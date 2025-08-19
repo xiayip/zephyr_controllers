@@ -1,0 +1,10 @@
+<library path="dexhand_controller">
+  <class
+      name="dexhand_controller/DexHandController"
+      type="dexhand_controller::DexHandController"
+      base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Unix dexterous hand controller.
+    </description>
+  </class>
+</library>

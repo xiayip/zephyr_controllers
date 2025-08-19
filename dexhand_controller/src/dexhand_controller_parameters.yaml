@@ -1,0 +1,10 @@
+dexhand_controller:
+  joints: {
+    type: string_array,
+    description: "List of joints",
+    read_only: true,
+    validation: {
+      size_gt<>: [0],
+      unique<>: null
+    }
+  }
