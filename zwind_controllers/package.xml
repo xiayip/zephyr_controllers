@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>zwind_controllers</name>
+  <version>1.0.0</version>
+  <description>Meta-package containing all zwind custom controllers for ROS2 control</description>
+  <maintainer email="yipeng.xia@hotmail.com">xiayip</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- Meta-package dependencies - all individual controller packages -->
+  <exec_depend>battery_state_broadcaster</exec_depend>
+  <exec_depend>dexhand_controller</exec_depend>
+  <exec_depend>diagnostic_broadcaster</exec_depend>
+  <exec_depend>omni_picker_controller</exec_depend>
+  <exec_depend>swerve_drive_controller</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
