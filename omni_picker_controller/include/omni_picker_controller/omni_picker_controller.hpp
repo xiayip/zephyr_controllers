@@ -14,7 +14,7 @@
 #include <rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp>
 #include <rclcpp_lifecycle/state.hpp>
 #include <realtime_tools/realtime_publisher.h>
-#include <zwind_msgs/msg/gripper_command.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include "omni_picker_controller/visibility_control.hpp"
 #include "realtime_tools/realtime_buffer.h"
@@ -90,13 +90,13 @@ namespace omni_picker_controller
     Params params_;
 
     // ROS API
-    rclcpp::Subscription<zwind_msgs::msg::GripperCommand>::SharedPtr gripper_command_subscriber_ = nullptr;
-    void topic_callback(const std::shared_ptr<zwind_msgs::msg::GripperCommand> msg);
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr gripper_command_subscriber_ = nullptr;
+    void topic_callback(const std::shared_ptr<sensor_msgs::msg::JointState> msg);
 
     std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::JointState>> gripper_joint_publisher_ = nullptr;
     std::shared_ptr<realtime_tools::RealtimePublisher<sensor_msgs::msg::JointState>>
     realtime_gripper_joint_publisher_ = nullptr;
 
-    void set_new_gripper_goal(const zwind_msgs::msg::GripperCommand &gripper_goal_msg);
+    void set_new_gripper_goal(const sensor_msgs::msg::JointState &gripper_goal_msg);
   };
 } // namespace battery_state_broadcaster

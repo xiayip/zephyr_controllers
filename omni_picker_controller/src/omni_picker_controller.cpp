@@ -48,7 +48,7 @@ namespace omni_picker_controller
     }
 
     gripper_command_subscriber_ =
-        get_node()->create_subscription<zwind_msgs::msg::GripperCommand>(
+        get_node()->create_subscription<sensor_msgs::msg::JointState>(
             params_.topic_prefix + "/gripper_command", rclcpp::SystemDefaultsQoS(),
             std::bind(&OmniPickerController::topic_callback, this, std::placeholders::_1));
 
@@ -226,21 +226,21 @@ namespace omni_picker_controller
     return controller_interface::return_type::OK;
   }
 
-  void OmniPickerController::topic_callback(const std::shared_ptr<zwind_msgs::msg::GripperCommand> msg)
+  void OmniPickerController::topic_callback(const std::shared_ptr<sensor_msgs::msg::JointState> msg)
   {
     set_new_gripper_goal(*msg);
   };
 
-  void OmniPickerController::set_new_gripper_goal(const zwind_msgs::msg::GripperCommand &gripper_goal_msg)
+  void OmniPickerController::set_new_gripper_goal(const sensor_msgs::msg::JointState &gripper_goal_msg)
   {
-    if (gripper_goal_msg.command.position[0] < 0.0 || gripper_goal_msg.command.position[0] > 1.0)
+    if (gripper_goal_msg.position[0] < 0.0 || gripper_goal_msg.position[0] > 1.0)
     {
       // RCLCPP_ERROR(get_node()->get_logger(), "Gripper goal position out of range, must be between 0 and 1");
       return;
     }
-    command_from_subscriber_.position_cmd_ = gripper_goal_msg.command.position[0];
-    command_from_subscriber_.velocity_cmd_ = (gripper_goal_msg.command.velocity.empty() || std::abs(gripper_goal_msg.command.velocity[0]) < 1e5) ? params_.max_velocity : gripper_goal_msg.command.velocity[0];
-    command_from_subscriber_.effort_cmd_ = (gripper_goal_msg.command.effort.empty() || std::abs(gripper_goal_msg.command.effort[0]) < 1e5) ? params_.max_effort : gripper_goal_msg.command.effort[0];
+    command_from_subscriber_.position_cmd_ = gripper_goal_msg.position[0];
+    command_from_subscriber_.velocity_cmd_ = (gripper_goal_msg.velocity.empty() || std::abs(gripper_goal_msg.velocity[0]) < 1e5) ? params_.max_velocity : gripper_goal_msg.velocity[0];
+    command_from_subscriber_.effort_cmd_ = (gripper_goal_msg.effort.empty() || std::abs(gripper_goal_msg.effort[0]) < 1e5) ? params_.max_effort : gripper_goal_msg.effort[0];
     command_.writeFromNonRT(command_from_subscriber_);
   }
 } // namespace omni_picker_controller
