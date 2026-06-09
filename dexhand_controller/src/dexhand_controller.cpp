@@ -122,7 +122,10 @@ namespace dexhand_controller
       {
         if (command_interface.get().get_name() == (*joint_commands)->name[i])
         {
-          command_interface.get().set_value((*joint_commands)->position[i]);
+          if (!command_interface.get().set_value((*joint_commands)->position[i]))
+          {
+            continue;
+          }
         }
       }
     }

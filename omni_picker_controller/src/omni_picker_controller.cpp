@@ -1,4 +1,6 @@
+#include <cmath>
 #include <hardware_interface/types/hardware_interface_type_values.hpp>
+#include <limits>
 #include "omni_picker_controller/omni_picker_controller.hpp"
 
 namespace omni_picker_controller
@@ -140,7 +142,8 @@ namespace omni_picker_controller
     joint_effort_state_interface_ = *effort_state_interface_it;
 
     // Command - non RT version
-    command_from_subscriber_.position_cmd_ = joint_position_state_interface_->get().get_value();
+    command_from_subscriber_.position_cmd_ = joint_position_state_interface_->get().get_optional().value_or(
+      std::numeric_limits<double>::quiet_NaN());
     command_from_subscriber_.velocity_cmd_ = params_.max_effort;
     command_from_subscriber_.effort_cmd_ = params_.max_velocity;
     command_.initRT(command_from_subscriber_);
@@ -172,9 +175,12 @@ namespace omni_picker_controller
   {
     (void)period;
 
-    double current_position = joint_position_state_interface_->get().get_value();
-    double current_velocity = joint_velocity_state_interface_->get().get_value();
-    double current_effort = joint_effort_state_interface_->get().get_value();
+    double current_position = joint_position_state_interface_->get().get_optional().value_or(
+      std::numeric_limits<double>::quiet_NaN());
+    double current_velocity = joint_velocity_state_interface_->get().get_optional().value_or(
+      std::numeric_limits<double>::quiet_NaN());
+    double current_effort = joint_effort_state_interface_->get().get_optional().value_or(
+      std::numeric_limits<double>::quiet_NaN());
     // RCLCPP_INFO(get_node()->get_logger(), "currnet position: %f, velocity: %f, effort: %f", current_position, current_velocity, current_effort);
 
     final_command_.position_cmd_ = reference_interfaces_[0];
@@ -182,14 +188,23 @@ namespace omni_picker_controller
     final_command_.effort_cmd_ = reference_interfaces_[2];
     // RCLCPP_INFO(get_node()->get_logger(), "final position: %f, velocity: %f, effort: %f", final_command_.position_cmd_, final_command_.velocity_cmd_, final_command_.effort_cmd_);
 
-    position_command_interface_->get().set_value(final_command_.position_cmd_);
+    if (!position_command_interface_->get().set_value(final_command_.position_cmd_))
+    {
+      return controller_interface::return_type::ERROR;
+    }
     if (!std::isnan(final_command_.velocity_cmd_))
     {
-      velocity_command_interface_->get().set_value(final_command_.velocity_cmd_);
+      if (!velocity_command_interface_->get().set_value(final_command_.velocity_cmd_))
+      {
+        return controller_interface::return_type::ERROR;
+      }
     }
     if (!std::isnan(final_command_.effort_cmd_))
     {
-      effort_command_interface_->get().set_value(final_command_.effort_cmd_);
+      if (!effort_command_interface_->get().set_value(final_command_.effort_cmd_))
+      {
+        return controller_interface::return_type::ERROR;
+      }
     }
     // publish realtime gripper joint state
     if (realtime_gripper_joint_publisher_->trylock())
@@ -218,8 +233,11 @@ namespace omni_picker_controller
   }
 
   // Is this function necessary?
-  controller_interface::return_type OmniPickerController::update_reference_from_subscribers()
+  controller_interface::return_type OmniPickerController::update_reference_from_subscribers(
+      const rclcpp::Time &time, const rclcpp::Duration &period)
   {
+    (void)time;
+    (void)period;
     reference_interfaces_[0] = (*(command_.readFromRT())).position_cmd_;
     reference_interfaces_[1] = (*(command_.readFromRT())).velocity_cmd_;
     reference_interfaces_[2] = (*(command_.readFromRT())).effort_cmd_;

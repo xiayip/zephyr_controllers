@@ -31,9 +31,8 @@
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/state.hpp"
-#include "realtime_tools/realtime_box.h"
-#include "realtime_tools/realtime_buffer.h"
-#include "realtime_tools/realtime_publisher.h"
+#include "realtime_tools/realtime_buffer.hpp"
+#include "realtime_tools/realtime_publisher.hpp"
 #include "tf2_msgs/msg/tf_message.hpp"
 
 namespace swerve_drive_controller

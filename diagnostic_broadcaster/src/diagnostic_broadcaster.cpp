@@ -1,5 +1,7 @@
 #include "diagnostic_broadcaster/diagnostic_broadcaster.hpp"
 
+#include <limits>
+
 namespace diagnostic_broadcaster
 {
   controller_interface::CallbackReturn DiagnosticBroadcaster::on_init()
@@ -111,14 +113,18 @@ namespace diagnostic_broadcaster
     {
       auto &interface = i.second;
       // convert error code to string
-      std::string error_code_str = std::to_string(interface.get().get_value());
-      if (error_code_map_f.find(interface.get().get_value()) != error_code_map_f.end())
+      const auto value = interface.get().get_optional().value_or(
+        std::numeric_limits<double>::quiet_NaN());
+      std::string error_code_str = std::to_string(value);
+      const auto error_code = static_cast<float>(value);
+      const auto error_code_it = error_code_map_f.find(error_code);
+      if (error_code_it != error_code_map_f.end())
       {
-        error_code_str = error_code_map_f.at(interface.get().get_value());
+        error_code_str = error_code_it->second;
       }
       stat.add(interface.get().get_name(), error_code_str);
-      // RCLCPP_INFO(get_node()->get_logger(), "Checking interface: %s, value: %f", interface.get().get_name().c_str(), interface.get().get_value());
-      if (interface.get().get_value() != 0.0)
+      // RCLCPP_INFO(get_node()->get_logger(), "Checking interface: %s, value: %f", interface.get().get_name().c_str(), value);
+      if (value != 0.0)
       {
         is_error_happened = true;
       }

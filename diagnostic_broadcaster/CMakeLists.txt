@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.10)
 project(diagnostic_broadcaster)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -19,4 +19,4 @@ ament_auto_add_library(${TARGET} SHARED src/${TARGET}.cpp)
 target_link_libraries(${TARGET} ${TARGET}_parameters ${diagnostic_msgs_TARGETS})
 pluginlib_export_plugin_description_file(controller_interface ${TARGET}.xml)
 
-ament_auto_package()
+ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)

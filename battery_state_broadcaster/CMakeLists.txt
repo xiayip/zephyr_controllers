@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.10)
 project(battery_state_broadcaster)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -45,4 +45,4 @@ pluginlib_export_plugin_description_file(
 #     ${${PROJECT_NAME}_FOUND_TEST_DEPENDS})
 # endif()
 
-ament_auto_package()
+ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)

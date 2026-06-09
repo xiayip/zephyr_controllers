@@ -14,6 +14,7 @@
 #include "swerve_drive_controller/swerve_drive_controller.hpp"
 
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <queue>
 #include <string>
@@ -53,9 +54,18 @@ Wheel::Wheel(
 {
 }
 
-void Wheel::set_velocity(double velocity) {velocity_.get().set_value(velocity);}
+void Wheel::set_velocity(double velocity)
+{
+  if (!velocity_.get().set_value(velocity)) {
+    return;
+  }
+}
 
-double Wheel::get_feedback() {return Wheel::feedback_.get().get_value();}
+double Wheel::get_feedback()
+{
+  return Wheel::feedback_.get().get_optional().value_or(
+    std::numeric_limits<double>::quiet_NaN());
+}
 
 Axle::Axle(
   std::reference_wrapper<hardware_interface::LoanedCommandInterface> position,
@@ -64,9 +74,18 @@ Axle::Axle(
 {
 }
 
-void Axle::set_position(double position) {position_.get().set_value(position);}
+void Axle::set_position(double position)
+{
+  if (!position_.get().set_value(position)) {
+    return;
+  }
+}
 
-double Axle::get_feedback() {return Axle::feedback_.get().get_value();}
+double Axle::get_feedback()
+{
+  return Axle::feedback_.get().get_optional().value_or(
+    std::numeric_limits<double>::quiet_NaN());
+}
 
 std::array<std::pair<double, double>, 4> wheel_positions_ = {{
   {-0.1, 0.175},     // front left
@@ -428,6 +447,7 @@ CallbackReturn SwerveController::on_activate(const rclcpp_lifecycle::State &)
 controller_interface::return_type SwerveController::update(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
+  (void)period;
   // auto logger = get_node()->get_logger();
   auto logger = rclcpp::get_logger("SwerveController");
   // if (this->get_state().id() == State::PRIMARY_STATE_INACTIVE) {
@@ -465,10 +485,6 @@ controller_interface::return_type SwerveController::update(
   double & linear_x_cmd = command.twist.linear.x;
   double & linear_y_cmd = command.twist.linear.y;
   double & angular_cmd = command.twist.angular.z;
-
-  double x_offset = wheel_params_.x_offset;
-  double y_offset = wheel_params_.y_offset;
-  double radius = wheel_params_.radius;
   
   double front_left_wheel_angle = front_left_axle_handle_->get_feedback();
   double front_right_wheel_angle = front_right_axle_handle_->get_feedback();

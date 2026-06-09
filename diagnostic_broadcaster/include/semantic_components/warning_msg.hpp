@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -41,7 +42,8 @@ public:
   {
     for (const auto & state_interface : this->state_interfaces_) {
       const auto & name = state_interface.get().get_interface_name();
-      const auto & value = state_interface.get().get_value();
+      const auto value = state_interface.get().get_optional().value_or(
+        std::numeric_limits<double>::quiet_NaN());
       if (name == "voltage") {
         message.voltage = value;
       } else if (name == "current") {
