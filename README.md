@@ -1,6 +1,6 @@
-# zwind_controllers
+# zephyr_controllers
 
-This is a meta-package that groups all custom ROS2 controllers developed for the zwind robotics platform.
+This is a meta-package that groups all custom ROS2 controllers developed for the zephyr robotics platform.
 
 ## Included Packages
 
@@ -15,11 +15,11 @@ This meta-package includes the following controller packages:
 
 ## Installation
 
-To install all zwind controllers, simply install this meta-package:
+To install all zephyr controllers, simply install this meta-package:
 
 ```bash
 # Build the workspace
-colcon build --packages-select zwind_controllers
+colcon build --packages-select zephyr_controllers
 
 # Or build specific controller packages
 colcon build --packages-select battery_state_broadcaster dexhand_controller
