@@ -14,6 +14,8 @@ This meta-package includes the following controller packages:
 - **mit_controller** - Chainable output stage for the MIT position, velocity, gain, and feed-forward tuple
 - **mit_damping_controller** - Gravity-compensated damping mode with filtered velocity,
   torque shaping, and URDF soft limits
+- **mit_impedance_controller** - Gravity-compensated joint impedance mode with rate-limited
+  equilibrium references, motor-side MIT stiffness/damping, and ROS feed-forward shaping
 - **mit_position_adapter_controller** - Completes position and velocity references into full MIT
   commands and publishes their realtime torque decomposition
 - **omni_picker_controller** - The Omni picker controller
@@ -28,7 +30,8 @@ To install all zephyr controllers, simply install this meta-package:
 colcon build --packages-select zephyr_controllers
 
 # Or build the MIT controller stack and its dependencies
-colcon build --packages-up-to mit_controller mit_position_adapter_controller mit_damping_controller
+colcon build --packages-up-to mit_controller mit_position_adapter_controller \
+  mit_damping_controller mit_impedance_controller
 ```
 
 ## Usage

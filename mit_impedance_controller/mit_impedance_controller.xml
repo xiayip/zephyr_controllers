@@ -1,0 +1,10 @@
+<library path="mit_impedance_controller">
+  <class
+      name="mit_impedance_controller/MitImpedanceController"
+      type="mit_impedance_controller::MitImpedanceController"
+      base_class_type="controller_interface::ChainableControllerInterface">
+    <description>
+      Computes gravity-compensated joint impedance torque for the MIT output controller.
+    </description>
+  </class>
+</library>

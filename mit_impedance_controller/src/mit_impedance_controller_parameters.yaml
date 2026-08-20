@@ -1,0 +1,173 @@
+mit_impedance_controller:
+  joints: {
+    type: string_array,
+    default_value: [],
+    description: "Ordered physical joint names.",
+    read_only: true,
+    validation: {
+      unique<>: null,
+    }
+  }
+  downstream_controller: {
+    type: string,
+    default_value: "",
+    description: "Name of the downstream MIT output controller.",
+    read_only: true,
+  }
+  stiffness: {
+    type: double_array,
+    default_value: [],
+    description: "Runtime-adjustable per-joint motor-side MIT kp in N*m/rad.",
+    read_only: false,
+    validation: {
+      element_bounds<>: [0.0, 300.0],
+    }
+  }
+  damping_coefficients: {
+    type: double_array,
+    default_value: [],
+    description: "Runtime-adjustable per-joint motor-side MIT kd in N*m*s/rad.",
+    read_only: false,
+    validation: {
+      element_bounds<>: [0.0, 30.0],
+    }
+  }
+  reference:
+    position_rate_limit: {
+      type: double_array,
+      default_value: [],
+      description: "Per-joint equilibrium-position rate limits in rad/s.",
+      read_only: true,
+      validation: {
+        lower_element_bounds<>: 0.0,
+      }
+    }
+    velocity_limit: {
+      type: double_array,
+      default_value: [],
+      description: "Absolute per-joint velocity-reference limits in rad/s.",
+      read_only: true,
+      validation: {
+        lower_element_bounds<>: 0.0,
+      }
+    }
+  state_publish_rate: {
+    type: double,
+    default_value: 50.0,
+    description: "Impedance command decomposition publish rate in Hz.",
+    read_only: true,
+    validation: {
+      gt<>: [0.0],
+    }
+  }
+  gravity_compensation:
+    enabled: {
+      type: bool,
+      default_value: true,
+      description: "Add calibrated Pinocchio gravity torque to the impedance command.",
+      read_only: true,
+    }
+    factor: {
+      type: double,
+      default_value: 1.0,
+      description: "Runtime gravity compensation factor.",
+      read_only: false,
+      validation: {
+        bounds<>: [0.0, 1.0],
+      }
+    }
+    factor_transition_duration: {
+      type: double,
+      default_value: 1.0,
+      description: "Time in seconds for a full-scale runtime factor change.",
+      read_only: true,
+      validation: {
+        gt_eq<>: [0.0],
+      }
+    }
+    gravity: {
+      type: double_array,
+      default_value: [0.0, 0.0, -9.80665],
+      description: "Gravity vector expressed in the robot model base frame.",
+      read_only: true,
+    }
+    scale: {
+      type: double_array,
+      default_value: [],
+      description: "Runtime-adjustable per-joint gravity torque scale.",
+      read_only: false,
+      validation: {
+        element_bounds<>: [0.0, 2.0],
+      }
+    }
+    bias: {
+      type: double_array,
+      default_value: [],
+      description: "Runtime-adjustable per-joint additive gravity torque bias in N*m.",
+      read_only: false,
+      validation: {
+        element_bounds<>: [-5.0, 5.0],
+      }
+    }
+  command_shaping:
+    torque_limit: {
+      type: double_array,
+      default_value: [],
+      description: "Absolute per-joint MIT feed-forward torque limits in N*m.",
+      read_only: true,
+      validation: {
+        lower_element_bounds<>: 0.0,
+      }
+    }
+    torque_rate_limit: {
+      type: double_array,
+      default_value: [],
+      description: "Per-joint MIT feed-forward torque rate limits in N*m/s.",
+      read_only: true,
+      validation: {
+        lower_element_bounds<>: 0.0,
+      }
+    }
+    transition_duration: {
+      type: double,
+      default_value: 1.0,
+      description: "Blend duration from equivalent previous MIT torque into gravity feed-forward.",
+      read_only: true,
+      validation: {
+        gt_eq<>: [0.0],
+      }
+    }
+  soft_limits:
+    enabled: {
+      type: bool,
+      default_value: true,
+      description: "Apply virtual spring torque inside the URDF position limits.",
+      read_only: true,
+    }
+    margin: {
+      type: double_array,
+      default_value: [],
+      description: "Per-joint soft-limit margin in rad.",
+      read_only: true,
+      validation: {
+        lower_element_bounds<>: 0.0,
+      }
+    }
+    stiffness: {
+      type: double_array,
+      default_value: [],
+      description: "Per-joint soft-limit stiffness in N*m/rad.",
+      read_only: true,
+      validation: {
+        lower_element_bounds<>: 0.0,
+      }
+    }
+    torque_limit: {
+      type: double_array,
+      default_value: [],
+      description: "Absolute per-joint soft-limit torque caps in N*m.",
+      read_only: true,
+      validation: {
+        lower_element_bounds<>: 0.0,
+      }
+    }
