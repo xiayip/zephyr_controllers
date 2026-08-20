@@ -1,0 +1,10 @@
+<library path="mit_damping_controller">
+  <class
+      name="mit_damping_controller/MitDampingController"
+      type="mit_damping_controller::MitDampingController"
+      base_class_type="controller_interface::ControllerInterface">
+    <description>
+      Gravity-compensated joint damping controller chained into the MIT output controller.
+    </description>
+  </class>
+</library>

@@ -10,6 +10,12 @@ This meta-package includes the following controller packages:
 - **battery_state_broadcaster** - Controller to publish readings of Battery state
 - **diagnostic_broadcaster** - The diagnostic message broadcaster
 - **dexhand_controller** - Dexterous hand controller
+- **gravity_compensation_model** - Realtime Pinocchio gravity model and feed-forward shaping library
+- **mit_controller** - Chainable output stage for the MIT position, velocity, gain, and feed-forward tuple
+- **mit_damping_controller** - Gravity-compensated damping mode with filtered velocity,
+  torque shaping, and URDF soft limits
+- **mit_position_adapter_controller** - Completes position and velocity references into full MIT
+  commands and publishes their realtime torque decomposition
 - **omni_picker_controller** - The Omni picker controller
 - **swerve_drive_controller** - Controller for a 4 wheel swerve drive robot base
 
@@ -21,8 +27,8 @@ To install all zephyr controllers, simply install this meta-package:
 # Build the workspace
 colcon build --packages-select zephyr_controllers
 
-# Or build specific controller packages
-colcon build --packages-select battery_state_broadcaster dexhand_controller
+# Or build the MIT controller stack and its dependencies
+colcon build --packages-up-to mit_controller mit_position_adapter_controller mit_damping_controller
 ```
 
 ## Usage

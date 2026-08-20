@@ -1,0 +1,10 @@
+<library path="mit_position_adapter_controller">
+  <class
+      name="mit_position_adapter_controller/MitPositionAdapterController"
+      type="mit_position_adapter_controller::MitPositionAdapterController"
+      base_class_type="controller_interface::ChainableControllerInterface">
+    <description>
+      Converts upstream joint position references into a complete MIT command tuple.
+    </description>
+  </class>
+</library>

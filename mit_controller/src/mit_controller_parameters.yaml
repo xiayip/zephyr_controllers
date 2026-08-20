@@ -1,0 +1,10 @@
+mit_controller:
+  joints: {
+    type: string_array,
+    default_value: [],
+    description: "Ordered joint names controlled by the MIT output stage.",
+    read_only: true,
+    validation: {
+      unique<>: null,
+    }
+  }

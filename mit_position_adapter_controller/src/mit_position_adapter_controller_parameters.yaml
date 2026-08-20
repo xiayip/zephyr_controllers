@@ -1,0 +1,113 @@
+mit_position_adapter_controller:
+  joints: {
+    type: string_array,
+    default_value: [],
+    description: "Ordered physical joint names.",
+    read_only: true,
+    validation: {
+      unique<>: null,
+    }
+  }
+  downstream_controller: {
+    type: string,
+    default_value: "",
+    description: "Name of the downstream MIT output controller.",
+    read_only: true,
+  }
+  position_kp: {
+    type: double_array,
+    default_value: [],
+    description: "Runtime-adjustable per-joint proportional gains for position mode.",
+    read_only: false,
+    validation: {
+      lower_element_bounds<>: 0.0,
+    }
+  }
+  position_kd: {
+    type: double_array,
+    default_value: [],
+    description: "Runtime-adjustable per-joint derivative gains for position mode.",
+    read_only: false,
+    validation: {
+      lower_element_bounds<>: 0.0,
+    }
+  }
+  state_publish_rate: {
+    type: double,
+    default_value: 50.0,
+    description: "MIT command decomposition publish rate in Hz.",
+    read_only: true,
+    validation: {
+      gt<>: [0.0],
+    }
+  }
+  gravity_compensation:
+    enabled: {
+      type: bool,
+      default_value: false,
+      description: "Compute Pinocchio gravity torque and write it to the MIT feed-forward interface.",
+      read_only: true,
+    }
+    factor: {
+      type: double,
+      default_value: 0.0,
+      description: "Runtime gravity feed-forward factor. Zero disables the applied gravity torque and one applies the configured per-joint affine calibration.",
+      read_only: false,
+      validation: {
+        bounds<>: [0.0, 1.0],
+      }
+    }
+    factor_transition_duration: {
+      type: double,
+      default_value: 1.0,
+      description: "Time in seconds for a full-scale runtime factor change.",
+      read_only: true,
+      validation: {
+        gt_eq<>: [0.0],
+      }
+    }
+    gravity: {
+      type: double_array,
+      default_value: [0.0, 0.0, -9.80665],
+      description: "Gravity vector expressed in the robot model base frame, in m/s^2.",
+      read_only: true,
+    }
+    scale: {
+      type: double_array,
+      default_value: [],
+      description: "Runtime-adjustable per-joint gravity torque scale. Empty at startup means one for every joint.",
+      read_only: false,
+      validation: {
+        element_bounds<>: [0.0, 2.0],
+      }
+    }
+    bias: {
+      type: double_array,
+      default_value: [],
+      description: "Runtime-adjustable per-joint additive gravity torque bias in N*m. Empty at startup means zero for every joint.",
+      read_only: false,
+      validation: {
+        element_bounds<>: [-5.0, 5.0],
+      }
+    }
+    torque_limit: {
+      type: double_array,
+      default_value: [],
+      description: "Optional absolute per-joint feed-forward torque limits in N*m.",
+      read_only: true,
+    }
+    torque_rate_limit: {
+      type: double_array,
+      default_value: [],
+      description: "Optional per-joint feed-forward torque rate limits in N*m/s.",
+      read_only: true,
+    }
+    transition_duration: {
+      type: double,
+      default_value: 1.0,
+      description: "Duration used to blend the activation torque into gravity compensation.",
+      read_only: true,
+      validation: {
+        gt_eq<>: [0.0],
+      }
+    }

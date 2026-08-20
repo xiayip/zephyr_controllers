@@ -13,6 +13,10 @@
   <exec_depend>battery_state_broadcaster</exec_depend>
   <exec_depend>dexhand_controller</exec_depend>
   <exec_depend>diagnostic_broadcaster</exec_depend>
+  <exec_depend>gravity_compensation_model</exec_depend>
+  <exec_depend>mit_controller</exec_depend>
+  <exec_depend>mit_damping_controller</exec_depend>
+  <exec_depend>mit_position_adapter_controller</exec_depend>
   <exec_depend>omni_picker_controller</exec_depend>
   <exec_depend>swerve_drive_controller</exec_depend>
 

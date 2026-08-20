@@ -1,0 +1,10 @@
+<library path="mit_controller">
+  <class
+      name="mit_controller/MitController"
+      type="mit_controller::MitController"
+      base_class_type="controller_interface::ChainableControllerInterface">
+    <description>
+      Owns the hardware MIT command tuple and exposes it as chainable reference interfaces.
+    </description>
+  </class>
+</library>
