@@ -16,14 +16,7 @@
 
 #include <array>
 #include <cmath>
-#include <iostream>
-#include <memory>
 #include <utility>
-#include <vector>
-
-#include <geometry_msgs/msg/twist.hpp>
-#include <nav_msgs/msg/odometry.hpp>
-#include <tf2_msgs/msg/tf_message.hpp>
 
 
 namespace swerve_drive_controller
@@ -35,8 +28,15 @@ namespace swerve_drive_controller
 
 struct WheelCommand
 {
-  double steering_angle;  // Steering angle in radians
-  double drive_velocity;  // Drive velocity in meters per second
+  double steering_angle = 0.0;
+  double drive_velocity = 0.0;
+};
+
+struct BaseVelocity
+{
+  double linear_x = 0.0;
+  double linear_y = 0.0;
+  double angular_z = 0.0;
 };
 
 /**
@@ -68,7 +68,13 @@ public:
    */
 
   std::array<WheelCommand, 4> compute_wheel_commands(
-    double linear_velocity_x, double linear_velocity_y, double angular_velocity_z, std::array<double, 4> steering_angles);
+    double linear_velocity_x, double linear_velocity_y, double angular_velocity_z,
+    const std::array<double, 4> & steering_angles,
+    double steering_limit = 1.5707963267948966) const;
+
+  BaseVelocity estimate_velocity(
+    const std::array<double, 4> & wheel_velocities,
+    const std::array<double, 4> & steering_angles) const;
 
   /**
    * @brief Update the odometry based on wheel velocities and elapsed time.
@@ -82,14 +88,13 @@ public:
     const std::array<double, 4> & wheel_velocities_, const std::array<double, 4> & steering_angles_,
     double dt);
 
-  void setWheelParams(std::array<std::pair<double, double>, 4> & wheel_params, double &wheel_radius);
+  void setWheelParams(
+    std::array<std::pair<double, double>, 4> & wheel_params, double & wheel_radius);
 
 private:
-  double wheel_radius_;                                 // wheel radius in meters
-  std::array<std::pair<double, double>, 4> wheel_positions_;  // Wheel Positions
-  OdometryState odometry_;                                    // Current Odometry of the robot
-
-  std::pair<double, double> limitAngle(double angle, double min_angle, double max_angle, double speed);
+  double wheel_radius_ = 0.09;
+  std::array<std::pair<double, double>, 4> wheel_positions_;
+  OdometryState odometry_;
 
   /**
    * @brief Normalize an angle to the range [-pi, pi].
@@ -97,7 +102,7 @@ private:
    * @return Normalized angle in radians.
    */
 
-  double normalize_angle(double angle);
+  static double normalize_angle(double angle);
 };
 }  // namespace swerve_drive_controller
 
