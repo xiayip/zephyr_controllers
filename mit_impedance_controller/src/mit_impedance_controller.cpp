@@ -14,7 +14,7 @@ constexpr std::array<const char *, 5> kMitInterfaces = {"position", "velocity",
                                                         "kp", "kd", "t_ff"};
 constexpr std::array<const char *, 2> kReferenceInterfaces = {"position",
                                                               "velocity"};
-constexpr std::array<const char *, 19> kStateFields = {
+constexpr std::array<const char *, 20> kStateFields = {
     "position",
     "target_position_reference",
     "active_position_reference",
@@ -31,6 +31,7 @@ constexpr std::array<const char *, 19> kStateFields = {
     "estimated_stiffness_torque",
     "estimated_damping_torque",
     "soft_limit_torque",
+    "friction_compensation_torque",
     "target_feedforward_torque",
     "commanded_feedforward_torque",
     "estimated_commanded_torque",
@@ -42,6 +43,11 @@ bool finite_nonnegative(const double value) {
 
 bool finite_in_range(const double value, const double upper) {
   return finite_nonnegative(value) && value <= upper;
+}
+
+bool finite_in_range(const double value, const double lower,
+                     const double upper) {
+  return std::isfinite(value) && value >= lower && value <= upper;
 }
 
 bool finite_absolute_bounded(const double value, const double limit) {
@@ -73,8 +79,16 @@ controller_interface::CallbackReturn MitImpedanceController::on_init() {
                 parameter.get_name() == "gravity_compensation.scale";
             const bool is_gravity_bias =
                 parameter.get_name() == "gravity_compensation.bias";
+            const bool is_friction_coulomb =
+                parameter.get_name() == "friction_compensation.coulomb";
+            const bool is_friction_viscous =
+                parameter.get_name() == "friction_compensation.viscous";
+            const bool is_friction_velocity_smoothing =
+                parameter.get_name() ==
+                "friction_compensation.velocity_smoothing";
             if (!is_stiffness && !is_damping && !is_gravity_scale &&
-                !is_gravity_bias) {
+                !is_gravity_bias && !is_friction_coulomb &&
+                !is_friction_viscous && !is_friction_velocity_smoothing) {
               continue;
             }
             if (parameter.get_type() !=
@@ -90,10 +104,17 @@ controller_interface::CallbackReturn MitImpedanceController::on_init() {
                   values.begin(), values.end(), [](const double value) {
                     return finite_absolute_bounded(value, 5.0);
                   });
+            } else if (is_friction_velocity_smoothing) {
+              values_valid = std::all_of(
+                  values.begin(), values.end(), [](const double value) {
+                    return finite_in_range(value, 0.001, 10.0);
+                  });
             } else {
-              const double upper = is_stiffness ? 300.0
-                                   : is_damping ? 30.0
-                                                : 2.0;
+              const double upper = is_stiffness          ? 300.0
+                                   : is_damping          ? 30.0
+                                   : is_gravity_scale    ? 2.0
+                                   : is_friction_coulomb ? 5.0
+                                                         : 10.0;
               values_valid = std::all_of(values.begin(), values.end(),
                                          [upper](double value) {
                                            return finite_in_range(value, upper);
@@ -116,8 +137,17 @@ controller_interface::CallbackReturn MitImpedanceController::on_init() {
       const auto &damping = updated_params.damping_coefficients;
       const auto &scale = updated_params.gravity_compensation.scale;
       const auto &bias = updated_params.gravity_compensation.bias;
+      const auto &friction_coulomb =
+          updated_params.friction_compensation.coulomb;
+      const auto &friction_viscous =
+          updated_params.friction_compensation.viscous;
+      const auto &friction_velocity_smoothing =
+          updated_params.friction_compensation.velocity_smoothing;
       if (stiffness.size() == joint_count && damping.size() == joint_count &&
           scale.size() == joint_count && bias.size() == joint_count &&
+          friction_coulomb.size() == joint_count &&
+          friction_viscous.size() == joint_count &&
+          friction_velocity_smoothing.size() == joint_count &&
           std::all_of(
               stiffness.begin(), stiffness.end(),
               [](double value) { return finite_in_range(value, 300.0); }) &&
@@ -127,11 +157,23 @@ controller_interface::CallbackReturn MitImpedanceController::on_init() {
           std::all_of(
               scale.begin(), scale.end(),
               [](double value) { return finite_in_range(value, 2.0); }) &&
-          std::all_of(bias.begin(), bias.end(), [](double value) {
-            return finite_absolute_bounded(value, 5.0);
-          })) {
+          std::all_of(bias.begin(), bias.end(),
+                      [](double value) {
+                        return finite_absolute_bounded(value, 5.0);
+                      }) &&
+          std::all_of(
+              friction_coulomb.begin(), friction_coulomb.end(),
+              [](double value) { return finite_in_range(value, 5.0); }) &&
+          std::all_of(
+              friction_viscous.begin(), friction_viscous.end(),
+              [](double value) { return finite_in_range(value, 10.0); }) &&
+          std::all_of(friction_velocity_smoothing.begin(),
+                      friction_velocity_smoothing.end(), [](double value) {
+                        return finite_in_range(value, 0.001, 10.0);
+                      })) {
         runtime_parameters_buffer_.writeFromNonRT(
-            {stiffness, damping, scale, bias});
+            {stiffness, damping, scale, bias, friction_coulomb,
+             friction_viscous, friction_velocity_smoothing});
       }
     });
   } catch (const std::exception &error) {
@@ -158,6 +200,9 @@ MitImpedanceController::on_configure(const rclcpp_lifecycle::State &) {
       !has_joint_count(params_.reference.velocity_limit) ||
       !has_joint_count(params_.gravity_compensation.scale) ||
       !has_joint_count(params_.gravity_compensation.bias) ||
+      !has_joint_count(params_.friction_compensation.coulomb) ||
+      !has_joint_count(params_.friction_compensation.viscous) ||
+      !has_joint_count(params_.friction_compensation.velocity_smoothing) ||
       !has_joint_count(params_.command_shaping.torque_limit) ||
       !has_joint_count(params_.command_shaping.torque_rate_limit) ||
       !has_joint_count(params_.soft_limits.margin) ||
@@ -217,8 +262,12 @@ MitImpedanceController::on_configure(const rclcpp_lifecycle::State &) {
 
   runtime_parameters_buffer_.initRT(
       {params_.stiffness, params_.damping_coefficients,
-       params_.gravity_compensation.scale, params_.gravity_compensation.bias});
+       params_.gravity_compensation.scale, params_.gravity_compensation.bias,
+       params_.friction_compensation.coulomb,
+       params_.friction_compensation.viscous,
+       params_.friction_compensation.velocity_smoothing});
   gravity_compensation_enabled_ = params_.gravity_compensation.enabled;
+  friction_compensation_enabled_ = params_.friction_compensation.enabled;
   soft_limits_enabled_ = params_.soft_limits.enabled;
   gravity_factor_transition_duration_ =
       params_.gravity_compensation.factor_transition_duration;
@@ -238,6 +287,7 @@ MitImpedanceController::on_configure(const rclcpp_lifecycle::State &) {
   stiffness_torques_.setZero(size);
   damping_torques_.setZero(size);
   soft_limit_torques_.setZero(size);
+  friction_compensation_torques_.setZero(size);
   target_feedforward_torques_.setZero(size);
   commanded_feedforward_torques_.setZero(size);
   command_indices_.clear();
@@ -559,10 +609,23 @@ bool MitImpedanceController::compute_target_command(
       soft_limit_torque = std::clamp(soft_limit_torque, -limit, limit);
     }
     soft_limit_torques_[eigen_index] = soft_limit_torque;
+
+    friction_compensation_torques_[eigen_index] =
+        friction_compensation_enabled_
+            ? runtime_parameters.friction_coulomb[index] *
+                      std::tanh(velocity_references_[eigen_index] /
+                                runtime_parameters
+                                    .friction_velocity_smoothing[index]) +
+                  runtime_parameters.friction_viscous[index] *
+                      velocity_references_[eigen_index]
+            : 0.0;
     target_feedforward_torques_[eigen_index] =
-        scaled_gravity_torques_[eigen_index] + soft_limit_torques_[eigen_index];
+        scaled_gravity_torques_[eigen_index] +
+        soft_limit_torques_[eigen_index] +
+        friction_compensation_torques_[eigen_index];
   }
   return stiffness_torques_.allFinite() && damping_torques_.allFinite() &&
+         friction_compensation_torques_.allFinite() &&
          target_feedforward_torques_.allFinite();
 }
 
@@ -664,7 +727,11 @@ void MitImpedanceController::publish_state(const rclcpp::Time &time,
   const auto *runtime_parameters = runtime_parameters_buffer_.readFromRT();
   if (!runtime_parameters ||
       runtime_parameters->stiffness.size() != params_.joints.size() ||
-      runtime_parameters->damping.size() != params_.joints.size()) {
+      runtime_parameters->damping.size() != params_.joints.size() ||
+      runtime_parameters->friction_coulomb.size() != params_.joints.size() ||
+      runtime_parameters->friction_viscous.size() != params_.joints.size() ||
+      runtime_parameters->friction_velocity_smoothing.size() !=
+          params_.joints.size()) {
     realtime_state_publisher_->unlock();
     return;
   }
@@ -689,9 +756,10 @@ void MitImpedanceController::publish_state(const rclcpp::Time &time,
     values[13] = stiffness_torques_[eigen_index];
     values[14] = damping_torques_[eigen_index];
     values[15] = soft_limit_torques_[eigen_index];
-    values[16] = target_feedforward_torques_[eigen_index];
-    values[17] = commanded_feedforward_torques_[eigen_index];
-    values[18] = stiffness_torques_[eigen_index] +
+    values[16] = friction_compensation_torques_[eigen_index];
+    values[17] = target_feedforward_torques_[eigen_index];
+    values[18] = commanded_feedforward_torques_[eigen_index];
+    values[19] = stiffness_torques_[eigen_index] +
                  damping_torques_[eigen_index] +
                  commanded_feedforward_torques_[eigen_index];
   }
@@ -730,6 +798,10 @@ MitImpedanceController::update_and_write_commands(
       runtime_parameters->damping.size() != params_.joints.size() ||
       runtime_parameters->gravity_scale.size() != params_.joints.size() ||
       runtime_parameters->gravity_bias.size() != params_.joints.size() ||
+      runtime_parameters->friction_coulomb.size() != params_.joints.size() ||
+      runtime_parameters->friction_viscous.size() != params_.joints.size() ||
+      runtime_parameters->friction_velocity_smoothing.size() !=
+          params_.joints.size() ||
       !update_measured_state() || !update_gravity_factor(period.seconds()) ||
       !update_reference_targets(period.seconds()) ||
       !compute_target_command(*runtime_parameters) ||

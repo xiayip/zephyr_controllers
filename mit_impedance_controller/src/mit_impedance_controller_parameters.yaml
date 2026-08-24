@@ -119,6 +119,40 @@ mit_impedance_controller:
         element_bounds<>: [-5.0, 5.0],
       }
     }
+  friction_compensation:
+    enabled: {
+      type: bool,
+      default_value: false,
+      description: "Add smooth Coulomb and viscous friction feed-forward from the commanded joint velocity.",
+      read_only: true,
+    }
+    coulomb: {
+      type: double_array,
+      default_value: [],
+      description: "Runtime-adjustable nonnegative per-joint Coulomb friction torque in N*m.",
+      read_only: false,
+      validation: {
+        element_bounds<>: [0.0, 5.0],
+      }
+    }
+    viscous: {
+      type: double_array,
+      default_value: [],
+      description: "Runtime-adjustable nonnegative per-joint viscous friction coefficient in N*m*s/rad.",
+      read_only: false,
+      validation: {
+        element_bounds<>: [0.0, 10.0],
+      }
+    }
+    velocity_smoothing: {
+      type: double_array,
+      default_value: [],
+      description: "Runtime-adjustable positive per-joint tanh velocity scale in rad/s.",
+      read_only: false,
+      validation: {
+        element_bounds<>: [0.001, 10.0],
+      }
+    }
   command_shaping:
     torque_limit: {
       type: double_array,

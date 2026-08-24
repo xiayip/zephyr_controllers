@@ -1,3 +1,4 @@
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
@@ -58,6 +59,13 @@ rclcpp::NodeOptions base_options(const bool gravity_enabled,
       rclcpp::Parameter("gravity_compensation.scale", std::vector<double>{1.0}),
       rclcpp::Parameter("gravity_compensation.bias",
                         std::vector<double>{gravity_bias}),
+      rclcpp::Parameter("friction_compensation.enabled", false),
+      rclcpp::Parameter("friction_compensation.coulomb",
+                        std::vector<double>{0.0}),
+      rclcpp::Parameter("friction_compensation.viscous",
+                        std::vector<double>{0.0}),
+      rclcpp::Parameter("friction_compensation.velocity_smoothing",
+                        std::vector<double>{0.04}),
       rclcpp::Parameter("command_shaping.torque_limit",
                         std::vector<double>{20.0}),
       rclcpp::Parameter("command_shaping.torque_rate_limit",
@@ -235,6 +243,58 @@ TEST(MitImpedanceControllerTest, AddsAffineGravityFeedforward) {
                 rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1)),
             controller_interface::return_type::OK);
   EXPECT_NEAR(*fixture.commands[4]->get_optional(), -7.80665, 1e-6);
+  controller.release_interfaces();
+}
+
+TEST(MitImpedanceControllerTest, AddsSmoothFrictionFeedforward) {
+  auto options = base_options(false, false, 0.0);
+  options.parameter_overrides().emplace_back("stiffness",
+                                             std::vector<double>{0.0});
+  options.parameter_overrides().emplace_back("damping_coefficients",
+                                             std::vector<double>{0.0});
+  options.parameter_overrides().emplace_back("friction_compensation.enabled",
+                                             true);
+  options.parameter_overrides().emplace_back("friction_compensation.coulomb",
+                                             std::vector<double>{0.3});
+  options.parameter_overrides().emplace_back("friction_compensation.viscous",
+                                             std::vector<double>{0.2});
+  options.parameter_overrides().emplace_back(
+      "friction_compensation.velocity_smoothing", std::vector<double>{0.05});
+  mit_impedance_controller::MitImpedanceController controller;
+  ASSERT_EQ(controller.init("test_impedance_friction", kPendulumUrdf, 200, "",
+                            options),
+            controller_interface::return_type::OK);
+  ASSERT_EQ(controller.on_configure(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
+  auto references = controller.export_reference_interfaces();
+  auto fixture =
+      assign_interfaces(controller, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+  ASSERT_EQ(controller.on_activate(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
+
+  ASSERT_TRUE(references[1]->set_value(0.2));
+  ASSERT_EQ(controller.update_and_write_commands(
+                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1)),
+            controller_interface::return_type::OK);
+  EXPECT_NEAR(*fixture.commands[4]->get_optional(),
+              0.3 * std::tanh(0.2 / 0.05) + 0.2 * 0.2, 1e-12);
+
+  ASSERT_TRUE(references[1]->set_value(-0.2));
+  ASSERT_EQ(controller.update_and_write_commands(
+                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1)),
+            controller_interface::return_type::OK);
+  EXPECT_NEAR(*fixture.commands[4]->get_optional(),
+              -0.3 * std::tanh(0.2 / 0.05) - 0.2 * 0.2, 1e-12);
+
+  const auto coulomb_result =
+      controller.get_node()->set_parameter(rclcpp::Parameter(
+          "friction_compensation.coulomb", std::vector<double>{0.25}));
+  ASSERT_TRUE(coulomb_result.successful) << coulomb_result.reason;
+  ASSERT_EQ(controller.update_and_write_commands(
+                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1)),
+            controller_interface::return_type::OK);
+  EXPECT_NEAR(*fixture.commands[4]->get_optional(),
+              -0.25 * std::tanh(0.2 / 0.05) - 0.2 * 0.2, 1e-12);
   controller.release_interfaces();
 }
 

@@ -58,6 +58,9 @@ private:
     std::vector<double> damping;
     std::vector<double> gravity_scale;
     std::vector<double> gravity_bias;
+    std::vector<double> friction_coulomb;
+    std::vector<double> friction_viscous;
+    std::vector<double> friction_velocity_smoothing;
   };
 
   struct ReferenceCommand {
@@ -113,10 +116,12 @@ private:
   Eigen::VectorXd stiffness_torques_;
   Eigen::VectorXd damping_torques_;
   Eigen::VectorXd soft_limit_torques_;
+  Eigen::VectorXd friction_compensation_torques_;
   Eigen::VectorXd target_feedforward_torques_;
   Eigen::VectorXd commanded_feedforward_torques_;
 
   bool gravity_compensation_enabled_{true};
+  bool friction_compensation_enabled_{false};
   bool soft_limits_enabled_{true};
   std::atomic<double> target_gravity_factor_{1.0};
   double current_gravity_factor_{1.0};
