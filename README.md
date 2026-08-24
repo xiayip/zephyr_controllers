@@ -15,7 +15,8 @@ This meta-package includes the following controller packages:
 - **mit_damping_controller** - Gravity-compensated damping mode with filtered velocity,
   torque shaping, and URDF soft limits
 - **mit_impedance_controller** - Gravity-compensated joint impedance mode with rate-limited
-  equilibrium references, motor-side MIT stiffness/damping, and ROS feed-forward shaping
+  equilibrium references, bounded motor-side MIT spring feedback, ROS feed-forward shaping,
+  and a blocked-trajectory guard
 - **mit_position_adapter_controller** - Completes position and velocity references into full MIT
   commands and publishes their realtime torque decomposition
 - **omni_picker_controller** - The Omni picker controller

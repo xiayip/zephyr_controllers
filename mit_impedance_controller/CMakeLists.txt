@@ -13,6 +13,7 @@ find_package(gravity_compensation_model REQUIRED)
 find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(realtime_tools REQUIRED)
 find_package(trajectory_msgs REQUIRED)
@@ -22,7 +23,10 @@ generate_parameter_library(
   src/mit_impedance_controller_parameters.yaml
 )
 
-add_library(mit_impedance_controller SHARED src/mit_impedance_controller.cpp)
+add_library(mit_impedance_controller SHARED
+  src/blocked_motion_detector.cpp
+  src/mit_impedance_controller.cpp
+)
 target_compile_features(mit_impedance_controller PUBLIC cxx_std_17)
 target_include_directories(mit_impedance_controller PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -42,17 +46,31 @@ ament_target_dependencies(mit_impedance_controller PUBLIC
   trajectory_msgs
 )
 
+add_executable(impedance_trajectory_guard
+  src/impedance_trajectory_guard.cpp)
+target_compile_features(impedance_trajectory_guard PUBLIC cxx_std_17)
+target_link_libraries(impedance_trajectory_guard mit_impedance_controller)
+ament_target_dependencies(impedance_trajectory_guard
+  control_msgs
+  rclcpp
+  rclcpp_action
+)
+
 pluginlib_export_plugin_description_file(
   controller_interface mit_impedance_controller.xml)
 
 install(DIRECTORY include/ DESTINATION include)
 install(
-  TARGETS mit_impedance_controller mit_impedance_controller_parameters
+  TARGETS
+    mit_impedance_controller
+    mit_impedance_controller_parameters
   EXPORT export_mit_impedance_controller
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin
 )
+install(TARGETS impedance_trajectory_guard
+  DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -71,11 +89,18 @@ if(BUILD_TESTING)
     realtime_tools
     trajectory_msgs
   )
+  ament_add_gtest(
+    test_blocked_motion_detector
+    test/test_blocked_motion_detector.cpp
+  )
+  target_link_libraries(
+    test_blocked_motion_detector mit_impedance_controller)
 endif()
 
 ament_export_dependencies(
   control_msgs controller_interface gravity_compensation_model
-  hardware_interface rclcpp rclcpp_lifecycle realtime_tools trajectory_msgs)
+  hardware_interface rclcpp rclcpp_action rclcpp_lifecycle realtime_tools
+  trajectory_msgs)
 ament_export_libraries(mit_impedance_controller)
 ament_export_targets(export_mit_impedance_controller HAS_LIBRARY_TARGET)
 ament_package()

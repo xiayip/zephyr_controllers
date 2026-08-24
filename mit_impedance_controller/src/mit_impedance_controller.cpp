@@ -14,11 +14,13 @@ constexpr std::array<const char *, 5> kMitInterfaces = {"position", "velocity",
                                                         "kp", "kd", "t_ff"};
 constexpr std::array<const char *, 2> kReferenceInterfaces = {"position",
                                                               "velocity"};
-constexpr std::array<const char *, 17> kStateFields = {
+constexpr std::array<const char *, 19> kStateFields = {
     "position",
     "target_position_reference",
     "active_position_reference",
+    "commanded_position_reference",
     "position_error",
+    "commanded_position_error",
     "velocity",
     "velocity_reference",
     "raw_gravity_torque",
@@ -151,6 +153,7 @@ MitImpedanceController::on_configure(const rclcpp_lifecycle::State &) {
   if (joint_count == 0 || params_.downstream_controller.empty() ||
       !has_joint_count(params_.stiffness) ||
       !has_joint_count(params_.damping_coefficients) ||
+      !has_joint_count(params_.feedback.stiffness_torque_limit) ||
       !has_joint_count(params_.reference.position_rate_limit) ||
       !has_joint_count(params_.reference.velocity_limit) ||
       !has_joint_count(params_.gravity_compensation.scale) ||
@@ -228,6 +231,7 @@ MitImpedanceController::on_configure(const rclcpp_lifecycle::State &) {
   measured_velocities_.setZero(size);
   target_position_references_.setZero(size);
   active_position_references_.setZero(size);
+  commanded_position_references_.setZero(size);
   velocity_references_.setZero(size);
   raw_gravity_torques_.setZero(size);
   scaled_gravity_torques_.setZero(size);
@@ -506,6 +510,19 @@ bool MitImpedanceController::compute_target_command(
   const auto &upper = gravity_model_.upper_position_limits();
   for (std::size_t index = 0; index < params_.joints.size(); ++index) {
     const auto eigen_index = static_cast<Eigen::Index>(index);
+    const double stiffness = runtime_parameters.stiffness[index];
+    if (stiffness > 0.0) {
+      const double maximum_error =
+          params_.feedback.stiffness_torque_limit[index] / stiffness;
+      commanded_position_references_[eigen_index] =
+          measured_positions_[eigen_index] +
+          std::clamp(active_position_references_[eigen_index] -
+                         measured_positions_[eigen_index],
+                     -maximum_error, maximum_error);
+    } else {
+      commanded_position_references_[eigen_index] =
+          active_position_references_[eigen_index];
+    }
     scaled_gravity_torques_[eigen_index] =
         gravity_compensation_enabled_
             ? current_gravity_factor_ *
@@ -516,7 +533,7 @@ bool MitImpedanceController::compute_target_command(
 
     stiffness_torques_[eigen_index] =
         runtime_parameters.stiffness[index] *
-        (active_position_references_[eigen_index] -
+        (commanded_position_references_[eigen_index] -
          measured_positions_[eigen_index]);
 
     damping_torques_[eigen_index] =
@@ -578,6 +595,8 @@ bool MitImpedanceController::initialize_command(
     }
     target_position_references_[eigen_index] = measured_positions_[eigen_index];
     active_position_references_[eigen_index] = measured_positions_[eigen_index];
+    commanded_position_references_[eigen_index] =
+        measured_positions_[eigen_index];
     velocity_references_[eigen_index] = 0.0;
     const double previous_total_torque =
         old_kp * (old_position - measured_positions_[eigen_index]) +
@@ -612,7 +631,7 @@ bool MitImpedanceController::write_command(
     const auto &indices = command_indices_[index];
     const auto eigen_index = static_cast<Eigen::Index>(index);
     if (!command_interfaces_[indices.position].set_value(
-            active_position_references_[eigen_index]) ||
+            commanded_position_references_[eigen_index]) ||
         !command_interfaces_[indices.velocity].set_value(
             velocity_references_[eigen_index]) ||
         !command_interfaces_[indices.kp].set_value(
@@ -655,21 +674,24 @@ void MitImpedanceController::publish_state(const rclcpp::Time &time,
     values[0] = measured_positions_[eigen_index];
     values[1] = target_position_references_[eigen_index];
     values[2] = active_position_references_[eigen_index];
-    values[3] = active_position_references_[eigen_index] -
+    values[3] = commanded_position_references_[eigen_index];
+    values[4] = active_position_references_[eigen_index] -
                 measured_positions_[eigen_index];
-    values[4] = measured_velocities_[eigen_index];
-    values[5] = velocity_references_[eigen_index];
-    values[6] = raw_gravity_torques_[eigen_index];
-    values[7] = scaled_gravity_torques_[eigen_index];
-    values[8] = current_gravity_factor_;
-    values[9] = runtime_parameters->stiffness[index];
-    values[10] = runtime_parameters->damping[index];
-    values[11] = stiffness_torques_[eigen_index];
-    values[12] = damping_torques_[eigen_index];
-    values[13] = soft_limit_torques_[eigen_index];
-    values[14] = target_feedforward_torques_[eigen_index];
-    values[15] = commanded_feedforward_torques_[eigen_index];
-    values[16] = stiffness_torques_[eigen_index] +
+    values[5] = commanded_position_references_[eigen_index] -
+                measured_positions_[eigen_index];
+    values[6] = measured_velocities_[eigen_index];
+    values[7] = velocity_references_[eigen_index];
+    values[8] = raw_gravity_torques_[eigen_index];
+    values[9] = scaled_gravity_torques_[eigen_index];
+    values[10] = current_gravity_factor_;
+    values[11] = runtime_parameters->stiffness[index];
+    values[12] = runtime_parameters->damping[index];
+    values[13] = stiffness_torques_[eigen_index];
+    values[14] = damping_torques_[eigen_index];
+    values[15] = soft_limit_torques_[eigen_index];
+    values[16] = target_feedforward_torques_[eigen_index];
+    values[17] = commanded_feedforward_torques_[eigen_index];
+    values[18] = stiffness_torques_[eigen_index] +
                  damping_torques_[eigen_index] +
                  commanded_feedforward_torques_[eigen_index];
   }

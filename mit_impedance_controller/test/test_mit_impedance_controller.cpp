@@ -48,6 +48,8 @@ rclcpp::NodeOptions base_options(const bool gravity_enabled,
       rclcpp::Parameter("downstream_controller", "mit_output"),
       rclcpp::Parameter("stiffness", std::vector<double>{10.0}),
       rclcpp::Parameter("damping_coefficients", std::vector<double>{2.0}),
+      rclcpp::Parameter("feedback.stiffness_torque_limit",
+                        std::vector<double>{20.0}),
       rclcpp::Parameter("reference.position_rate_limit",
                         std::vector<double>{10.0}),
       rclcpp::Parameter("reference.velocity_limit", std::vector<double>{2.0}),
@@ -184,6 +186,32 @@ TEST(MitImpedanceControllerTest, PreservesEquivalentActivationTorque) {
   EXPECT_DOUBLE_EQ(*fixture.commands[2]->get_optional(), 10.0);
   EXPECT_DOUBLE_EQ(*fixture.commands[3]->get_optional(), 2.0);
   EXPECT_DOUBLE_EQ(*fixture.commands[4]->get_optional(), 0.0);
+  controller.release_interfaces();
+}
+
+TEST(MitImpedanceControllerTest, LimitsMotorSideSpringTorque) {
+  auto options = base_options(false, false, 0.0);
+  options.parameter_overrides().emplace_back("feedback.stiffness_torque_limit",
+                                             std::vector<double>{1.0});
+  mit_impedance_controller::MitImpedanceController controller;
+  ASSERT_EQ(controller.init("test_impedance_spring_limit", kPendulumUrdf, 200,
+                            "", options),
+            controller_interface::return_type::OK);
+  ASSERT_EQ(controller.on_configure(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
+  auto references = controller.export_reference_interfaces();
+  auto fixture =
+      assign_interfaces(controller, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+  ASSERT_EQ(controller.on_activate(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
+
+  ASSERT_TRUE(references[0]->set_value(0.5));
+  ASSERT_TRUE(references[1]->set_value(0.0));
+  ASSERT_EQ(controller.update_and_write_commands(
+                rclcpp::Time(0), rclcpp::Duration::from_seconds(0.1)),
+            controller_interface::return_type::OK);
+  EXPECT_NEAR(*fixture.commands[0]->get_optional(), 0.1, 1e-12);
+  EXPECT_DOUBLE_EQ(*fixture.commands[2]->get_optional(), 10.0);
   controller.release_interfaces();
 }
 

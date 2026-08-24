@@ -32,6 +32,16 @@ mit_impedance_controller:
       element_bounds<>: [0.0, 30.0],
     }
   }
+  feedback:
+    stiffness_torque_limit: {
+      type: double_array,
+      default_value: [],
+      description: "Per-joint motor-side spring torque limits in N*m, enforced by bounding the commanded equilibrium error.",
+      read_only: true,
+      validation: {
+        lower_element_bounds<>: 0.0,
+      }
+    }
   reference:
     position_rate_limit: {
       type: double_array,

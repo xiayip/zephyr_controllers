@@ -106,6 +106,7 @@ private:
   Eigen::VectorXd measured_velocities_;
   Eigen::VectorXd target_position_references_;
   Eigen::VectorXd active_position_references_;
+  Eigen::VectorXd commanded_position_references_;
   Eigen::VectorXd velocity_references_;
   Eigen::VectorXd raw_gravity_torques_;
   Eigen::VectorXd scaled_gravity_torques_;
