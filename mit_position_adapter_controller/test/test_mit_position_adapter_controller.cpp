@@ -83,8 +83,9 @@ TEST(MitPositionAdapterControllerTest,
   ASSERT_EQ(controller.on_activate(rclcpp_lifecycle::State()),
             controller_interface::CallbackReturn::SUCCESS);
 
-  EXPECT_DOUBLE_EQ(*references[0]->get_optional(), 0.8);
+  EXPECT_DOUBLE_EQ(*references[0]->get_optional(), 0.75);
   EXPECT_DOUBLE_EQ(*references[1]->get_optional(), 0.0);
+  EXPECT_NEAR(*commands[4]->get_optional(), 2.5, 1e-12);
   ASSERT_TRUE(references[0]->set_value(1.1));
   ASSERT_TRUE(references[1]->set_value(0.4));
   ASSERT_EQ(controller.update_and_write_commands(
@@ -94,7 +95,7 @@ TEST(MitPositionAdapterControllerTest,
   EXPECT_DOUBLE_EQ(*commands[1]->get_optional(), 0.4);
   EXPECT_DOUBLE_EQ(*commands[2]->get_optional(), 50.0);
   EXPECT_DOUBLE_EQ(*commands[3]->get_optional(), 3.0);
-  EXPECT_DOUBLE_EQ(*commands[4]->get_optional(), 0.0);
+  EXPECT_NEAR(*commands[4]->get_optional(), 2.4875, 1e-12);
 
   const auto gains_result = controller.get_node()->set_parameters_atomically(
       {rclcpp::Parameter("position_kp", std::vector<double>{40.0}),
@@ -163,7 +164,8 @@ TEST(MitPositionAdapterControllerTest, PreservesEquivalentTorqueOnActivation) {
 
   ASSERT_EQ(controller.on_activate(rclcpp_lifecycle::State()),
             controller_interface::CallbackReturn::SUCCESS);
-  EXPECT_NEAR(*commands[4]->get_optional(), -0.5, 1e-12);
+  EXPECT_DOUBLE_EQ(*commands[0]->get_optional(), 0.75);
+  EXPECT_NEAR(*commands[4]->get_optional(), 4.5, 1e-12);
 
   const double previous_torque = 50.0 * (0.8 - 0.75) + 2.0;
   const double new_torque = 100.0 * (*commands[0]->get_optional() - 0.75) +
@@ -173,6 +175,146 @@ TEST(MitPositionAdapterControllerTest, PreservesEquivalentTorqueOnActivation) {
   EXPECT_EQ(controller.on_deactivate(rclcpp_lifecycle::State()),
             controller_interface::CallbackReturn::SUCCESS);
   controller.release_interfaces();
+}
+
+class AdapterHandoverTest : public ::testing::Test {
+protected:
+  void configure(double torque_limit = 20.0, double torque_rate = 10000.0) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+        {rclcpp::Parameter("joints", std::vector<std::string>{"joint1"}),
+         rclcpp::Parameter("downstream_controller", "mit_output"),
+         rclcpp::Parameter("position_kp", std::vector<double>{120.0}),
+         rclcpp::Parameter("position_kd", std::vector<double>{4.0}),
+         rclcpp::Parameter("gravity_compensation.enabled", true),
+         rclcpp::Parameter("gravity_compensation.factor", 1.0),
+         rclcpp::Parameter("gravity_compensation.factor_transition_duration",
+                           1.0),
+         rclcpp::Parameter("gravity_compensation.transition_duration", 1.0),
+         rclcpp::Parameter("gravity_compensation.torque_limit",
+                           std::vector<double>{torque_limit}),
+         rclcpp::Parameter("gravity_compensation.torque_rate_limit",
+                           std::vector<double>{torque_rate})});
+    ASSERT_EQ(
+        controller.init("adapter_handover", kPendulumUrdf, 200, "", options),
+        controller_interface::return_type::OK);
+    ASSERT_EQ(controller.on_configure(rclcpp_lifecycle::State()),
+              controller_interface::CallbackReturn::SUCCESS);
+    references = controller.export_reference_interfaces();
+    commands = {make_command_interface("mit_output", "joint1/position", 0.0),
+                make_command_interface("mit_output", "joint1/velocity", 0.0),
+                make_command_interface("mit_output", "joint1/kp", 150.0),
+                make_command_interface("mit_output", "joint1/kd", 10.0),
+                make_command_interface("mit_output", "joint1/t_ff", 0.0)};
+    position = std::make_shared<hardware_interface::StateInterface>(
+        "joint1", "position", "double");
+    velocity = std::make_shared<hardware_interface::StateInterface>(
+        "joint1", "velocity", "double");
+    ASSERT_TRUE(position->set_value(0.0));
+    ASSERT_TRUE(velocity->set_value(0.0));
+    std::vector<hardware_interface::LoanedCommandInterface> c;
+    std::vector<hardware_interface::LoanedStateInterface> s;
+    for (const auto &handle : commands)
+      c.emplace_back(handle, nullptr);
+    s.emplace_back(position);
+    s.emplace_back(velocity);
+    controller.assign_interfaces(std::move(c), std::move(s));
+  }
+  void TearDown() override { controller.release_interfaces(); }
+  void activate() {
+    ASSERT_EQ(controller.on_activate(rclcpp_lifecycle::State()),
+              controller_interface::CallbackReturn::SUCCESS);
+  }
+  void tick(double seconds) {
+    ASSERT_EQ(controller.update_and_write_commands(
+                  rclcpp::Time(0), rclcpp::Duration::from_seconds(seconds)),
+              controller_interface::return_type::OK);
+  }
+  mit_position_adapter_controller::MitPositionAdapterController controller;
+  std::vector<hardware_interface::CommandInterface::SharedPtr> commands,
+      references;
+  hardware_interface::StateInterface::SharedPtr position, velocity;
+};
+
+TEST_F(AdapterHandoverTest,
+       WarmLoadPreloadBecomesFeedforwardWithoutDoubleRampDip) {
+  configure();
+  ASSERT_TRUE(commands[0]->set_value(-9.80665 / 150.0));
+  activate();
+  EXPECT_DOUBLE_EQ(*references[0]->get_optional(), 0.0);
+  EXPECT_DOUBLE_EQ(*references[1]->get_optional(), 0.0);
+  EXPECT_NEAR(*commands[4]->get_optional(), -9.80665, 1e-10);
+  for (int i = 0; i < 150; ++i) {
+    tick(.01);
+    EXPECT_NEAR(*commands[4]->get_optional(), -9.80665, 1e-6);
+    EXPECT_DOUBLE_EQ(*commands[0]->get_optional(), 0.0);
+  }
+}
+
+TEST_F(AdapterHandoverTest, ColdStartUsesOneBlendAndKeepsRuntimeFactorRamp) {
+  configure();
+  activate();
+  EXPECT_DOUBLE_EQ(*commands[4]->get_optional(), 0.0);
+  for (int i = 1; i <= 4; ++i) {
+    tick(.25);
+    EXPECT_NEAR(*commands[4]->get_optional(), -.25 * i * 9.80665, 1e-6);
+  }
+  ASSERT_TRUE(
+      controller.get_node()
+          ->set_parameter(rclcpp::Parameter("gravity_compensation.factor", 0.0))
+          .successful);
+  tick(.25);
+  EXPECT_NEAR(*commands[4]->get_optional(), -.75 * 9.80665, 1e-6);
+}
+
+TEST_F(AdapterHandoverTest,
+       PreservesTorqueWithMovingReferenceAndChangedDerivativeGain) {
+  configure();
+  ASSERT_TRUE(commands[0]->set_value(.05));
+  ASSERT_TRUE(commands[1]->set_value(.3));
+  ASSERT_TRUE(commands[4]->set_value(1.2));
+  ASSERT_TRUE(velocity->set_value(.2));
+  activate();
+  EXPECT_DOUBLE_EQ(*references[0]->get_optional(), 0.0);
+  EXPECT_DOUBLE_EQ(*references[1]->get_optional(), 0.0);
+  EXPECT_NEAR(*commands[4]->get_optional(), 10.5, 1e-12);
+  const double torque = *commands[4]->get_optional() - 4.0 * .2;
+  EXPECT_NEAR(torque, 150.0 * .05 + 10.0 * (.3 - .2) + 1.2, 1e-12);
+}
+
+TEST_F(AdapterHandoverTest,
+       RejectsUnrepresentableLoadWithoutClampingOrWritingDownstream) {
+  configure(1.0);
+  ASSERT_TRUE(commands[0]->set_value(-9.80665 / 150.0));
+  EXPECT_EQ(controller.on_activate(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::ERROR);
+  EXPECT_DOUBLE_EQ(*commands[0]->get_optional(), -9.80665 / 150.0);
+  EXPECT_DOUBLE_EQ(*commands[2]->get_optional(), 150.0);
+  EXPECT_DOUBLE_EQ(*commands[4]->get_optional(), 0.0);
+}
+
+TEST_F(AdapterHandoverTest, StartupBlendStillHonorsTorqueRateLimit) {
+  configure(20.0, 2.0);
+  activate();
+  double previous = 0.0;
+  for (int i = 0; i < 20; ++i) {
+    tick(.25);
+    const double now = *commands[4]->get_optional();
+    EXPECT_LE(std::abs(now - previous), .5 + 1e-12);
+    previous = now;
+  }
+  EXPECT_NEAR(previous, -9.80665, 1e-6);
+}
+
+TEST_F(AdapterHandoverTest,
+       RejectsNonfiniteStateWithoutDroppingExistingFeedforward) {
+  configure();
+  ASSERT_TRUE(commands[4]->set_value(2.0));
+  ASSERT_TRUE(velocity->set_value(std::numeric_limits<double>::quiet_NaN()));
+  EXPECT_EQ(controller.on_activate(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::ERROR);
+  EXPECT_DOUBLE_EQ(*commands[4]->get_optional(), 2.0);
+  EXPECT_DOUBLE_EQ(*commands[2]->get_optional(), 150.0);
 }
 
 TEST(MitPositionAdapterControllerTest, WritesPinocchioGravityFeedforward) {

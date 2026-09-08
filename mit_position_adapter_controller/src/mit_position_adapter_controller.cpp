@@ -390,53 +390,70 @@ bool MitPositionAdapterController::initialize_references() {
 
     const auto measured_velocity =
         state_interfaces_[velocity_state_indices_[index]].get_optional();
-    measured_velocities_[static_cast<Eigen::Index>(index)] =
-        measured_velocity && std::isfinite(*measured_velocity)
-            ? *measured_velocity
-            : 0.0;
+    if (!measured_velocity || !std::isfinite(*measured_velocity)) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+                   "No finite startup velocity for joint '%s'",
+                   params_.joints[index].c_str());
+      return false;
+    }
+    measured_velocities_[static_cast<Eigen::Index>(index)] = *measured_velocity;
 
     const auto &indices = command_indices_[index];
-    const auto downstream_position =
+    const auto old_position =
         command_interfaces_[indices.position].get_optional();
-    if (downstream_position && std::isfinite(*downstream_position)) {
-      position_references_[index] = *downstream_position;
-    } else {
-      position_references_[index] = *measured_position;
+    const auto old_velocity =
+        command_interfaces_[indices.velocity].get_optional();
+    const auto old_kp = command_interfaces_[indices.kp].get_optional();
+    const auto old_kd = command_interfaces_[indices.kd].get_optional();
+    const auto old_feedforward =
+        command_interfaces_[indices.t_ff].get_optional();
+    if (!old_position || !std::isfinite(*old_position) || !old_velocity ||
+        !std::isfinite(*old_velocity) || !old_kp ||
+        !finite_nonnegative(*old_kp) || !old_kd ||
+        !finite_nonnegative(*old_kd) || !old_feedforward ||
+        !std::isfinite(*old_feedforward)) {
+      RCLCPP_ERROR(get_node()->get_logger(),
+                   "No finite downstream MIT tuple for joint '%s'",
+                   params_.joints[index].c_str());
+      return false;
     }
-
-    const auto read_or = [this](const std::size_t command_index,
-                                const double fallback) {
-      const auto value = command_interfaces_[command_index].get_optional();
-      return value && std::isfinite(*value) ? *value : fallback;
-    };
-    const double old_position = read_or(indices.position, *measured_position);
-    const double old_velocity = read_or(indices.velocity, 0.0);
-    velocity_references_[index] = old_velocity;
-    const double old_kp = read_or(indices.kp, gains->kp[index]);
-    const double old_kd = read_or(indices.kd, gains->kd[index]);
-    const double old_feedforward = read_or(indices.t_ff, 0.0);
+    // A motor-side preload is torque support, not a JTC position goal.
+    // Start a stationary reference at measured q and transfer the complete
+    // old feedback/feedforward contribution into the initial t_ff instead.
+    position_references_[index] = *measured_position;
+    velocity_references_[index] = 0.0;
     const double measured_velocity_value =
         measured_velocities_[static_cast<Eigen::Index>(index)];
     const double old_torque =
-        old_kp * (old_position - *measured_position) +
-        old_kd * (old_velocity - measured_velocity_value) + old_feedforward;
+        *old_kp * (*old_position - *measured_position) +
+        *old_kd * (*old_velocity - measured_velocity_value) + *old_feedforward;
     const double new_feedback_torque =
         gains->kp[index] * (position_references_[index] - *measured_position) +
         gains->kd[index] *
             (velocity_references_[index] - measured_velocity_value);
     initial_feedforward[static_cast<Eigen::Index>(index)] =
         old_torque - new_feedback_torque;
-
-    const auto reference_offset = index * kReferenceInterfaces.size();
-    (void)reference_handles_[reference_offset]->set_value(
-        position_references_[index]);
-    (void)reference_handles_[reference_offset + 1]->set_value(
-        velocity_references_[index]);
+    const double limit = params_.gravity_compensation.torque_limit.empty()
+                             ? 1.0e6
+                             : params_.gravity_compensation.torque_limit[index];
+    if (!std::isfinite(initial_feedforward[static_cast<Eigen::Index>(index)]) ||
+        std::abs(initial_feedforward[static_cast<Eigen::Index>(index)]) >
+            limit) {
+      // reset() clamps internally. Reject before writing any downstream
+      // command instead of silently dropping load torque during takeover.
+      RCLCPP_ERROR(get_node()->get_logger(),
+                   "Startup feedforward for '%s' exceeds the configured limit",
+                   params_.joints[index].c_str());
+      return false;
+    }
   }
 
   raw_gravity_torques_.setZero();
   factored_gravity_torques_.setZero();
-  current_gravity_factor_ = 0.0;
+  // The shaper already blends inherited torque into calibrated gravity.
+  // Factor ramping is for runtime parameter changes, not a second startup fade.
+  current_gravity_factor_ =
+      target_gravity_factor_.load(std::memory_order_relaxed);
   if (gravity_compensation_enabled_ &&
       !gravity_model_.compute(measured_positions_, raw_gravity_torques_)) {
     RCLCPP_ERROR(get_node()->get_logger(),
@@ -449,6 +466,13 @@ bool MitPositionAdapterController::initialize_references() {
     RCLCPP_ERROR(get_node()->get_logger(),
                  "Failed to initialize gravity feed-forward transition");
     return false;
+  }
+  for (std::size_t index = 0; index < params_.joints.size(); ++index) {
+    const auto reference_offset = index * kReferenceInterfaces.size();
+    (void)reference_handles_[reference_offset]->set_value(
+        position_references_[index]);
+    (void)reference_handles_[reference_offset + 1]->set_value(
+        velocity_references_[index]);
   }
   return write_position_mode(*gains);
 }

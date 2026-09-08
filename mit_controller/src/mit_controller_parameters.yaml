@@ -1,4 +1,13 @@
 mit_controller:
+  max_position_step: {
+    type: double,
+    default_value: 0.02,
+    description: "Maximum motor position-reference change per write. Must not exceed the downstream hardware position step limit; coupled torque interpolation preserves handover continuity.",
+    read_only: true,
+    validation: {
+      gt<>: [0.0],
+    }
+  }
   joints: {
     type: string_array,
     default_value: [],

@@ -54,6 +54,7 @@ install(
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(mit_controller REQUIRED)
   ament_add_gtest(
     test_mit_position_adapter_controller
     test/test_mit_position_adapter_controller.cpp
@@ -68,6 +69,14 @@ if(BUILD_TESTING)
     rclcpp
     rclcpp_lifecycle
     realtime_tools
+  )
+  ament_add_gtest(test_mit_chain_handover
+    test/test_mit_chain_handover.cpp
+    SKIP_LINKING_MAIN_LIBRARIES
+  )
+  target_link_libraries(test_mit_chain_handover mit_position_adapter_controller)
+  ament_target_dependencies(test_mit_chain_handover
+    mit_controller controller_interface hardware_interface rclcpp rclcpp_lifecycle
   )
 endif()
 

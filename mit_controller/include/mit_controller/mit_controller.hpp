@@ -51,10 +51,20 @@ private:
     std::size_t t_ff;
   };
 
+  struct Command {
+    double position;
+    double velocity;
+    double kp;
+    double kd;
+    double t_ff;
+  };
+
   std::size_t find_command_interface(const std::string &full_name) const;
   std::size_t find_state_interface(const std::string &full_name) const;
   bool bind_interfaces();
   bool initialize_hold();
+  bool capture_hold(std::size_t joint_index, const Command &command);
+  bool enter_hold();
   bool write_hold();
   bool write_joint_command(std::size_t joint_index, double position,
                            double velocity, double kp, double kd, double t_ff);
@@ -65,9 +75,14 @@ private:
   Params params_;
   std::vector<CommandIndices> command_indices_;
   std::vector<std::size_t> position_state_indices_;
+  std::vector<std::size_t> velocity_state_indices_;
   std::vector<double> hold_positions_;
   std::vector<double> hold_kp_;
   std::vector<double> hold_kd_;
+  std::vector<double> hold_t_ff_;
+  std::vector<double> hold_measured_velocities_;
+  std::vector<Command> last_commands_;
+  bool holding_{false};
   std::vector<hardware_interface::CommandInterface::SharedPtr>
       reference_handles_;
 };
