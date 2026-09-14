@@ -78,6 +78,14 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_mit_chain_handover
     mit_controller controller_interface hardware_interface rclcpp rclcpp_lifecycle
   )
+  ament_add_gtest(test_mit_position_friction
+    test/test_mit_position_friction.cpp
+    SKIP_LINKING_MAIN_LIBRARIES
+  )
+  target_link_libraries(test_mit_position_friction mit_position_adapter_controller)
+  ament_target_dependencies(test_mit_position_friction
+    control_msgs controller_interface hardware_interface rclcpp rclcpp_lifecycle
+  )
 endif()
 
 ament_export_dependencies(

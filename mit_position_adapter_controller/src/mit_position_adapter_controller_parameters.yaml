@@ -41,6 +41,41 @@ mit_position_adapter_controller:
       gt<>: [0.0],
     }
   }
+  friction_compensation:
+    enabled: {
+      type: bool,
+      default_value: false,
+      description: "Runtime switch for bounded Coulomb/viscous feed-forward based on commanded velocity. Changes pass through the total feed-forward rate limiter.",
+      read_only: false,
+    }
+    coulomb: {
+      type: double_array,
+      default_value: [],
+      description: "Runtime per-joint Coulomb coefficients in N*m. Empty at startup means zeros; runtime arrays must match joints.",
+      read_only: false,
+      validation: {element_bounds<>: [0.0, 5.0]},
+    }
+    viscous: {
+      type: double_array,
+      default_value: [],
+      description: "Runtime per-joint viscous coefficients in N*m/(rad/s). Empty at startup means zeros.",
+      read_only: false,
+      validation: {element_bounds<>: [0.0, 10.0]},
+    }
+    velocity_smoothing: {
+      type: double_array,
+      default_value: [],
+      description: "Positive per-joint tanh velocity scale in rad/s. Empty at startup means 0.04. Uses reference, not measured velocity.",
+      read_only: false,
+      validation: {element_bounds<>: [0.001, 10.0]},
+    }
+    torque_limit: {
+      type: double_array,
+      default_value: [],
+      description: "Nonnegative absolute friction-only limits in N*m. Empty means zeros, so explicit limits are required for a nonzero contribution. Zero disables compensation on that joint.",
+      read_only: true,
+      validation: {element_bounds<>: [0.0, 5.0]},
+    }
   gravity_compensation:
     enabled: {
       type: bool,
@@ -93,19 +128,19 @@ mit_position_adapter_controller:
     torque_limit: {
       type: double_array,
       default_value: [],
-      description: "Optional absolute per-joint feed-forward torque limits in N*m.",
+      description: "Optional absolute per-joint TOTAL feed-forward torque limits in N*m (gravity plus friction, not motor-side PD).",
       read_only: true,
     }
     torque_rate_limit: {
       type: double_array,
       default_value: [],
-      description: "Optional per-joint feed-forward torque rate limits in N*m/s.",
+      description: "Optional per-joint TOTAL feed-forward torque rate limits in N*m/s, including runtime friction changes.",
       read_only: true,
     }
     transition_duration: {
       type: double,
       default_value: 1.0,
-      description: "Duration used to blend the activation torque into gravity compensation.",
+      description: "Duration used to blend inherited activation torque into gravity plus friction feed-forward.",
       read_only: true,
       validation: {
         gt_eq<>: [0.0],

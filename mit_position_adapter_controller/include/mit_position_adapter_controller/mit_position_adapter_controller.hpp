@@ -64,6 +64,17 @@ private:
     std::vector<double> bias;
   };
 
+  struct FrictionParameters {
+    bool enabled;
+    std::vector<double> coulomb;
+    std::vector<double> viscous;
+    std::vector<double> velocity_smoothing;
+  };
+
+  static FrictionParameters friction_parameters(const Params &params);
+  static bool valid_friction_parameters(const FrictionParameters &parameters,
+                                        std::size_t joint_count);
+
   struct CommandIndices {
     std::size_t position;
     std::size_t velocity;
@@ -79,8 +90,9 @@ private:
   bool update_measured_state();
   bool update_gravity_factor(double period_seconds) noexcept;
   bool
-  update_gravity_feedforward(double period_seconds,
-                             const GravityCalibration &gravity_calibration);
+  update_feedforward(double period_seconds,
+                     const GravityCalibration &gravity_calibration,
+                     const FrictionParameters &friction);
   bool write_position_mode(const PositionGains &gains);
   void publish_mit_state(const rclcpp::Time &time, double period_seconds,
                          const PositionGains &gains,
@@ -96,17 +108,22 @@ private:
   realtime_tools::RealtimeBuffer<PositionGains> position_gains_buffer_;
   realtime_tools::RealtimeBuffer<GravityCalibration>
       gravity_calibration_buffer_;
+  realtime_tools::RealtimeBuffer<FrictionParameters> friction_parameters_buffer_;
   std::vector<CommandIndices> command_indices_;
   std::vector<std::size_t> position_state_indices_;
   std::vector<std::size_t> velocity_state_indices_;
   std::vector<double> position_references_;
   std::vector<double> velocity_references_;
   gravity_compensation_model::GravityCompensationModel gravity_model_;
-  gravity_compensation_model::GravityFeedforwardShaper gravity_shaper_;
+  gravity_compensation_model::GravityFeedforwardShaper feedforward_shaper_;
   Eigen::VectorXd measured_positions_;
   Eigen::VectorXd measured_velocities_;
   Eigen::VectorXd raw_gravity_torques_;
   Eigen::VectorXd factored_gravity_torques_;
+  Eigen::VectorXd friction_torque_limits_;
+  Eigen::VectorXd raw_friction_torques_;
+  Eigen::VectorXd friction_compensation_torques_;
+  Eigen::VectorXd target_feedforward_torques_;
   Eigen::VectorXd feedforward_torques_;
   bool gravity_compensation_enabled_{false};
   std::atomic<double> target_gravity_factor_{0.0};

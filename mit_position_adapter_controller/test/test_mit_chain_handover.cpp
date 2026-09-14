@@ -1,6 +1,7 @@
 // Real controller instances, loaned interfaces and lifecycle transitions.
 // No CAN transport, hardware launch, or trajectory action server is used.
 #include <array>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
@@ -20,7 +21,8 @@ constexpr std::array<double, 6> kKd = {3, 10, 10, 5, 4, 4};
 
 class MitChainTest : public ::testing::Test {
 protected:
-  void configure(bool loaded, bool insufficient_limit = false) {
+  void configure(bool loaded, bool insufficient_limit = false,
+                 bool friction = false) {
     std::vector<std::string> joints;
     for (int i = 1; i <= 6; ++i)
       joints.push_back("joint" + std::to_string(i));
@@ -41,7 +43,14 @@ protected:
                            std::vector<double>{40, 120, 120, 40, 40, 40}),
          rclcpp::Parameter("position_kd",
                            std::vector<double>{2, 4, 4, 3, 3, 3}),
-         rclcpp::Parameter("gravity_compensation.torque_limit", limits)});
+         rclcpp::Parameter("gravity_compensation.torque_limit", limits),
+         rclcpp::Parameter("friction_compensation.enabled", friction),
+         rclcpp::Parameter("friction_compensation.coulomb",
+                           std::vector<double>{0, 0, .4, 0, 0, 0}),
+         rclcpp::Parameter("friction_compensation.viscous",
+                           std::vector<double>{0, 0, .2, 0, 0, 0}),
+         rclcpp::Parameter("friction_compensation.torque_limit",
+                           std::vector<double>{0, 0, .5, 0, 0, 0})});
     ASSERT_EQ(adapter.init("chain_adapter", "", 200, "", adapter_options),
               controller_interface::return_type::OK);
     ASSERT_EQ(adapter.on_configure(rclcpp_lifecycle::State()),
@@ -174,6 +183,33 @@ TEST_F(MitChainTest, ColdActivationMovingStopAndReactivation) {
 }
 TEST_F(MitChainTest, WarmActivationMovingStopAndReactivation) {
   run_cycle(true);
+}
+
+TEST_F(MitChainTest, FrictionReachesOnlyConfiguredJointThroughMitChain) {
+  configure(false, false, true);
+  ASSERT_EQ(mit.on_activate(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
+  ASSERT_TRUE(mit.set_chained_mode(true));
+  ASSERT_EQ(adapter.on_activate(rclcpp_lifecycle::State()),
+            controller_interface::CallbackReturn::SUCCESS);
+  for (const double velocity : {.04, -.04, 0.}) {
+    for (std::size_t i = 0; i < 6; ++i)
+      ASSERT_TRUE(adapter_refs[i * 2 + 1]->set_value(velocity));
+    ASSERT_EQ(adapter.update_and_write_commands(
+                  rclcpp::Time(0), rclcpp::Duration::from_seconds(1.)),
+              controller_interface::return_type::OK);
+    ASSERT_EQ(mit.update(rclcpp::Time(0), rclcpp::Duration::from_seconds(.005)),
+              controller_interface::return_type::OK);
+    for (std::size_t i = 0; i < 6; ++i) {
+      const double expected =
+          i == 2 ? .4 * std::tanh(velocity / .04) + .2 * velocity : 0.;
+      EXPECT_NEAR(*hardware[i * 5 + 4]->get_optional(), expected, 1e-12)
+          << "joint" << i + 1;
+      EXPECT_DOUBLE_EQ(*hardware[i * 5 + 1]->get_optional(), velocity);
+      EXPECT_DOUBLE_EQ(*hardware[i * 5]->get_optional(),
+                       *states[i * 2]->get_optional());
+    }
+  }
 }
 
 TEST_F(MitChainTest, SixthJointRejectionDoesNotModifyTheFirstFiveReferences) {

@@ -18,7 +18,7 @@ This meta-package includes the following controller packages:
   equilibrium references, bounded motor-side MIT spring feedback, configurable smooth
   Coulomb/viscous friction feed-forward, ROS feed-forward shaping, and a blocked-trajectory guard
 - **mit_position_adapter_controller** - Completes position and velocity references into full MIT
-  commands and publishes their realtime torque decomposition
+  commands with optional bounded, smooth friction feed-forward and realtime torque decomposition
 - **omni_picker_controller** - The Omni picker controller
 - **swerve_drive_controller** - Controller for a 4 wheel swerve drive robot base
 
@@ -108,6 +108,77 @@ ROS_DOMAIN_ID=211 ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST colcon test \
 These include cold/warm six-joint controller-chain lifecycles, gain/velocity
 changes, invalid feedback, torque/rate limits and final hardware command flushing.
 They do not open CAN or establish real-machine safety.
+
+## Position Adapter friction feed-forward
+
+The Position Adapter supports the same velocity-based model as the impedance
+controller, but has its own parameters; configuring one does not configure the
+other:
+
+```text
+raw_friction = enabled ? Fc * tanh(v_ref / v_smooth) + B * v_ref : 0
+friction = clamp(raw_friction, -friction_limit, +friction_limit)
+target_ff = calibrated_gravity + friction
+t_ff = existing_activation_blend_and_rate_limiter(target_ff)
+```
+
+The final shaper retains the existing `gravity_compensation.torque_limit`,
+`torque_rate_limit` and `transition_duration` parameter names for compatibility.
+Those limits apply to **total feed-forward**, including friction, not to the
+motor-side PD torque. Friction does not enlarge the existing feed-forward budget;
+it can use only the remaining headroom. Startup retains the inherited complete
+MIT torque before blending, and deactivation does not abruptly remove friction
+from the tuple passed to the MIT hold logic.
+
+`friction_compensation.enabled` defaults to `false`. `coulomb` (N*m), `viscous`
+(N*m/(rad/s)) and `velocity_smoothing` (rad/s) are runtime-adjustable per-joint
+arrays. Empty startup arrays mean respectively zero, zero and 0.04; runtime
+updates must contain one finite valid value per joint. `torque_limit` is a
+configure-time, nonnegative per-joint array: empty/zero means **no friction
+contribution**, so configure explicit limits before enabling compensation.
+
+For example, a **disabled experimental configuration**, not calibrated gains:
+
+```yaml
+zephyr_arm_position_adapter:
+  ros__parameters:
+    # Keep the existing joints, gains and gravity calibration unchanged.
+    friction_compensation:
+      enabled: false
+      coulomb: [0.0, 0.0, 0.2, 0.0, 0.0, 0.0]
+      viscous: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      velocity_smoothing: [0.04, 0.04, 0.04, 0.04, 0.04, 0.04]
+      torque_limit: [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]
+```
+
+After loading the new library and configuring limits, `enabled` can be changed
+at runtime for an A/B test. Enable/disable, coefficient changes and direction
+reversals all pass through the total feed-forward rate limiter; disabling is
+therefore a ramp to zero, **not an emergency stop**. No new position or velocity
+reference is generated, and the motor-side Kp/Kd are unchanged.
+
+The friction model uses **commanded velocity**, not noisy measured velocity.
+At `v_ref=0` its target is zero; previously applied torque can persist briefly
+while the rate limiter settles. This model does not latch static friction,
+integrate position error, or guarantee zero endpoint error. Establish a separate
+baseline for static load/model errors, then compare the same trajectory at similar
+temperature with identical gains. Do not copy the impedance controller's fitted
+coefficient without validating this control chain.
+
+`~/mit_state` retains its existing nine fields and appends:
+
+- `raw_friction_torque`: model output before the friction-only clamp (zero when disabled).
+- `friction_compensation_torque`: friction-only clamped contribution, before total shaping.
+- `target_feedforward_torque`: gravity plus that contribution, before total shaping.
+
+The existing `feedforward_torque` is the final shaped total passed to MIT. These
+fields describe requested commands, not independently measured output torque;
+the existing `commanded_torque` remains a diagnostic FF+P+D estimate. During a
+startup blend or saturation, the requested friction term need not equal the
+increment in transmitted total feed-forward. Observe the final tuple on CAN too.
+
+The new `test_mit_position_friction` regressions run with the other offline
+Position Adapter tests, without CAN or real hardware.
 
 ## Dependencies
 

@@ -16,12 +16,13 @@ constexpr std::array<const char *, 2> kStateInterfaces = {"position",
                                                           "velocity"};
 constexpr std::array<const char *, 2> kReferenceInterfaces = {"position",
                                                               "velocity"};
-constexpr std::array<const char *, 9> kMitStateInterfaces = {
+constexpr std::array<const char *, 12> kMitStateInterfaces = {
     "position_reference",       "velocity_reference",
     "raw_gravity_torque",       "scaled_gravity_torque",
     "gravity_factor",           "feedforward_torque",
     "position_feedback_torque", "velocity_feedback_torque",
-    "commanded_torque",
+    "commanded_torque",         "raw_friction_torque",
+    "friction_compensation_torque", "target_feedforward_torque",
 };
 
 bool finite_nonnegative(const double value) {
@@ -30,6 +31,10 @@ bool finite_nonnegative(const double value) {
 
 bool finite_absolute_bounded(const double value, const double limit) {
   return std::isfinite(value) && std::abs(value) <= limit;
+}
+
+bool finite_in_range(const double value, const double lower, const double upper) {
+  return std::isfinite(value) && value >= lower && value <= upper;
 }
 
 Eigen::VectorXd parameter_vector(const std::vector<double> &values,
@@ -43,6 +48,34 @@ Eigen::VectorXd parameter_vector(const std::vector<double> &values,
       values.data(), static_cast<Eigen::Index>(values.size()));
 }
 } // namespace
+
+MitPositionAdapterController::FrictionParameters
+MitPositionAdapterController::friction_parameters(const Params &params) {
+  const auto count = params.joints.size();
+  const auto &friction = params.friction_compensation;
+  return {friction.enabled,
+          friction.coulomb.empty() ? std::vector<double>(count, 0.0)
+                                  : friction.coulomb,
+          friction.viscous.empty() ? std::vector<double>(count, 0.0)
+                                  : friction.viscous,
+          friction.velocity_smoothing.empty()
+              ? std::vector<double>(count, 0.04)
+              : friction.velocity_smoothing};
+}
+
+bool MitPositionAdapterController::valid_friction_parameters(
+    const FrictionParameters &parameters, const std::size_t joint_count) {
+  return parameters.coulomb.size() == joint_count &&
+         parameters.viscous.size() == joint_count &&
+         parameters.velocity_smoothing.size() == joint_count &&
+         std::all_of(parameters.coulomb.begin(), parameters.coulomb.end(),
+                     [](double v) { return finite_in_range(v, 0.0, 5.0); }) &&
+         std::all_of(parameters.viscous.begin(), parameters.viscous.end(),
+                     [](double v) { return finite_in_range(v, 0.0, 10.0); }) &&
+         std::all_of(parameters.velocity_smoothing.begin(),
+                     parameters.velocity_smoothing.end(),
+                     [](double v) { return finite_in_range(v, 0.001, 10.0); });
+}
 
 MitPositionAdapterController::~MitPositionAdapterController() {
   if (param_listener_) {
@@ -68,7 +101,14 @@ controller_interface::CallbackReturn MitPositionAdapterController::on_init() {
                 parameter.get_name() == "gravity_compensation.scale";
             const bool is_gravity_bias =
                 parameter.get_name() == "gravity_compensation.bias";
-            if (!is_position_gain && !is_gravity_scale && !is_gravity_bias) {
+            const bool is_coulomb =
+                parameter.get_name() == "friction_compensation.coulomb";
+            const bool is_viscous =
+                parameter.get_name() == "friction_compensation.viscous";
+            const bool is_smoothing =
+                parameter.get_name() == "friction_compensation.velocity_smoothing";
+            if (!is_position_gain && !is_gravity_scale && !is_gravity_bias &&
+                !is_coulomb && !is_viscous && !is_smoothing) {
               continue;
             }
             if (parameter.get_type() !=
@@ -78,19 +118,20 @@ controller_interface::CallbackReturn MitPositionAdapterController::on_init() {
               return result;
             }
             const auto values = parameter.as_double_array();
-            const bool values_valid =
-                is_position_gain ? std::all_of(values.begin(), values.end(),
-                                               finite_nonnegative)
-                : is_gravity_scale
-                    ? std::all_of(values.begin(), values.end(),
-                                  [](const double value) {
-                                    return finite_nonnegative(value) &&
-                                           value <= 2.0;
-                                  })
-                    : std::all_of(values.begin(), values.end(),
-                                  [](const double value) {
-                                    return finite_absolute_bounded(value, 5.0);
-                                  });
+            const bool values_valid = std::all_of(
+                values.begin(), values.end(), [=](const double value) {
+                  if (is_position_gain) {
+                    return finite_nonnegative(value);
+                  }
+                  if (is_gravity_bias) {
+                    return finite_absolute_bounded(value, 5.0);
+                  }
+                  const double lower = is_smoothing ? 0.001 : 0.0;
+                  const double upper = is_gravity_scale ? 2.0
+                                       : is_coulomb    ? 5.0
+                                                       : 10.0;
+                  return finite_in_range(value, lower, upper);
+                });
             if (values.size() != expected_size || !values_valid) {
               result.successful = false;
               result.reason = parameter.get_name() +
@@ -104,6 +145,10 @@ controller_interface::CallbackReturn MitPositionAdapterController::on_init() {
       target_gravity_factor_.store(updated_params.gravity_compensation.factor,
                                    std::memory_order_relaxed);
       const auto joint_count = updated_params.joints.size();
+      const auto friction = friction_parameters(updated_params);
+      if (valid_friction_parameters(friction, joint_count)) {
+        friction_parameters_buffer_.writeFromNonRT(friction);
+      }
       if (updated_params.position_kp.size() == joint_count &&
           updated_params.position_kd.size() == joint_count &&
           std::all_of(updated_params.position_kp.begin(),
@@ -167,6 +212,21 @@ MitPositionAdapterController::on_configure(const rclcpp_lifecycle::State &) {
   }
   position_gains_buffer_.initRT({params_.position_kp, params_.position_kd});
 
+  const auto friction = friction_parameters(params_);
+  friction_torque_limits_ = parameter_vector(
+      params_.friction_compensation.torque_limit, joint_count, 0.0);
+  if (!valid_friction_parameters(friction, joint_count) ||
+      friction_torque_limits_.size() != static_cast<Eigen::Index>(joint_count) ||
+      !friction_torque_limits_.allFinite() ||
+      (friction_torque_limits_.array() < 0.0).any() ||
+      (friction_torque_limits_.array() > 5.0).any()) {
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Friction coefficients, smoothing, and limits must be valid "
+                 "and empty or match joints");
+    return controller_interface::CallbackReturn::ERROR;
+  }
+  friction_parameters_buffer_.initRT(friction);
+
   if (params_.gravity_compensation.gravity.size() != 3) {
     RCLCPP_ERROR(
         get_node()->get_logger(),
@@ -206,9 +266,9 @@ MitPositionAdapterController::on_configure(const rclcpp_lifecycle::State &) {
   shaper_config.transition_duration =
       params_.gravity_compensation.transition_duration;
   std::string model_error;
-  if (!gravity_shaper_.configure(shaper_config, model_error)) {
+  if (!feedforward_shaper_.configure(shaper_config, model_error)) {
     RCLCPP_ERROR(get_node()->get_logger(),
-                 "Invalid gravity feed-forward configuration: %s",
+                 "Invalid feed-forward shaping configuration: %s",
                  model_error.c_str());
     return controller_interface::CallbackReturn::ERROR;
   }
@@ -242,6 +302,9 @@ MitPositionAdapterController::on_configure(const rclcpp_lifecycle::State &) {
   measured_velocities_.setZero(static_cast<Eigen::Index>(joint_count));
   raw_gravity_torques_.setZero(static_cast<Eigen::Index>(joint_count));
   factored_gravity_torques_.setZero(static_cast<Eigen::Index>(joint_count));
+  raw_friction_torques_.setZero(static_cast<Eigen::Index>(joint_count));
+  friction_compensation_torques_.setZero(static_cast<Eigen::Index>(joint_count));
+  target_feedforward_torques_.setZero(static_cast<Eigen::Index>(joint_count));
   feedforward_torques_.setZero(static_cast<Eigen::Index>(joint_count));
   reference_handles_.clear();
   reference_handles_.reserve(joint_count * kReferenceInterfaces.size());
@@ -450,6 +513,9 @@ bool MitPositionAdapterController::initialize_references() {
 
   raw_gravity_torques_.setZero();
   factored_gravity_torques_.setZero();
+  raw_friction_torques_.setZero();
+  friction_compensation_torques_.setZero();
+  target_feedforward_torques_.setZero();
   // The shaper already blends inherited torque into calibrated gravity.
   // Factor ramping is for runtime parameter changes, not a second startup fade.
   current_gravity_factor_ =
@@ -460,11 +526,11 @@ bool MitPositionAdapterController::initialize_references() {
                  "Failed to compute initial Pinocchio gravity torque");
     return false;
   }
-  if (!gravity_shaper_.reset(initial_feedforward) ||
-      !gravity_shaper_.update(factored_gravity_torques_, 0.0,
-                              feedforward_torques_)) {
+  if (!feedforward_shaper_.reset(initial_feedforward) ||
+      !feedforward_shaper_.update(target_feedforward_torques_, 0.0,
+                                 feedforward_torques_)) {
     RCLCPP_ERROR(get_node()->get_logger(),
-                 "Failed to initialize gravity feed-forward transition");
+                 "Failed to initialize feed-forward transition");
     return false;
   }
   for (std::size_t index = 0; index < params_.joints.size(); ++index) {
@@ -517,9 +583,10 @@ bool MitPositionAdapterController::update_gravity_factor(
   return true;
 }
 
-bool MitPositionAdapterController::update_gravity_feedforward(
+bool MitPositionAdapterController::update_feedforward(
     const double period_seconds,
-    const GravityCalibration &gravity_calibration) {
+    const GravityCalibration &gravity_calibration,
+    const FrictionParameters &friction) {
   if (!update_measured_state() || !update_gravity_factor(period_seconds)) {
     return false;
   }
@@ -538,8 +605,30 @@ bool MitPositionAdapterController::update_gravity_feedforward(
     raw_gravity_torques_.setZero();
     factored_gravity_torques_.setZero();
   }
-  return gravity_shaper_.update(factored_gravity_torques_, period_seconds,
-                                feedforward_torques_);
+  for (std::size_t index = 0; index < params_.joints.size(); ++index) {
+    const auto i = static_cast<Eigen::Index>(index);
+    const double velocity = velocity_references_[index];
+    // Reference velocity supplies intent without amplifying measured-velocity
+    // noise. Zero reference requests zero friction (no static-force latch).
+    raw_friction_torques_[i] =
+        friction.enabled
+            ? friction.coulomb[index] *
+                      std::tanh(velocity / friction.velocity_smoothing[index]) +
+                  friction.viscous[index] * velocity
+            : 0.0;
+    if (!std::isfinite(raw_friction_torques_[i])) {
+      return false;
+    }
+    friction_compensation_torques_[i] =
+        std::clamp(raw_friction_torques_[i], -friction_torque_limits_[i],
+                   friction_torque_limits_[i]);
+    target_feedforward_torques_[i] =
+        factored_gravity_torques_[i] + friction_compensation_torques_[i];
+  }
+  // A single shaper retains the inherited torque on activation and bounds the
+  // combined output, including enable/disable and runtime coefficient changes.
+  return feedforward_shaper_.update(target_feedforward_torques_, period_seconds,
+                                   feedforward_torques_);
 }
 
 bool MitPositionAdapterController::write_position_mode(
@@ -600,6 +689,9 @@ void MitPositionAdapterController::publish_mit_state(
     values[7] = velocity_feedback;
     values[8] = feedforward_torques_[eigen_index] + position_feedback +
                 velocity_feedback;
+    values[9] = raw_friction_torques_[eigen_index];
+    values[10] = friction_compensation_torques_[eigen_index];
+    values[11] = target_feedforward_torques_[eigen_index];
   }
   realtime_mit_state_publisher_->unlockAndPublish();
 }
@@ -639,10 +731,14 @@ MitPositionAdapterController::update_and_write_commands(
     const rclcpp::Time &time, const rclcpp::Duration &period) {
   const auto *gains = position_gains_buffer_.readFromRT();
   const auto *gravity_calibration = gravity_calibration_buffer_.readFromRT();
+  const auto *friction = friction_parameters_buffer_.readFromRT();
   if (!gains || gains->kp.size() != params_.joints.size() ||
       gains->kd.size() != params_.joints.size() || !gravity_calibration ||
       gravity_calibration->scale.size() != params_.joints.size() ||
-      gravity_calibration->bias.size() != params_.joints.size()) {
+      gravity_calibration->bias.size() != params_.joints.size() || !friction ||
+      friction->coulomb.size() != params_.joints.size() ||
+      friction->viscous.size() != params_.joints.size() ||
+      friction->velocity_smoothing.size() != params_.joints.size()) {
     return controller_interface::return_type::ERROR;
   }
   for (std::size_t index = 0; index < params_.joints.size(); ++index) {
@@ -675,10 +771,10 @@ MitPositionAdapterController::update_and_write_commands(
           velocity_references_[index]);
     }
   }
-  if (!update_gravity_feedforward(period.seconds(), *gravity_calibration)) {
+  if (!update_feedforward(period.seconds(), *gravity_calibration, *friction)) {
     RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
                           1000,
-                          "Invalid gravity compensation input; retaining the "
+                          "Invalid feed-forward input; retaining the "
                           "previous feed-forward torque");
   }
   if (!write_position_mode(*gains)) {
