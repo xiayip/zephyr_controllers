@@ -46,8 +46,14 @@ public:
         std::numeric_limits<double>::quiet_NaN());
       if (name == "voltage") {
         message.voltage = value;
+      } else if (name == "temperature") {
+        message.temperature = value;
       } else if (name == "current") {
         message.current = value;
+      } else if (name == "charge") {
+        message.charge = value;
+      } else if (name == "capacity") {
+        message.capacity = value;
       } else if (name == "percentage") {
         message.percentage = value;
       } else if (name == "power_supply_status") {

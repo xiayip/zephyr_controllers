@@ -52,6 +52,7 @@ controller_interface::CallbackReturn BatteryStateBroadcaster::on_configure(
   this->realtime_publisher_->msg_.power_supply_status = this->params_.power_supply_status;
   this->realtime_publisher_->msg_.power_supply_health = this->params_.power_supply_health;
   this->realtime_publisher_->msg_.power_supply_technology = this->params_.power_supply_technology;
+  this->realtime_publisher_->msg_.present = this->params_.present;
   this->realtime_publisher_->msg_.location = this->params_.location;
   this->realtime_publisher_->msg_.serial_number = this->params_.serial_number;
 
