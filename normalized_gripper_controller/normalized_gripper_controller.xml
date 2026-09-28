@@ -1,0 +1,18 @@
+<library path="normalized_gripper_controller">
+  <class
+      name="normalized_gripper_controller/NormalizedGripperController"
+      type="normalized_gripper_controller::NormalizedGripperController"
+      base_class_type="controller_interface::ChainableControllerInterface">
+    <description>
+      Generic one-axis gripper controller using normalized commands: 0 is open and 1 is closed.
+    </description>
+  </class>
+  <class
+      name="omni_picker_controller/OmniPickerController"
+      type="normalized_gripper_controller::NormalizedGripperController"
+      base_class_type="controller_interface::ChainableControllerInterface">
+    <description>
+      Deprecated compatibility alias for normalized_gripper_controller/NormalizedGripperController.
+    </description>
+  </class>
+</library>

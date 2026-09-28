@@ -18,7 +18,7 @@
   <exec_depend>mit_damping_controller</exec_depend>
   <exec_depend>mit_impedance_controller</exec_depend>
   <exec_depend>mit_position_adapter_controller</exec_depend>
-  <exec_depend>omni_picker_controller</exec_depend>
+  <exec_depend>normalized_gripper_controller</exec_depend>
   <exec_depend>swerve_drive_controller</exec_depend>
 
   <export>

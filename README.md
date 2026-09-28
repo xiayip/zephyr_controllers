@@ -19,7 +19,7 @@ This meta-package includes the following controller packages:
   Coulomb/viscous friction feed-forward, ROS feed-forward shaping, and a blocked-trajectory guard
 - **mit_position_adapter_controller** - Completes position and velocity references into full MIT
   commands with optional bounded, smooth friction feed-forward and realtime torque decomposition
-- **omni_picker_controller** - The Omni picker controller
+- **normalized_gripper_controller** - Generic normalized single-axis gripper controller (`0=open`, `1=closed`)
 - **swerve_drive_controller** - Controller for a 4 wheel swerve drive robot base
 
 ## Installation
@@ -46,6 +46,26 @@ ros2 control load_controller <controller_name>
 # Start controller
 ros2 control set_controller_state <controller_name> active
 ```
+
+## Normalized gripper controller
+
+`normalized_gripper_controller/NormalizedGripperController` controls one logical gripper joint in
+the normalized range `0.0 = fully open`, `1.0 = fully closed`. Hardware-specific conversion belongs
+in the ros2_control hardware/protocol layer, so the same controller can drive OmniPicker, the
+official reBot RS00 gripper, or another single-axis gripper without embedding vendor CAN behavior.
+
+It provides:
+
+- `<topic_prefix>/gripper_command` and `<topic_prefix>/joint_states` using
+  `sensor_msgs/msg/JointState` for existing clients;
+- `~/gripper_cmd` using `control_msgs/action/ParallelGripperCommand` for standard action clients and
+  MoveIt;
+- position/velocity/effort reference interfaces for controller chaining. Position is required;
+  velocity and effort hardware interfaces are optional and selected in the controller parameters.
+
+The old plugin type `omni_picker_controller/OmniPickerController` remains as a deprecated plugin
+alias, but new configurations should depend on the `normalized_gripper_controller` package and use
+the new type name.
 
 ## MIT startup and shutdown handover
 

@@ -1,0 +1,70 @@
+normalized_gripper_controller:
+  topic_prefix: {
+    type: string,
+    default_value: "",
+    description: "Topic prefix for the legacy JointState command and state topics",
+    read_only: true,
+  }
+  action_monitor_rate: {
+    type: double,
+    default_value: 20.0,
+    description: "Rate used to publish action status changes",
+    read_only: true,
+    validation: {gt_eq: [0.1]},
+  }
+  joints: {
+    type: string_array,
+    default_value: [],
+    description: "Exactly one normalized logical gripper joint",
+    read_only: true,
+    validation: {unique<>: null},
+  }
+  command_interfaces: {
+    type: string_array,
+    default_value: ["position", "velocity", "effort"],
+    description: "Hardware command interfaces; position is required",
+    read_only: true,
+    validation: {unique<>: null},
+  }
+  state_interfaces: {
+    type: string_array,
+    default_value: ["position", "velocity", "effort"],
+    description: "Hardware state interfaces; position is required",
+    read_only: true,
+    validation: {unique<>: null},
+  }
+  max_velocity: {
+    type: double,
+    default_value: 1.0,
+    description: "Default normalized velocity in [0, 1]",
+    validation: {bounds<>: [0.0, 1.0]},
+  }
+  max_effort: {
+    type: double,
+    default_value: 1.0,
+    description: "Default normalized effort in [0, 1]",
+    validation: {bounds<>: [0.0, 1.0]},
+  }
+  goal_tolerance: {
+    type: double,
+    default_value: 0.01,
+    description: "Normalized position tolerance for action success",
+    validation: {gt_eq: [0.0]},
+  }
+  stall_velocity_threshold: {
+    type: double,
+    default_value: 0.001,
+    description: "Normalized velocity below which stall timing starts",
+    validation: {gt_eq: [0.0]},
+  }
+  stall_timeout: {
+    type: double,
+    default_value: 2.0,
+    description: "Seconds without motion before reporting a stall",
+    validation: {gt_eq: [0.0]},
+  }
+  allow_stalling: {
+    type: bool,
+    default_value: true,
+    description: "Treat a grasping stall as a successful action result",
+  }
