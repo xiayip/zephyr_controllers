@@ -8,7 +8,6 @@ This meta-package includes the following controller packages:
 
 ### Core Controllers
 - **battery_state_broadcaster** - Controller to publish readings of Battery state
-- **diagnostic_broadcaster** - The diagnostic message broadcaster
 - **dexhand_controller** - Dexterous hand controller
 - **gravity_compensation_model** - Realtime Pinocchio gravity model and feed-forward shaping library
 - **mit_controller** - Chainable output stage for the MIT position, velocity, gain, and feed-forward tuple

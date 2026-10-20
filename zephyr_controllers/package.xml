@@ -12,7 +12,6 @@
   <!-- Meta-package dependencies - all individual controller packages -->
   <exec_depend>battery_state_broadcaster</exec_depend>
   <exec_depend>dexhand_controller</exec_depend>
-  <exec_depend>diagnostic_broadcaster</exec_depend>
   <exec_depend>gravity_compensation_model</exec_depend>
   <exec_depend>mit_controller</exec_depend>
   <exec_depend>mit_damping_controller</exec_depend>
