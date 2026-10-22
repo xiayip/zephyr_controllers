@@ -1,0 +1,5 @@
+<library path="teleop_joint_controller">
+  <class name="teleop_joint_controller/TeleopJointController" type="teleop_joint_controller::TeleopJointController" base_class_type="controller_interface::ControllerInterface">
+    <description>Watchdog-protected position streaming with controller-clock velocity and acceleration bounds.</description>
+  </class>
+</library>

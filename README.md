@@ -19,6 +19,8 @@ This meta-package includes the following controller packages:
 - **mit_position_adapter_controller** - Completes position and velocity references into full MIT
   commands with optional bounded, smooth friction feed-forward and realtime torque decomposition
 - **normalized_gripper_controller** - Generic normalized single-axis gripper controller (`0=open`, `1=closed`)
+- **teleop_joint_controller** - Guarded direct Servo position streaming with controller-clock
+  velocity/acceleration bounds, a latched watchdog and exclusive handover with JTC
 - **swerve_drive_controller** - Controller for a 4 wheel swerve drive robot base
 
 ## Installation
