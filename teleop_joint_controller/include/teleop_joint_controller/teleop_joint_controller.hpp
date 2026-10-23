@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <limits>
 #include <string>
 #include <vector>
 #include <controller_interface/controller_interface.hpp>
@@ -35,10 +36,19 @@ private:
     int64_t source_ns{0};
     uint64_t session{0};
   };
+  struct ServoHoldState {
+    uint64_t session{0};
+    int64_t last_hold_ns{0};
+    bool active{false};
+    int code{0};
+  };
   static int64_t steady_now();
   void receive(const trajectory_msgs::msg::JointTrajectory::SharedPtr msg);
   void receive_servo_status(const moveit_msgs::msg::ServoStatus::SharedPtr msg);
-  void fault(const char* reason);
+  void fault(const char* reason, int joint = -1,
+             double observed = std::numeric_limits<double>::quiet_NaN(),
+             double reference = std::numeric_limits<double>::quiet_NaN(),
+             double limit = std::numeric_limits<double>::quiet_NaN());
   bool write();
   void publish(const rclcpp::Time&, double dt);
   bool read_positions();
@@ -49,8 +59,11 @@ private:
   ReferenceFilter filter_;
   double command_timeout_{0.1}, startup_timeout_{1.0}, max_period_{0.05};
   double max_target_step_{0.15}, max_tracking_error_{0.15};
-  bool seen_command_{false}, faulted_{false};
+  bool seen_command_{false}, faulted_{false}, servo_hold_{false}, timeout_hold_{false};
   const char* reason_{"inactive"};
+  int fault_joint_{-1};
+  double fault_observed_{NAN}, fault_reference_{NAN}, fault_limit_{NAN};
+  double fault_actual_{NAN}, fault_output_{NAN};
   int64_t activated_ns_{0}, last_received_ns_{0}, last_source_ns_{0};
   uint64_t current_session_{0};
   // Accessed only by the mutually exclusive subscription callback. Reject
@@ -60,6 +73,10 @@ private:
   std::atomic<uint64_t> active_session_{0}, invalid_session_{0};
   std::atomic<uint64_t> servo_stop_session_{0};
   std::atomic<int> servo_stop_code_{0};
+  // Callback-owned state is copied coherently to the update thread. Retain the
+  // last bound time even when a normal status arrives before the next update.
+  ServoHoldState callback_servo_hold_;
+  realtime_tools::RealtimeBuffer<ServoHoldState> servo_hold_state_;
   realtime_tools::RealtimeBuffer<Command> commands_;
   rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr subscription_;
   rclcpp::Subscription<moveit_msgs::msg::ServoStatus>::SharedPtr servo_status_subscription_;
