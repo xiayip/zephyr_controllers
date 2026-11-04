@@ -1,13 +1,13 @@
-<library path="mpc_wholebody_rviz_panel">
-  <class name="mpc_wholebody_controller/target_coordinate_panel"
+<library path="mpc_rviz_panel">
+  <class name="mpc_controller/target_coordinate_panel"
          type="zephyr::mpc_rviz::target_coordinate_panel"
          base_class_type="rviz_common::Panel">
     <description>Display and enter the single-arm MPC target coordinates.</description>
   </class>
-  <class name="mpc_wholebody_controller/tcp_pose_panel" type="zephyr::mpc_rviz::tcp_pose_panel" base_class_type="rviz_common::Panel">
+  <class name="mpc_controller/tcp_pose_panel" type="zephyr::mpc_rviz::tcp_pose_panel" base_class_type="rviz_common::Panel">
     <description>Single TCP absolute and relative pose input.</description>
   </class>
-  <class name="mpc_wholebody_controller/tcp_error_display" type="zephyr::mpc_rviz::tcp_error_display" base_class_type="rviz_common::Display">
+  <class name="mpc_controller/tcp_error_display" type="zephyr::mpc_rviz::tcp_error_display" base_class_type="rviz_common::Display">
     <description>Tracking error from native TCP topics.</description>
   </class>
 </library>

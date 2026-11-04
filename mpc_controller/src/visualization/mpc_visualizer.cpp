@@ -4,10 +4,11 @@
 // Created by fiveages on 8/21/25.
 //
 
-#include "mpc_wholebody_controller/visualization/mpc_visualizer.h"
+#include "mpc_controller/visualization/mpc_visualizer.h"
 #include <fstream>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <algorithm>
 #include <ocs2_ros_interfaces/common/RosMsgHelpers.h>
@@ -32,21 +33,6 @@ using namespace ocs2;
         const auto& model = pinocchio_interface_.getModel();
         tcp_ee_frame_id_ = model.getFrameId(config_.tcp_ee_frame);
         tcp_ee_frame_valid_ = tcp_ee_frame_id_ < static_cast<pinocchio::FrameIndex>(model.nframes);
-        if (!config_.body_frame.empty())
-        {
-            body_frame_id_ = model.getFrameId(config_.body_frame);
-            body_frame_valid_ = body_frame_id_ < static_cast<pinocchio::FrameIndex>(model.nframes);
-        }
-        if (!config_.head_frame.empty())
-        {
-            head_frame_id_ = model.getFrameId(config_.head_frame);
-            head_frame_valid_ = head_frame_id_ < static_cast<pinocchio::FrameIndex>(model.nframes);
-            if (!head_frame_valid_)
-            {
-                RCLCPP_WARN(node_->get_logger(), "Head frame '%s' not in model; head_current_pose disabled",
-                            config_.head_frame.c_str());
-            }
-        }
     }
 
     void mpc_visualizer::initialize()
@@ -61,15 +47,6 @@ using namespace ocs2;
         // Create end effector pose publisher
         tcp_end_effector_pose_publisher_ = node_->create_publisher<geometry_msgs::msg::PoseStamped>(
             "tcp_current_pose", 1);
-
-        body_frame_pose_publisher_ = node_->create_publisher<geometry_msgs::msg::PoseStamped>(
-        "body_current_pose", 1);
-
-        if (head_frame_valid_)
-        {
-            head_frame_pose_publisher_ = node_->create_publisher<geometry_msgs::msg::PoseStamped>(
-                "head_current_pose", 1);
-        }
 
         // Create robot description publisher and publish URDF
         if (!config_.urdf_file.empty())
@@ -102,6 +79,8 @@ using namespace ocs2;
             auto geometry_opt = std::move(config_.pinocchio_geometry);
             if (geometry_opt)
             {
+                if (config_.self_collision_enabled && geometry_opt->getNumCollisionPairs() == 0)
+                    throw std::runtime_error("Self-collision monitoring is enabled but no collision pairs are configured");
                 const scalar_t activationDistance = config_.self_collision_activation_distance;
                 geometry_visualization_ = std::make_unique<GeometryInterfaceVisualization>(
                     pinocchio_interface_, std::move(*geometry_opt), config_.base_frame, activationDistance);
@@ -110,6 +89,8 @@ using namespace ocs2;
             }
             else
             {
+                if (config_.self_collision_enabled)
+                    throw std::runtime_error("Self-collision monitoring is enabled but geometry is unavailable");
                 RCLCPP_INFO(node_->get_logger(),
                             "No Pinocchio geometry provided, self-collision visualization disabled");
             }
@@ -117,6 +98,7 @@ using namespace ocs2;
         catch (const std::exception& e)
         {
             geometry_visualization_.reset();
+            if (config_.self_collision_enabled) throw;
             RCLCPP_WARN(node_->get_logger(),
                         "Failed to initialize self-collision visualization: %s, self-collision visualization disabled",
                         e.what());
@@ -348,7 +330,7 @@ using namespace ocs2;
         catch (const std::exception& e)
         {
             RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-                                 "Self-collision visualization failed (disable selfCollision in task or fix URDF/collision pairs): %s",
+                                 "Self-collision check failed; fix the URDF/collision configuration before resuming: %s",
                                  e.what());
             return false;
         }
@@ -404,89 +386,39 @@ using namespace ocs2;
         msg.pose.orientation.w = pose7(6);
     }
 
-    void mpc_visualizer::publishPose(
-        const rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr& pub,
-        const rclcpp::Time& time, const vector_t& pose7) const
-    {
-        if (!pub)
-        {
-            return;
-        }
-        geometry_msgs::msg::PoseStamped msg;
-        fillPoseStamped(msg, time, config_.visualization_frame, pose7);
-        pub->publish(msg);
-    }
-
     void mpc_visualizer::setPosePublishPeriod(const double period_sec)
     {
         pose_publish_period_sec_ = std::max(0.0, period_sec);
     }
 
-    mpc_visualizer::EndEffectorPoses
-    mpc_visualizer::computeEndEffectorPoses(const vector_t& state) const
+    vector_t mpc_visualizer::computeEndEffectorPose(const vector_t& state) const
     {
-        EndEffectorPoses poses;
-        poses.tcp(6) = 1.0;
-        poses.body(6) = 1.0;
-        poses.head(6) = 1.0;
-
-        const bool need_fk = tcp_ee_frame_valid_ ||
-                             body_frame_valid_ || head_frame_valid_;
-        if (need_fk)
-        {
-            forwardKinematicsInto(rt_data_, state);
-        }
-
         if (tcp_ee_frame_valid_)
         {
-            poses.tcp = extractFramePose7(rt_data_, tcp_ee_frame_id_);
-        }
-        else
-        {
-            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-                                 "TCP frame '%s' not in model (nframes=%d)",
-                                 config_.tcp_ee_frame.c_str(), pinocchio_interface_.getModel().nframes);
+            forwardKinematicsInto(rt_data_, state);
+            return extractFramePose7(rt_data_, tcp_ee_frame_id_);
         }
 
-        if (body_frame_valid_)
-        {
-            poses.body = extractFramePose7(rt_data_, body_frame_id_);
-        }
-        else if (!config_.body_frame.empty())
-        {
-            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
-                                 "Body frame '%s' not in model (nframes=%d)",
-                                 config_.body_frame.c_str(), pinocchio_interface_.getModel().nframes);
-        }
-        if (head_frame_valid_)
-        {
-            poses.head = extractFramePose7(rt_data_, head_frame_id_);
-        }
-        return poses;
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                             "TCP frame '%s' not in model (nframes=%d)",
+                             config_.tcp_ee_frame.c_str(), pinocchio_interface_.getModel().nframes);
+        vector_t pose = vector_t::Zero(7);
+        pose(6) = 1.0;
+        return pose;
     }
 
-    void mpc_visualizer::publishEndEffectorPoses(const rclcpp::Time& time,
-                                                          const EndEffectorPoses& poses) const
+    void mpc_visualizer::publishTcpPose(const rclcpp::Time& time, const vector_t& pose) const
     {
+        if (!tcp_end_effector_pose_publisher_) return;
         if (pose_publish_period_sec_ > 0.0 && last_pose_publish_time_.nanoseconds() != 0 &&
             (time - last_pose_publish_time_).seconds() < pose_publish_period_sec_)
         {
             return;
         }
         last_pose_publish_time_ = time;
-        publishPose(tcp_end_effector_pose_publisher_, time, poses.tcp);
-        publishPose(body_frame_pose_publisher_, time, poses.body);
-        publishPose(head_frame_pose_publisher_, time, poses.head);
-    }
-
-    void mpc_visualizer::publishEndEffectorPose(const rclcpp::Time& time, const vector_t& state) const
-    {
-        publishEndEffectorPoses(time, computeEndEffectorPoses(state));
-    }
-
-    vector_t mpc_visualizer::computeEndEffectorPose(const vector_t& state) const
-    {
-        return computeEndEffectorPoses(state).tcp;
+        geometry_msgs::msg::PoseStamped msg;
+        fillPoseStamped(msg, time, config_.visualization_frame, pose);
+        tcp_end_effector_pose_publisher_->publish(msg);
     }
 
     vector_t mpc_visualizer::computeRecordedEndEffectorPose(const vector_t& state) const
@@ -499,11 +431,6 @@ using namespace ocs2;
         }
         forwardKinematicsInto(viz_data_, state);
         return extractFramePose7(viz_data_, tcp_ee_frame_id_);
-    }
-
-    vector_t mpc_visualizer::computeBodyFramePose(const vector_t& state) const
-    {
-        return computeEndEffectorPoses(state).body;
     }
 
     visualization_msgs::msg::Marker mpc_visualizer::createTrajectoryLineMarker(

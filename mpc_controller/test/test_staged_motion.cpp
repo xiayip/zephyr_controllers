@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <gtest/gtest.h>
 #include <cmath>
-#include "mpc_wholebody_controller/control/StagedMotion.h"
+#include "mpc_controller/control/StagedMotion.h"
 
-using namespace zephyr::mpc_wholebody;
+using namespace zephyr::mpc;
 namespace {
 ReachCoordinator makeCoordinator() {
     StagedMotionConfig config;

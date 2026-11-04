@@ -1,13 +1,13 @@
-# mpc_wholebody_controller
+# mpc_controller
 
-Zephyr 机械臂和 Z2 底盘的独立 MPC 控制器，依赖原版 OCS2 和
+支持固定底座单机械臂，或单机械臂加移动底盘的 MPC 控制器，依赖原版 OCS2 和
 `arms_ros2_control` 公共库。包名、控制器类名和导出的插件名均为小写。
 
 ## 组成与依赖
 
 | 文件 | 功能 |
 | --- | --- |
-| `src/mpc_wholebody_controller.cpp` | 生命周期、求解线程、暂停以及单 TCP FK/IK 服务 |
+| `src/mpc_controller.cpp` | 生命周期、求解线程、暂停以及单 TCP FK/IK 服务 |
 | `src/control/CtrlComponent.cpp` | TCP 目标与参考轨迹、实测状态送入 MPC、执行求解结果、底盘限速/死区与可选 CSV 记录 |
 | `src/control/StagedMotion.cpp` | 机械臂优先、底盘接近和停稳后的任务切换 |
 | `src/visualization/mpc_visualizer.cpp` | TCP 位姿、两色轨迹、分身及其时间对齐 |
@@ -27,66 +27,108 @@ MPC 求解器与优化模型使用未修改的 `ocs2_mobile_manipulator`、`ocs2
 
 ## 注册与兼容
 
-控制器插件类型为 `mpc_wholebody_controller/mpc_wholebody_controller`，
-C++ 类为 `zephyr::mpc_wholebody::mpc_wholebody_controller`。
-目标面板插件为 `mpc_wholebody_controller/target_coordinate_panel`。
+控制器插件类型为 `mpc_controller/mpc_controller`，
+C++ 类为 `zephyr::mpc::mpc_controller`。
+目标面板插件为 `mpc_controller/target_coordinate_panel`。
 
-Z2 与单机械臂入口均使用实例名 `mpc_wholebody_controller`，只加载一个 MPC 控制器。
+单机械臂 mock 使用实例名 `mpc_controller`，只加载一个 MPC 控制器。
 RViz 的本地 TCP 面板直接连接 TCP 话题，不再使用控制器别名或左右臂重映射。
 
-Z2 的参数仍在 `z2_bringup/config/controllers.yaml`，URDF、任务权重和限制仍在
-`z2_description`；固定底座机械臂的参数在 `zephyr_arm_description`。
-两者的控制器插件类型都已切换到本包。夹爪桥接继续使用
-`zephyr_arm_bringup/gripper_rviz_bridge`。
+ROS 包、C++ 头文件路径、插件 XML、共享库、RViz 插件和 `ExecuteTcpPath` 服务类型
+均已使用新名称；不提供旧包名兼容别名。已有外部 YAML、RViz 配置或客户端需同步迁移。
+从旧包切换时请在新终端加载新的安装环境，避免旧安装残留干扰插件发现。
+
+固定底座模型任务在 `zephyr_arm_description/config/ocs2/task.info`，控制器参数在
+`zephyr_arm_bringup/config/mpc_mock_controllers.yaml`。本次没有改 Z2 启动链；
+当前工作区未提供可直接启动本控制器的 Z2 MPC launch，下文底盘部分说明的是代码能力，
+不代表已经完成整机接线或验证。
 
 ## 编译
 
-在 **VSCode 的 zephyr_dev Dev Container 终端** 执行：
+控制保护修复已在 Jazzy/aarch64 下隔离编译并测试：OCS2 `1.4.0`、
+`arms_ros2_control` 提交 `2309556624b41d0f45267c369358e35bcdd8f431`。
+该组合需要的上游包是 `arms_ros2_control_msgs`、`arms_controller_common`、
+`ocs2_controller_common` 和 `arms_rviz_control_plugin`；本插件不依赖上游的
+`ocs2_arm_controller`。不要直接混用任意最新版本：测试发现 OCS2
+`1.4.2.main.e81351c` 与上述公共库的碰撞显示构造接口不兼容。
+
+系统依赖（ROS Jazzy、ros2_control、RViz/Qt 等）按 `package.xml` 安装；
+OCS2 使用上述匹配版本的二进制安装包或已构建的源码 underlay。
+上述四个 `arms_ros2_control` 包需从记录的源码提交构建，不能仅安装本插件。
+这些外部依赖不打包进本仓库，也不要对上游打补丁。
+
+在开发容器中先加载 OCS2 与上述公共库的安装环境；以下命令假设其他 Zephyr
+依赖也已安装到工作区。它只构建本次新增/改名的三个包，不隐式下载外部依赖：
 
 ```bash
 cd /workspaces/zephyr-dev/zephyr_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
 colcon build \
-  --base-paths src/ocs2/arms_ros2_control/libraries/ocs2_controller_common \
-               src/ocs2/arms_ros2_control/controller/ocs2_arm_controller \
-               src/ocs2/arms_ros2_control/command/arms_rviz_control_plugin \
-               src/zephyr_common/zephyr_controllers/mpc_wholebody_controller \
-               src/zephyr_z2/z2_description src/zephyr_z2/z2_bringup \
-               src/zephyr_common/zephyr_arm_ros2/zephyr_arm_description \
-               src/zephyr_common/zephyr_arm_ros2/zephyr_arm_bringup \
-  --packages-select ocs2_controller_common ocs2_arm_controller \
-                    arms_rviz_control_plugin mpc_wholebody_controller \
-                    z2_description z2_bringup \
-                    zephyr_arm_description zephyr_arm_bringup --symlink-install
+  --packages-select mpc_controller zephyr_arm_description zephyr_arm_bringup \
+  --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 source install/setup.bash
 ```
 
-以上命令用于其他依赖已经构建好的工作区，包含本次迁移需重新构建的上游库、
-原控制器、RViz 插件及 Zephyr 包，避免旧的定制二进制掩盖源码恢复结果。
+验证改名和 mock 配置：
+
+```bash
+colcon test --packages-select mpc_controller zephyr_arm_description zephyr_arm_bringup
+colcon test-result --verbose
+```
 
 ## 启动
 
-同一个 Dev Container 终端中：
+以下单臂入口位于配套 `zephyr_arm_ros2` 工作区改动中，目前暂留本地，
+**不随本次控制器 `dev_mpc` 推送发布**。仅拉取本控制器仓库不会获得该 launch/task 配置；
+本包本身只提供插件、服务定义和 RViz 面板。
+
+固定底座单臂 mock（默认打开 RViz）：
 
 ```bash
-export ROS_DOMAIN_ID=12
-ros2 launch z2_bringup MPCmockdemo.launch.py
+ros2 launch zephyr_arm_bringup mpc_mock.launch.py
+# 无窗口
+ros2 launch zephyr_arm_bringup mpc_mock.launch.py show_rviz:=false
 ```
 
-仅机械臂的现有入口仍为：
+不要同时运行以上两条命令，也不要在同一 ROS domain 混入真机 controller manager。
+此 launch 只接受 `mock_components/GenericSystem`，没有切换真机的参数，
+不会启动 CAN、MIT 控制器、相机驱动或底盘；原 real_world/mock 启动链不变。
+
+- 初始关节为 `[0, 1.6, 1.0, 0, -0.5, 0]`，直接初始化理想 mock，不是真机 JTC 准备动作。
+- `manipulatorModelType=0`，只有六个机械臂状态；控制器只认领六轴 `position`。
+- 同时激活 `joint_state_broadcaster` 和 `zephyr_arm_gripper_controller`。
+- 包含法兰、Gemini 305、OmniPicker 的几何，TCP 为 `omni_picker_tcp`。
+- MPC 中夹爪固定闭合，mock 初始夹爪归一化位置为 `1.0`；本轮不要开合夹爪，
+  否则显示与规划几何会不一致。夹爪实时几何更新尚未接入。
+- 自碰撞检查启用，52 对来自现有 SRDF 的排除规则；没有新增碰撞忽略。
+  不含桌面、Z2 车厢或动态环境，不能用作这些场景的安全证明。
+- GenericSystem 是理想位置跟随，不模拟电机动力学、MIT 力矩、刚度或通信延迟。
+
+查看加载状态与 TCP：
 
 ```bash
-ros2 launch zephyr_arm_bringup MPCmockdemo.launch.py
+ros2 control list_controllers
+ros2 topic echo /tcp_current_pose --once
+ros2 topic echo /fsm_state --once
 ```
 
-`ros2 control list_controllers` 中，Z2 和单机械臂的实例均为 `mpc_wholebody_controller`，类型应为
-`mpc_wholebody_controller/mpc_wholebody_controller`。
-控制器激活后自动开始 OCS2；RViz 保留夹爪、目标坐标、跟踪误差和预测显示，移除了原 FSM 面板。
+控制器类型应为 `mpc_controller/mpc_controller`；生命周期 `active` 不代表 MPC
+未暂停，需要同时查看 `/fsm_state` 和诊断日志。TCP 指令与暂停接口见下文。
+
+### 当前 mock 验证状态（2026-11-04）
+
+新包及 RViz 插件编译通过，三个控制器已实际加载并激活，测试汇总 60 项通过
+（包含 CTest 包装项）。但尚未完成目标运动/跟踪验证：沿用高精度 STL 碰撞网格时，
+离线一轮 52 对距离查询约 97 ms，首次 MPC 求解约 15.9 s，
+运行触发 `collision check stale` 并保持暂停。求解目标周期为 20 ms。
+高密度碰撞网格是已确认的耗时来源，需继续做求解耗时分解及保守碰撞模型简化。
+没有通过关闭碰撞、放宽超时或忽略旧策略来绕过此问题；没有发布运动目标，测试节点已退出。
+RViz 配置已提供，当前运行验证使用 `show_rviz:=false`，GUI 尚未验收。
 
 ## 后续更新上游
 
-保持 `src/ocs2/arms_ros2_control` 工作树干净，在该仓库更新到所需上游版本后，
+保持外部 `arms_ros2_control` 工作树干净，在该仓库更新到所需上游版本后，
 重新构建变动的公共库和本包。算法库中的兼容优化可以直接复用；若公共 API 改变，
 在本包做适配。迁入的控制器胶水代码需要按 UPSTREAM.md 中的来源表对比上游变化。
 
@@ -96,8 +138,8 @@ ros2 launch zephyr_arm_bringup MPCmockdemo.launch.py
 
 ## 无界面运行与 Ranger 真机输出
 
-Z2 的启动参数以 `z2_bringup/README.md` 为准。
-`MPCmockdemo.launch.py show_rviz:=false` 可关闭窗口，`rviz.launch.py` 可独立打开显示。
+单臂 `mpc_mock.launch.py show_rviz:=false` 可关闭窗口。以下是移动底盘输出配置说明，
+不能直接用于本节的固定底座 mock，也不表示已有 Z2 真机启动入口。
 
 真机配置设置 `base_command_profile: ranger`。启用分阶段控制时，MPC 在接近和协同阶段
 约束横向速度为零，使用前后移动、原地转向或弧线转向，匹配 Ranger 支持的命令组合。
@@ -146,7 +188,7 @@ Z2 的启动参数以 `z2_bringup/README.md` 为准。
 - CSV 记录文件为 `real_tcp.csv`、`pred_tcp.csv`，没有左右臂分支。
 
 路径可发布到 `/target_path`（`nav_msgs/Path`），也可调用 `/execute_path`。
-该服务现使用本包的 `mpc_wholebody_controller/srv/ExecuteTcpPath`：请求字段为 `path`
+该服务现使用本包的 `mpc_controller/srv/ExecuteTcpPath`：请求字段为 `path`
 和 `trajectory_duration`，旧的双臂 `ExecutePath` 请求需要迁移。
 `/execute_tcp_circle` 沿用上游 `ExecuteCircle` 消息定义以复用传输格式，
 `circle_params.arm_name` 填实际 TCP 帧、`tcp` 或留空；只处理单 TCP 几何字段。
@@ -159,6 +201,11 @@ Z2 的启动参数以 `z2_bringup/README.md` 为准。
 
 ## 观测、线程和参数更新
 
+控制观测始终来自实测关节和里程计，包括暂停后重新初始化；不再用上一周期的
+关节命令覆盖反馈。旧 YAML 必须删除观测缓存参数，或明确设置
+`cached_ob_state: false`、`hardware_latency: 0.0`。其他值会拒绝初始化，
+不会静默启用旧行为。这两个名称只保留用于迁移检查，不提供延迟补偿功能。
+
 控制线程先读取完整的一组关节位置和底盘里程计，全部有效才提交观测。
 关节读取失败、NaN/Inf、里程计接收超时（500 ms）、无效四元数或
 `header.frame_id` 与 `base_odom_frame` 不一致时，保留上一组有效观测，
@@ -168,23 +215,74 @@ Z2 的启动参数以 `z2_bringup/README.md` 为准。
 
 实时 TCP FK 使用 `rt_data_`；预测、轨迹记录使用显示工作线程自己的 `viz_data_`。
 轨迹清理也交给该工作线程，避免控制线程修改它正在使用的缓存。
-控制线程每周期只交接最新实测观测与不可变预测快照的指针；显示线程按独立频率运行，
+控制线程交接最新实测观测快照与不可变预测快照；显示线程按独立频率运行，
 不积压中间帧。退出 MPC 时通过版本号丢弃旧轨迹，防止分身重新出现。
 TCP 发布仍由 `dds_publish_hz` 控制，不再随 MPC/分身刷新周期改变。
 
+TCP 参考轨迹生成、Twist 积分和目标发布只在非实时回调执行。控制周期只更新原子时钟；
+暂停不等待参考轨迹的互斥锁。恢复通过固定大小的非阻塞邮箱请求目标重置，等待
+非实时处理确认之后才启动求解；等待期间保持关节并发送底盘零速。
+暂停前已开始、但尚未获得处理锁的目标回调不能跨会话进入恢复后的控制。
+这消除了参考轨迹长任务对控制线程的锁阻塞，但不表示整个插件已通过硬实时认证：
+现有观测/显示快照分配及部分诊断发布仍需后续实测评估。
+
 | 参数类别 | 更新规则 |
 | --- | --- |
-| `hardware_latency` | 可在线修改；必须是有限、非负的浮点秒数，以原子变量传给实时线程 |
+| `cached_ob_state`、`hardware_latency` | 仅接受 `false`、`0.0`；迁移检查参数，不支持在线启用旧功能 |
+| `policy_max_age` | 默认 `0.5` 秒，策略 ROS 时间年龄和接收后的单调时钟年龄上限；初始化读取 |
+| `collision_check_timeout` | 默认 `0.25` 秒，碰撞检查所用观测的最大年龄；初始化读取，须覆盖至少两个检查周期 |
 | `rt_timing_enabled`、`traj_record_enabled` | 可在线修改，只接受布尔值 |
 | `traj_record_dir` | 非空字符串；更换目录前先停止记录，下次开启记录时使用新目录 |
 | 模型/接口、底盘话题与坐标系、底盘限速/死区、线程配置、MPC/DDS 频率、预测显示开关、观测缓存与未来采样配置 | 只在初始化读取；在线更改会返回失败，修改 YAML/launch 后须重新加载控制器 |
 
-`hardware_latency` 等动态设置在整批参数通过所有校验后才应用；拒绝的参数批次不会修改本包内部配置。
+动态设置在整批参数通过所有校验后才应用；拒绝的参数批次不会修改本包内部配置。
+`movel_*` 速度、加速度、jerk、采样间隔和时长在初始化时读取，在线更改会明确拒绝。
+以下旧参数没有实际控制作用，已删除声明、成员和配置，旧 YAML 不应继续传入：
+
+| 已删除参数 | 当前有效行为 |
+| --- | --- |
+| `joint_speed_threshold` | 不设置该门槛；实际限速由任务文件及硬件/控制器限制决定 |
+| `movel_trajectory_duration` | 使用 `movel_duration`；路径服务也可以显式指定 `trajectory_duration` |
+| `movel_auto_extend_duration` | 按速度、加速度和 jerk 限制自动延长时长，不再提供无效开关 |
+
+单 TCP 可视化也不再包含类人机器人的 body/head 帧、额外 FK 结果和
+`body_current_pose` / `head_current_pose` 发布器。只计算并发布实际 TCP，
+保持原有发布节流及实时/显示线程独立 FK 缓存。移动底盘的里程计与协同控制不受影响。
 本包已移除 HOME、HOLD、MOVEJ 状态类和对应动作；OCS2 参考轨迹管理仍调用上游公共库。
+
+### 输出与故障边界
+
+- 接收新策略时检查时间顺序、状态/输入维度和全部有限数值；每周期检查
+  `当前时间 + future_time_offset / update_rate` 是否仍在策略时域内。不允许末端外推，
+  策略过期或数据无效当周期保持关节、清零关节速度并请求底盘零速，锁存暂停。
+- 运行时碰撞监控同时检查实测关节与最近命令。启用检查却缺少几何或碰撞对时拒绝初始化；
+  检查失败、检测到碰撞或观测过期均锁存暂停。首次有效检查到达前不执行运动。
+  碰撞结果的年龄从观测采集时刻计算，重复检查旧快照不会刷新有效期。
+  目前检查与显示共用工作线程（频率为 `prediction_publish_hz`），但关闭预测显示
+  不关闭已配置的碰撞检查。慢 FCL/显示负载可能触发监控超时，不会被当作安全。
+- 求解、参考处理和上述策略/碰撞故障必须排查后显式调用 `~/pause {data: false}` 恢复。
+  首条策略尚未到达时只保持，不会输出运动命令。
+- MIX 模式按 Pinocchio 关节名对应的 `idx_v` 选取重力力矩，跳过移动底盘自由度。
+  初始化校验六轴顺序和模型维度，拒绝静默错位。保持状态不失能电机，也不清掉
+  已输出的重力前馈；但这些软件行为不是未经真机验证的“不下坠”保证。
+
+保护逻辑回归测试在 `test/test_control_safety.cpp`，覆盖策略过期/无效数值、
+移动与固定底座力矩映射、碰撞检查失效/陈旧结果、暂停会话隔离及邮箱并发一致性。
+`test/test_reference_handoff.cpp` 使用真实 ROS 执行器验证重置确认，并故意阻塞
+参考处理，检查控制侧观测更新、暂停及重置请求仍不等待该锁；不启动硬件或求解器。
+`test/test_tcp_visualizer.cpp` 用解析关节模型验证单 TCP 的 FK、话题、坐标系和节流；
+不加载机器人网格、求解器或硬件。
+依赖齐备后运行：
+
+```bash
+colcon test --packages-select mpc_controller
+colcon test-result --verbose
+```
 
 ## 机械臂优先与底盘接近
 
-Z2 默认启用 `staged_motion_enabled`。MPC 根据目标到机械臂 `base_link` 原点的三维距离分配运动：
+移动底盘模型可以启用 `staged_motion_enabled`（单臂 mock 关闭）。
+MPC 根据目标到机械臂 `base_link` 原点的三维距离分配运动：
 
 - 目标在完整操作半径 `R` 内时，先由机械臂跟踪，不以停车半径限制正常跟踪。
 - 距离超过 `R + reach_switch_margin` 后，底盘平移接近；停车目标设为约 `0.65 × R`，
@@ -207,9 +305,10 @@ Z2 默认启用 `staged_motion_enabled`。MPC 根据目标到机械臂 `base_lin
 这是位置包络估计，不能保证范围内任意末端姿态均可达；可用 `arm_reach_radius`（米）覆盖。
 若目标高度本身超出整个半径，则保持位置并报告 `unreachable_height`，新目标回到可达高度后自动恢复。
 
-参数位于 Z2 的 `controllers.yaml`，修改后重新加载控制器：
+移动底盘接线时可在控制器参数中配置下列值，修改后重新加载控制器；
+示例不代表当前 Z2 仓库的默认参数或真机验收结果：
 
-| 参数 | Z2 配置 | 说明 |
+| 参数 | 示例配置 | 说明 |
 | --- | --- | --- |
 | `staged_motion_enabled` | `true` | 启用分阶段控制；单机械臂默认关闭 |
 | `arm_workspace_frame` | `base_link` | 位于所有机械臂活动关节之前的安装坐标系 |
@@ -225,7 +324,7 @@ Z2 默认启用 `staged_motion_enabled`。MPC 根据目标到机械臂 `base_lin
 | `assist_no_progress_seconds` | `4.0` | 协同阶段无进一步改善时结束本次尝试，秒 |
 | `base_settle_seconds` | `0.25` | 底盘连续停稳的等待时间 |
 | `base_max_linear_speed` | `0.15` | 底盘平移合速度上限，m/s |
-| `base_max_angular_speed` | `0.3` | 仿真旋转速度上限，rad/s；真机覆盖为 0.2 |
+| `base_max_angular_speed` | `0.3` | 旋转速度上限，rad/s；真机值需单独验证 |
 
 本地 `control/StagedMotion.cpp` 在上游问题的副本中添加输入等式约束。
 接近阶段暂停 TCP 代价，使用底盘位置与朝向代价，并以关节速度等式约束锁住机械臂。
@@ -247,7 +346,7 @@ Ranger 接近阶段使用停车点引导：转向速度随朝向误差平滑变�
 预测与控制使用同一次求解，分身反映接近阶段的关节保持及协同阶段的跟踪动作。
 扩展使用 OCS2 公共接口，无需修改上游目录。
 
-`/mpc_wholebody_controller/motion_phase` 发布当前阶段：
+`/mpc_controller/motion_phase` 发布当前阶段：
 `arm_tracking`、`base_approach`、`whole_body_tracking`、`base_settling` 或 `unreachable_height`。
 暂停/恢复会重置阶段，并以当前 TCP 初始化目标。
 
@@ -255,14 +354,13 @@ Ranger 接近阶段使用停车点引导：转向速度随朝向误差平滑变�
 
 求解工作线程在一次 MPC 求解结束后，通过 OCS2 公共 `getPrimalSolution(getFinalTime(), ...)`
 单独取得完整预测时域，并同时保留时间和状态。MRT 的 `solutionTimeWindow` 仍只决定控制策略导出窗口；
-例如 Z2 中优化时域为 2 秒、控制导出窗口为 0.2 秒，显示使用完整 2 秒预测。
+例如优化时域为 2 秒、控制导出窗口为 0.2 秒时，显示使用完整 2 秒预测。
 完整轨迹复制在求解线程完成，控制线程只交接共享指针；不更改上游 OCS2 代码。
 
 显示只接受与当前 MRT 策略起始时间、暂停/恢复版本号相符的预测。
 每个显示周期都以当前 ROS 时间重新采样：第 k 个分身对应 `现在 + k × prediction_ghost_interval`，
-过去的点不显示，超过优化时域末端的点不外推。Z2 在自己的控制器 YAML 中设置最多 6 个分身，
-间隔为 0.3 秒，对应当前时刻之后 0.3、0.6、0.9、1.2、1.5、1.8 秒；实际数量受剩余预测时域限制。
-单机械臂保留 1 秒时域、0.2 秒间隔和最多 5 个分身，通常可见 4 个。
+过去的点不显示，超过优化时域末端的点不外推。
+单臂 mock 配置 1 秒时域、0.2 秒间隔和最多 5 个分身；实际数量受剩余预测时域限制。
 预测终点是当前有限时域末端，不保证已经到达远处目标。
 蓝色 TCP 路径从最新实测 TCP 连向剩余预测轨迹，橙色段表示下一控制周期的预测位置。
 路径最多做 64 次预测 FK，分身在相邻预测状态之间按绝对时间插值。
@@ -277,16 +375,15 @@ Ranger 接近阶段使用停车点引导：转向速度随朝向误差平滑变�
 以上参数在初始化时读取，放在控制器 YAML 的 `ros__parameters` 中，修改后重新启动/加载控制器。
 这些参数不改变 MPC 权重、求解频率、TCP 偏移或安装变换。
 
-Z2 的预测跨度在 `z2_description/config/ocs2/task.info` 的 `mpc.timeHorizon` 中设置，
-分身数量和间隔在 `z2_bringup/config/controllers.yaml` 的 `mpc_wholebody_controller.ros__parameters` 中设置。
+单臂预测跨度在 `zephyr_arm_description/config/ocs2/task.info` 的 `mpc.timeHorizon` 中设置，
+分身数量和间隔在 `zephyr_arm_bringup/config/mpc_mock_controllers.yaml` 中设置。
 仅增加分身上限不会延长预测时间；需同步增加真实优化时域。
-延长 `timeHorizon` 会增加求解计算量，并可能改变 MPC 规划的动作；本次 Z2 从 1 秒增加到 2 秒，
-20 Hz 显示刷新、控制导出窗口、求解请求频率和过期清理保持原配置。
+延长 `timeHorizon` 会增加求解计算量，并可能改变 MPC 规划的动作。
 
 两色轨迹和分身的 ADD 标记都有有限生存期：`max(0.15, 3 / prediction_publish_hz)` 秒。
 暂停、预测过期或分身数量减少时也主动发送 DELETE，避免旧分身卡住；
 即使发布进程停止，RViz 也会在生存期结束后移除标记（需其 ROS 时间正常推进）。
-随包提供的两个 RViz 配置对 `/trajectory_markers` 使用 Depth=1、Best Effort，
+单臂 `mpc_mock.rviz` 对 `/trajectory_markers` 使用 Depth=1、Best Effort，
 尽量显示最新帧；发布端保留 Reliable，兼容已有的 Reliable 订阅配置。
 显示刷新率不代表 MPC 求解频率，也不保证远程 RViz 的实际渲染帧率。
 
@@ -298,39 +395,30 @@ Z2 的预测跨度在 `z2_description/config/ocs2/task.info` 的 `mpc.timeHorizo
 若碰撞检查和记录也未开启，显示工作线程空闲，不再创建观测显示快照。
 该参数在启动时生效，修改后需重新加载控制器。
 
-Z2 和单机械臂的 `MPCmockdemo.launch.py` 默认开启预测显示；
-Z2 总入口的真机模式默认关闭，设置 `enable_mpc:=true` 选择 MPC。可在现有启动命令后追加：
-
-```bash
-# 无窗口，也不计算预测显示
-ros2 launch z2_bringup MPCmockdemo.launch.py show_rviz:=false prediction_visualization_enabled:=false
-
-# 机器人端无窗口，仍向另一台电脑上的 RViz 提供预测显示数据
-ros2 launch z2_bringup z2_launch_all.launch.py enable_mpc:=true show_rviz:=false prediction_visualization_enabled:=true
-
-# 固定底座机械臂同样支持独立开关
-ros2 launch zephyr_arm_bringup MPCmockdemo.launch.py show_rviz:=false prediction_visualization_enabled:=false
-```
-
-单机械臂入口直接生成本地控制器临时参数文件，退出时清理。
-`robot_profile/control.patch/mpc_wholebody_controller/ros__parameters` 可覆盖 MPC 参数。
-无需更改 `src/ocs2`。
+单臂 mock 默认开启预测显示。如需关闭，修改
+`zephyr_arm_bringup/config/mpc_mock_controllers.yaml` 中的该参数并重新启动。
+`show_rviz:=false` 只关闭窗口，不修改这个控制器参数。
+单机械臂入口生成临时的规划 URDF 和控制器参数文件，退出时清理；
+不覆盖正常控制器 YAML，也不修改上游包。
 
 
 ## 自动运行与暂停
 
-`src/FSM` 和对应头文件已经删除，直接 OCS2 执行已合入 `src/mpc_wholebody_controller.cpp`。
-激活时启动后台求解线程；首个完整观测到达后以实测 TCP 初始化目标，等待第一条策略期间保持位置。
-暂停、无效观测、自碰撞和求解异常均停止运动输出；自碰撞和求解异常需显式恢复。
-暂停后恢复前先等待旧求解完成，再从当前 TCP 重置 MPC，避免并发 reset/solve。
+`src/FSM` 和对应头文件已经删除，直接 OCS2 执行已合入 `src/mpc_controller.cpp`。
+激活时启动后台求解线程；完整观测及首个有效碰撞检查到达后，以实测 TCP 初始化目标。
+等待参考重置确认和第一条策略期间保持位置。
+暂停、无效观测、碰撞监控故障、策略失效、参考处理和求解异常均停止运动输出；
+除临时无效观测外，上述故障均锁存暂停，需显式恢复。
+暂停后恢复前先等待旧求解完成和非实时参考重置确认，再重置 MPC，避免并发 reset/solve。
 
 ```bash
-ros2 service call /mpc_wholebody_controller/pause std_srvs/srv/SetBool '{data: true}'
-ros2 service call /mpc_wholebody_controller/pause std_srvs/srv/SetBool '{data: false}'
+ros2 service call /mpc_controller/pause std_srvs/srv/SetBool '{data: true}'
+ros2 service call /mpc_controller/pause std_srvs/srv/SetBool '{data: false}'
 ```
 
 单机械臂使用相同的暂停/恢复服务路径。
-停用控制器时先停止并 join 求解线程、显示线程，再释放硬件接口；重新激活后自动启动。
+停用控制器时先发保持/底盘零速并停止接受目标，再 join 求解线程、显示线程，最后释放硬件接口；
+重新激活后自动启动。
 `/fsm_state` 仅作为原版 RViz/目标管理器的兼容状态发布（3 运行、2 暂停），
 控制器不再接收 `/fsm_command`，也不再提供 HOME、MOVEJ、腰部或原状态机动作接口。
 本地交互坐标轴直接订阅该状态话题，以支持启动后拖动目标。

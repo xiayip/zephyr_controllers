@@ -8,9 +8,9 @@ Baseline: `2309556624b41d0f45267c369358e35bcdd8f431` (the local origin/main at m
 
 | Local implementation | Source at baseline |
 | --- | --- |
-| `src/mpc_wholebody_controller.cpp`, corresponding header | `controller/ocs2_arm_controller/src/Ocs2ArmController.cpp`, corresponding header |
+| `src/mpc_controller.cpp`, corresponding header | `controller/ocs2_arm_controller/src/Ocs2ArmController.cpp`, corresponding header |
 | `src/control`, `include/.../control` | `controller/ocs2_arm_controller/src/control`, corresponding headers |
-| MPC worker in `src/mpc_wholebody_controller.cpp` | Replaces the former FSM adaptation with direct OCS2 execution |
+| MPC worker in `src/mpc_controller.cpp` | Replaces the former FSM adaptation with direct OCS2 execution |
 | `src/visualization/mpc_visualizer.cpp`, corresponding header | `libraries/ocs2_controller_common/src/visualization/Ocs2PinocchioVisualizer.cpp`, corresponding header |
 | `plugin/tcp_rviz.cpp` and `plugin/tcp_rviz.hpp` (Qt AUTOMOC) | Zephyr addition previously kept inside `command/arms_rviz_control_plugin` |
 

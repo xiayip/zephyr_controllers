@@ -14,7 +14,7 @@
 #include <pinocchio/multibody/model.hpp>
 #include <rclcpp/logger.hpp>
 
-namespace zephyr::mpc_wholebody {
+namespace zephyr::mpc {
 enum class MotionPhase { Arm, Base, Assist, Settling, Unreachable };
 const char* motionPhaseName(MotionPhase phase);
 
@@ -120,4 +120,4 @@ private:
     std::unique_ptr<ReachCoordinator> coordinator_;
     rclcpp::Logger logger_;
 };
-} // namespace zephyr::mpc_wholebody
+} // namespace zephyr::mpc

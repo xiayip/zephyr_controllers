@@ -4,7 +4,7 @@
 // Created for OCS2 Arm Controller - CtrlComponent
 //
 
-#include "mpc_wholebody_controller/control/CtrlComponent.h"
+#include "mpc_controller/control/CtrlComponent.h"
 
 #include <ocs2_controller_common/rt/ThreadScheduling.h>
 #include <ocs2_core/thread_support/ThreadPool.h>
@@ -35,8 +35,13 @@
 #include <stdexcept>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
-namespace zephyr::mpc_wholebody
+namespace zephyr::mpc
 {
+static int64_t steadyMicroseconds()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 // Adapt an omni MPC command to the chassis backend after applying deadbands.
 // Positive limits bound speed; zero leaves that axis unbounded.
 static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
@@ -103,13 +108,17 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
             return node_->has_parameter(name) ? node_->get_parameter(name).get_value<Value>()
                                              : node_->declare_parameter<Value>(name, value);
         };
-        cached_ob_state_ = auto_declare("cached_ob_state", true);
-        const double joint_speed_threshold = auto_declare("joint_speed_threshold", 0.1);
-        hardware_latency_ = auto_declare("hardware_latency", 0.2);
-        if (!std::isfinite(hardware_latency_.load()) || hardware_latency_.load() < 0.0)
+        // Keep explicit migration errors for old YAML, never silently run the
+        // former command-as-observation substitution or invent a delay model.
+        if (auto_declare("cached_ob_state", false) || auto_declare("hardware_latency", 0.0) != 0.0)
         {
-            throw std::runtime_error("hardware_latency must be finite and nonnegative");
+            throw std::runtime_error("Command observation caching was removed: set cached_ob_state=false and hardware_latency=0.0");
         }
+        policy_max_age_ = auto_declare("policy_max_age", 0.5);
+        collision_check_timeout_ = auto_declare("collision_check_timeout", 0.25);
+        if (!std::isfinite(policy_max_age_) || policy_max_age_ <= 0.0 ||
+            !std::isfinite(collision_check_timeout_) || collision_check_timeout_ <= 0.0)
+            throw std::runtime_error("Policy and collision timeouts must be finite and positive");
         // Declare dir before enabled so both can be applied together from yaml/callback.
         traj_record_dir_ = auto_declare("traj_record_dir", std::string("/tmp/traj_record"));
         const bool traj_record_enabled = auto_declare("traj_record_enabled", false);
@@ -215,10 +224,9 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         planning_urdf_variant_ = auto_declare("planning_urdf_variant", std::string(""));
         planning_urdf_path_ = auto_declare("planning_urdf_path", std::string(""));
         future_time_offset_ = auto_declare("future_time_offset", 1.0);
-        if (!std::isfinite(future_time_offset_) || future_time_offset_ < 0.0 ||
-            !std::isfinite(joint_speed_threshold) || joint_speed_threshold < 0.0)
+        if (!std::isfinite(future_time_offset_) || future_time_offset_ < 0.0)
         {
-            throw std::runtime_error("Future offset and joint speed threshold must be finite and nonnegative");
+            throw std::runtime_error("Future offset must be finite and nonnegative");
         }
         const std::string info_file_name = auto_declare("info_file_name", std::string("task"));
         joint_names_ = node_->get_parameter("joints").as_string_array();
@@ -273,8 +281,33 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
 
         if (interface_->dual_arm_)
         {
-            throw std::runtime_error("mpc_wholebody_controller supports one TCP; disable dualArmMode");
+            throw std::runtime_error("mpc_controller supports one TCP; disable dualArmMode");
         }
+
+        // The state/input model is scalar arm joints with an optional planar
+        // base prefix. Fail configuration rather than silently permuting DoFs.
+        const auto& model = interface_->getPinocchioInterface().getModel();
+        const auto& info = interface_->getManipulatorModelInfo();
+        if (model.nq != static_cast<int>(joint_names_.size() + base_state_offset_) ||
+            model.nv != model.nq || info.stateDim != static_cast<size_t>(model.nq) ||
+            info.inputDim != static_cast<size_t>(model.nv))
+            throw std::runtime_error("MPC requires scalar arm joints and matching state/input model dimensions");
+        for (size_t i = 0; i < joint_names_.size(); ++i)
+        {
+            const auto id = model.getJointId(joint_names_[i]);
+            if (id == 0 || id >= model.joints.size())
+                throw std::runtime_error("Arm joint missing from MPC model: " + joint_names_[i]);
+            const auto& joint = model.joints[id];
+            if (joint.nq() != 1 || joint.nv() != 1 || joint.idx_q() != static_cast<int>(i + base_state_offset_) ||
+                joint.idx_v() != joint.idx_q())
+                throw std::runtime_error("Configured joints must follow the MPC model DoF order: " + joint_names_[i]);
+            arm_torque_indices_.push_back(joint.idx_v());
+        }
+        arm_torques_ = vector_t::Zero(joint_names_.size());
+        if (interface_->isSelfCollisionEnabled() && collision_check_timeout_ < 2.0 * visualization_period_sec_)
+            throw std::runtime_error("collision_check_timeout must cover at least two collision worker periods (prediction_publish_hz)");
+        if (interface_->isSelfCollisionEnabled() && !std::isfinite(interface_->getSelfCollisionMinimumDistance()))
+            throw std::runtime_error("Self-collision distance threshold must be finite");
 
         mpc_observation_publisher_ = node_->create_publisher<ocs2_msgs::msg::MpcObservation>(
             robot_name_ + "_mpc_observation", 1);
@@ -284,7 +317,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
             viz_cfg.urdf_file = urdf_file;
             const auto& minfo = interface_->getManipulatorModelInfo();
             viz_cfg.base_frame = minfo.baseFrame;
-            viz_cfg.mobile_base_enabled = mobile_base_enabled_;
             viz_cfg.prediction_visualization_enabled = prediction_visualization_enabled_;
             viz_cfg.ghost_interval = prediction_ghost_interval_;
             viz_cfg.ghost_count = static_cast<size_t>(prediction_ghost_count_);
@@ -294,6 +326,7 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
             // FK produces world/odom coordinates rather than base-local coordinates.
             viz_cfg.visualization_frame = mobile_base_enabled_ ? base_odom_frame : minfo.baseFrame;
             viz_cfg.tcp_ee_frame = minfo.eeFrame;
+            viz_cfg.self_collision_enabled = interface_->isSelfCollisionEnabled();
             if (auto geo = interface_->getPinocchioGeometryInterface())
             {
                 viz_cfg.pinocchio_geometry = std::move(*geo);
@@ -306,7 +339,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         visualizer_->setPosePublishPeriod(dds_publish_period_sec_);
         RCLCPP_INFO(node_->get_logger(), "Future sample offset: %.2f control cycles", future_time_offset_);
 
-        auto_declare("movel_trajectory_duration", 2.0);
         auto_declare("movel_duration", 2.0);
         auto_declare("movel_sample_interval", 0.04);
         auto_declare("movel_max_linear_velocity", 0.3);
@@ -315,7 +347,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         auto_declare("movel_max_angular_velocity", 1.0);
         auto_declare("movel_max_angular_acceleration", 2.0);
         auto_declare("movel_max_angular_jerk", 4.0);
-        auto_declare("movel_auto_extend_duration", true);
 
         pose_reference_manager_ = std::make_shared<TcpReferenceManager>(
             interface_->getReferenceManagerPtr(),
@@ -354,10 +385,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         observation_candidate_ = observation_.state;
         measured_observation_ = observation_;
 
-        // Initialize cached state
-        last_execute_time_ = node_->now();
-        cached_last_action_ = observation_.state;
-
         freezeInitializationParameters();
         parameter_callback_handle_ = node_->add_on_set_parameters_callback(
             [this](const std::vector<rclcpp::Parameter>& parameters) {
@@ -378,7 +405,7 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         for (const auto* name : {
                  "joints", "command_prefix", "command_interfaces", "state_interfaces",
                  "pd_gains", "mpc_frequency", "update_rate",
-                 "cached_ob_state", "joint_speed_threshold", "thread_priority", "cpu_affinity",
+                 "cached_ob_state", "hardware_latency", "policy_max_age", "collision_check_timeout", "thread_priority", "cpu_affinity",
                  "dds_publish_hz", "robot_name", "mobile_base_enabled", "base_odom_frame",
                  "base_odom_topic", "base_cmd_topic", "base_linear_start_threshold",
                  "base_linear_stop_threshold", "base_angular_start_threshold",
@@ -391,7 +418,10 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
                  "reach_switch_margin", "base_settle_seconds",
                  "base_parking_radius_ratio", "base_parking_tolerance", "base_heading_tolerance", "tracking_stall_seconds",
                  "tracking_position_tolerance", "tracking_orientation_tolerance",
-                 "tracking_progress_threshold", "assist_no_progress_seconds"})
+                 "tracking_progress_threshold", "assist_no_progress_seconds",
+                 "movel_duration", "movel_sample_interval", "movel_max_linear_velocity",
+                 "movel_max_linear_acceleration", "movel_max_linear_jerk",
+                 "movel_max_angular_velocity", "movel_max_angular_acceleration", "movel_max_angular_jerk"})
         {
             if (node_->has_parameter(name))
             {
@@ -423,12 +453,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
                 param.get_parameter_value() != frozen->second)
             {
                 result.reason = name + " is initialization-only; change the launch/YAML configuration and reload the controller";
-            }
-            else if (name == "hardware_latency" &&
-                     (param.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE ||
-                      !std::isfinite(param.as_double()) || param.as_double() < 0.0))
-            {
-                result.reason = "hardware_latency must be a finite nonnegative double (seconds)";
             }
             else if ((name == "traj_record_enabled" || name == "rt_timing_enabled") &&
                      param.get_type() != rclcpp::ParameterType::PARAMETER_BOOL)
@@ -464,11 +488,7 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         std::optional<bool> traj_record_enabled_update;
         for (const auto& param : parameters)
         {
-            if (param.get_name() == "hardware_latency")
-            {
-                hardware_latency_.store(param.as_double(), std::memory_order_release);
-            }
-            else if (param.get_name() == "traj_record_dir")
+            if (param.get_name() == "traj_record_dir")
             {
                 traj_record_dir_ = param.as_string();
             }
@@ -618,38 +638,62 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
 
         if (visualizer_)
         {
-            zephyr::mpc_visualization::mpc_visualizer::EndEffectorPoses poses;
+            vector_t tcp_pose;
             {
                 auto fk_scope = rt_timing_.scope(&rt_timing_.ee_fk_us);
-                poses = visualizer_->computeEndEffectorPoses(observation_.state);
+                tcp_pose = visualizer_->computeEndEffectorPose(observation_.state);
             }
             auto pub_scope = rt_timing_.scope(&rt_timing_.ee_pub_us);
-            visualizer_->publishEndEffectorPoses(time, poses);
+            visualizer_->publishTcpPose(time, tcp_pose);
         }
         return true;
     }
 
-    void CtrlComponent::evaluatePolicy(const rclcpp::Time& time)
+    bool CtrlComponent::evaluatePolicy(const rclcpp::Time& time)
     {
         auto eval_scope = rt_timing_.scope(&rt_timing_.eval_us);
         if (!mpc_mrt_interface_)
         {
             RCLCPP_WARN(node_->get_logger(), "MPC MRT interface not available");
-            return;
+            holdLastSentPositions();
+            return false;
         }
         if (!observation_valid_ ||
             (mobile_base_enabled_ && !base_odometry_received_.load(std::memory_order_acquire)))
         {
             stopMobileBase();
             holdLastSentPositions();
-            return;
+            return false;
         }
         {
             auto upd_scope = rt_timing_.scope(&rt_timing_.eval_upd_us);
             if (mpc_mrt_interface_->updatePolicy())
             {
                 policy_active_ = true;
+                const auto& policy = mpc_mrt_interface_->getPolicy();
+                policy_valid_ = validPolicy(policy.timeTrajectory_, policy.stateTrajectory_,
+                    policy.inputTrajectory_, observation_.state.size(), observation_.input.size());
+                policy_received_at_ = std::chrono::steady_clock::now();
             }
+        }
+        // Always feed real feedback back into MPC, including while holding for
+        // a policy/phase handoff. Commands are never substituted as observations.
+        mpc_mrt_interface_->setCurrentObservation(measured_observation_);
+        if (!policy_active_)
+        {
+            holdLastSentPositions();
+            return true;
+        }
+        const auto& policy = mpc_mrt_interface_->getPolicy();
+        const double future_time = time.seconds() + future_time_offset_ / ctrl_interfaces_.frequency_;
+        const double policy_age = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - policy_received_at_).count();
+        if (!policy_valid_ || !usablePolicy(time.seconds(), future_time, policy.timeTrajectory_.front(),
+                                           policy.timeTrajectory_.back(), policy_age, policy_max_age_))
+        {
+            RCLCPP_ERROR(node_->get_logger(), "MPC policy invalid, expired, or outside its sampling horizon; explicit resume required");
+            holdLastSentPositions();
+            return false;
         }
         MotionPhase phase = MotionPhase::Arm;
         StagedMotionState approach_state;
@@ -663,7 +707,7 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
             {
                 mpc_mrt_interface_->setCurrentObservation(measured_observation_);
                 holdLastSentPositions();
-                return; // Never apply a policy with a different phase/version.
+                return true; // Never apply a policy with a different phase/version.
             }
             phase = plan->stage.phase;
             approach_state = plan->stage;
@@ -672,31 +716,12 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
                 held_arm_positions_ = measured_observation_.state.tail(joint_names_.size());
             if (phase != applied_motion_phase_)
             {
-                cached_last_action_ = measured_observation_.state;
                 std_msgs::msg::String message;
                 message.data = motionPhaseName(phase);
                 motion_phase_publisher_->publish(message);
             }
             applied_motion_phase_ = phase;
         }
-        bool trigger_cached_state = (time - last_execute_time_).seconds() <
-                                    hardware_latency_.load(std::memory_order_acquire);
-        // Staged reachability/progress must use measured joints, not cached commands.
-        if (trigger_cached_state && cached_ob_state_ && !staged_reference_)
-        {
-            if (base_state_offset_ == 0)
-            {
-                observation_.state = cached_last_action_;
-            }
-            else if (cached_last_action_.size() == observation_.state.size())
-            {
-                const auto arm_state_size =
-                    observation_.state.size() - static_cast<Eigen::Index>(base_state_offset_);
-                observation_.state.tail(arm_state_size) = cached_last_action_.tail(arm_state_size);
-            }
-        }
-
-        mpc_mrt_interface_->setCurrentObservation(observation_);
         {
             auto pub_scope = rt_timing_.scope(&rt_timing_.eval_obs_pub_us);
             if (shouldPublishDds(time))
@@ -705,27 +730,12 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
             }
         }
 
-        if (!policy_active_)
-        {
-            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-                                 "Policy not ready (no active MRT policy yet), holding");
-            holdLastSentPositions();
-            return;
-        }
-
         vector_t future_state;
         vector_t future_input;
         {
             auto mrt_scope = rt_timing_.scope(&rt_timing_.eval_mrt_us);
-            const auto& policy = mpc_mrt_interface_->getPolicy();
-            if (time.seconds() > policy.timeTrajectory_.back())
-            {
-                RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
-                                    "Current time is beyond the received MPC policy");
-            }
             // Commands have always used the future policy sample below. Do not
             // also evaluate a current-time state/input that is never consumed.
-            const double future_time = observation_.time + future_time_offset_ / ctrl_interfaces_.frequency_;
             future_state = LinearInterpolation::interpolate(
                 future_time, policy.timeTrajectory_, policy.stateTrajectory_);
             future_input = LinearInterpolation::interpolate(
@@ -763,6 +773,32 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         }
 
         auto cmd_scope = rt_timing_.scope(&rt_timing_.eval_cmd_us);
+        const auto mode = ctrl_interfaces_.control_mode_;
+        const bool mixed = mode == arms_controller_common::ControlMode::MIX;
+        if ((!mixed && mode != arms_controller_common::ControlMode::POSITION) ||
+            !future_state.allFinite() || !future_input.allFinite())
+        {
+            RCLCPP_ERROR(node_->get_logger(), "Invalid MPC command or unsupported output mode; holding");
+            holdLastSentPositions();
+            return false;
+        }
+        // Validate all commands before writing any base or arm output.
+        if (mixed)
+        {
+            try
+            {
+                if (!selectJointTorques(calculateStaticTorques(), arm_torque_indices_, arm_torques_) ||
+                    ctrl_interfaces_.joint_force_command_interface_.size() != joint_names_.size() ||
+                    ctrl_interfaces_.joint_velocity_command_interface_.size() != joint_names_.size())
+                    throw std::runtime_error("Invalid gravity torque or mixed command interfaces");
+            }
+            catch (const std::exception& error)
+            {
+                RCLCPP_ERROR(node_->get_logger(), "Mixed output rejected: %s", error.what());
+                holdLastSentPositions();
+                return false;
+            }
+        }
         if (mobile_base_enabled_ && base_command_publisher_)
         {
             geometry_msgs::msg::Twist command;
@@ -783,19 +819,11 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
                                  base_max_linear_speed_, base_max_angular_speed_);
             publishMobileBaseCommand(command);
         }
-        const auto mode = ctrl_interfaces_.control_mode_;
-        const bool mixed = mode == arms_controller_common::ControlMode::MIX;
-        if (!mixed && mode != arms_controller_common::ControlMode::POSITION)
-        {
-            RCLCPP_ERROR(node_->get_logger(), "Unknown control output mode");
-            return;
-        }
         if (mixed)
         {
-            const vector_t static_torques = calculateStaticTorques();
-            for (size_t i = 0; i < joint_names_.size() && i < static_cast<size_t>(static_torques.size()); ++i)
+            for (size_t i = 0; i < joint_names_.size(); ++i)
             {
-                std::ignore = ctrl_interfaces_.joint_force_command_interface_[i].get().set_value(static_torques(i));
+                std::ignore = ctrl_interfaces_.joint_force_command_interface_[i].get().set_value(arm_torques_(i));
             }
         }
         for (size_t i = 0; i < joint_names_.size() &&
@@ -813,11 +841,14 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
                     set_value(future_input(static_cast<Eigen::Index>(i + base_state_offset_)));
             }
         }
-        else
-        {
-            cached_last_action_ = future_state;
-            last_execute_time_ = time;
-        }
+        return true;
+    }
+
+    bool CtrlComponent::requestReferenceReset()
+    {
+        // Use real joints, even if the held reference differs after disturbance.
+        reset_tcp_pose_ = visualizer_->computeEndEffectorPose(measured_observation_.state);
+        return pose_reference_manager_->requestReset(reset_tcp_pose_, measured_observation_.time);
     }
 
     void CtrlComponent::resetMpc()
@@ -832,26 +863,11 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
             message.data = motionPhaseName(MotionPhase::Arm);
             motion_phase_publisher_->publish(message);
         }
-        // Update observation time to current time
-        observation_.time = node_->now().seconds();
-
-        // Use last sent joint positions for initial state (avoids jumps when entering OCS2 state)
-        for (size_t i = 0; i < joint_names_.size() && i < ctrl_interfaces_.last_sent_joint_positions_.size(); ++i)
-        {
-            observation_.state[static_cast<Eigen::Index>(i + base_state_offset_)] =
-                ctrl_interfaces_.last_sent_joint_positions_[i];
-        }
-
-        const vector_t tcp_pose = visualizer_->computeEndEffectorPose(observation_.state);
+        observation_ = measured_observation_;
+        const auto& tcp_pose = reset_tcp_pose_;
         RCLCPP_INFO(node_->get_logger(),
                     "Initial TCP target: t=%.3f xyz=[%.3f, %.3f, %.3f]",
                     observation_.time, tcp_pose(0), tcp_pose(1), tcp_pose(2));
-        if (pose_reference_manager_)
-        {
-            pose_reference_manager_->setCurrentObservation(observation_);
-            pose_reference_manager_->setCurrentTcpPose(tcp_pose);
-            pose_reference_manager_->publishCurrentTargetsFromCache();
-        }
         const TargetTrajectories target_trajectories({observation_.time}, {tcp_pose}, {observation_.input});
 
         // Set initial observation and target trajectory (non-blocking).
@@ -859,7 +875,7 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         // blocking here runs inside controller_manager::update and causes overruns.
         mpc_mrt_interface_->reset();
         policy_active_ = false;
-        collision_active_.store(false, std::memory_order_release);
+        policy_valid_ = false;
         mpc_mrt_interface_->setCurrentObservation(observation_);
         mpc_mrt_interface_->resetMpcNode(target_trajectories);
         RCLCPP_INFO(node_->get_logger(),
@@ -881,14 +897,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         for (auto& interface : ctrl_interfaces_.joint_velocity_command_interface_)
         {
             std::ignore = interface.get().set_value(0.0);
-        }
-    }
-
-    void CtrlComponent::publishCachedCurrentTargets() const
-    {
-        if (pose_reference_manager_)
-        {
-            pose_reference_manager_->publishCurrentTargetsFromCache();
         }
     }
 
@@ -967,6 +975,8 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         std::atomic_store_explicit(&visualization_snapshot_,
             std::shared_ptr<VisualizationSnapshot>{}, std::memory_order_release);
         last_recorded_observation_time_ = -1.0;
+        collision_started_us_ = steadyMicroseconds();
+        collision_watchdog_.reset();
         visualization_running_.store(true, std::memory_order_release);
         visualization_thread_ = std::thread(&CtrlComponent::visualizationThreadLoop, this);
     }
@@ -976,7 +986,14 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         visualization_running_.store(false, std::memory_order_release);
         visualization_wakeup_.notify_one();
         if (visualization_thread_.joinable()) visualization_thread_.join();
-        collision_active_.store(false, std::memory_order_release);
+        collision_watchdog_.reset();
+    }
+
+    CollisionStatus CtrlComponent::collisionStatus() const
+    {
+        if (!interface_->isSelfCollisionEnabled()) return CollisionStatus::Safe;
+        return collision_watchdog_.status(steadyMicroseconds(), collision_started_us_,
+            static_cast<int64_t>(collision_check_timeout_ * 1e6));
     }
 
     void CtrlComponent::requestVisualizationUpdate()
@@ -990,6 +1007,7 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         }
         auto snap = std::make_shared<VisualizationSnapshot>();
         snap->observation = measured_observation_;
+        snap->observed_at_us = steadyMicroseconds();
         snap->epoch = visualization_epoch_.load(std::memory_order_acquire);
         if (collision_enabled)
         {
@@ -1062,16 +1080,22 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
             return;
         }
 
-        // One FCL per viz tick on command-overlay q: updates markers + collision_active_ for RT.
-        const vector_t& collision_q =
-            snap.collision_state.size() > 0 ? snap.collision_state : obs.state;
-        bool active = false;
-        if (visualizer_->publishSelfCollisionVisualization(collision_q))
+        if (interface_->isSelfCollisionEnabled())
         {
-            const scalar_t thr = interface_->getSelfCollisionMinimumDistance();
-            active = visualizer_->getLastMinDistance() <= thr;
+            // Check measured geometry AND commanded geometry. Failure is not
+            // clearance, and re-rendering an old snapshot cannot renew its age.
+            const auto check = [&](const vector_t& q, bool& collision) {
+                if (!visualizer_->publishSelfCollisionVisualization(q)) return false;
+                const auto distance = visualizer_->getLastMinDistance();
+                if (!std::isfinite(distance)) return false;
+                collision = collision || distance <= interface_->getSelfCollisionMinimumDistance();
+                return true;
+            };
+            bool collision = false;
+            bool valid = check(obs.state, collision);
+            if (valid && snap.collision_state.size() > 0) valid = check(snap.collision_state, collision);
+            collision_watchdog_.record(valid, collision, snap.observed_at_us);
         }
-        collision_active_.store(active, std::memory_order_release);
 
         if (prediction_visualization_enabled_)
         {
@@ -1307,6 +1331,15 @@ void TcpReferenceManager::subscribe(const rclcpp_lifecycle::LifecycleNode::Share
     tf_=std::make_shared<tf2_ros::Buffer>(node->get_clock());
     listener_=std::make_shared<tf2_ros::TransformListener>(*tf_);
     target_pub_=node->create_publisher<geometry_msgs::msg::PoseStamped>("tcp_current_target",rclcpp::QoS(1).transient_local());
+    // All target integration, allocation and publishing runs on the executor.
+    // The control loop supplies only an atomic clock and bounded reset requests.
+    reference_timer_ = node->create_wall_timer(std::chrono::milliseconds(10), [this] {
+        try { updateReference(); }
+        catch (const std::exception& error) {
+            failed_.store(true, std::memory_order_release);
+            RCLCPP_ERROR(node_->get_logger(), "TCP reference update failed: %s", error.what());
+        }
+    });
     pose_sub_=node->create_subscription<geometry_msgs::msg::Pose>("tcp_target",1,
         [this](geometry_msgs::msg::Pose::ConstSharedPtr p) { geometry_msgs::msg::PoseStamped s; s.header.frame_id=base_frame_; s.pose=*p; acceptPose(s,false); });
     stamped_sub_=node->create_subscription<geometry_msgs::msg::PoseStamped>("tcp_target/stamped",1,
@@ -1315,24 +1348,28 @@ void TcpReferenceManager::subscribe(const rclcpp_lifecycle::LifecycleNode::Share
         [this](geometry_msgs::msg::TwistStamped::ConstSharedPtr p) { acceptRelative(*p); });
     twist_sub_=node->create_subscription<geometry_msgs::msg::Twist>("tcp_target/twist",1,
         [this](geometry_msgs::msg::Twist::ConstSharedPtr p) {
-            if (!accepting_) return;
+            const auto session = target_session_.token();
+            if (!session) return;
             const double values[]={p->linear.x,p->linear.y,p->linear.z,p->angular.x,p->angular.y,p->angular.z};
             for (double v:values) if (!std::isfinite(v)) return;
             std::lock_guard<std::mutex> lock(mutex_);
+            if (!target_session_.accepts(session)) return;
             target_=sample(time_); twist_=*p; twist_active_=true; twist_received_=std::chrono::steady_clock::now();
+            last_time_ = observation_time_.load(std::memory_order_acquire);
         });
     path_sub_=node->create_subscription<nav_msgs::msg::Path>("target_path",1,
         [this](nav_msgs::msg::Path::ConstSharedPtr p) { acceptPath(*p); });
-    path_service_=node->create_service<::mpc_wholebody_controller::srv::ExecuteTcpPath>("execute_path",
-        [this](const std::shared_ptr<::mpc_wholebody_controller::srv::ExecuteTcpPath::Request> req,
-               std::shared_ptr<::mpc_wholebody_controller::srv::ExecuteTcpPath::Response> res) {
+    path_service_=node->create_service<::mpc_controller::srv::ExecuteTcpPath>("execute_path",
+        [this](const std::shared_ptr<::mpc_controller::srv::ExecuteTcpPath::Request> req,
+               std::shared_ptr<::mpc_controller::srv::ExecuteTcpPath::Response> res) {
             try {
-                if (!accepting_||req->path.poses.empty()) throw std::invalid_argument("Tracking paused or empty TCP path");
+                const auto session = target_session_.token();
+                if (!session||req->path.poses.empty()) throw std::invalid_argument("Tracking paused or empty TCP path");
                 if (!std::isfinite(req->trajectory_duration)||req->trajectory_duration<0.0) throw std::invalid_argument("Invalid path duration");
                 vector_array_t goals;
                 if (!transformPath(req->path, goals)) throw std::invalid_argument("Invalid path pose");
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (!accepting_) throw std::invalid_argument("Tracking paused");
+                if (!target_session_.accepts(session)) throw std::invalid_argument("Tracking paused or session changed");
                 twist_active_=false; plan(goals,req->trajectory_duration>0.0?req->trajectory_duration:duration_); publish();
                 res->success=true;res->estimated_duration=times_.back()-times_.front();res->message="TCP path accepted";
             } catch (const std::exception& e) { res->success=false;res->message=e.what(); }
@@ -1352,9 +1389,10 @@ bool TcpReferenceManager::transform(const geometry_msgs::msg::PoseStamped& p,vec
     } catch (const std::exception& e) { RCLCPP_WARN(node_->get_logger(),"TCP target rejected: %s",e.what()); return false; }
 }
 void TcpReferenceManager::acceptPose(const geometry_msgs::msg::PoseStamped& p,bool interpolate_target) {
-    if (!accepting_) return;
+    const auto session = target_session_.token();
+    if (!session) return;
     vector_t goal; if (!transform(p,goal)) return;
-    std::lock_guard<std::mutex> lock(mutex_); if (!accepting_) return;
+    std::lock_guard<std::mutex> lock(mutex_); if (!target_session_.accepts(session)) return;
     twist_active_=false;
     try {
         if (interpolate_target) plan({goal},duration_);
@@ -1363,12 +1401,13 @@ void TcpReferenceManager::acceptPose(const geometry_msgs::msg::PoseStamped& p,bo
     } catch (const std::exception& e) { RCLCPP_WARN(node_->get_logger(),"TCP target rejected: %s",e.what()); }
 }
 void TcpReferenceManager::acceptRelative(const geometry_msgs::msg::TwistStamped& delta) {
-    if (!accepting_) return;
+    const auto session = target_session_.token();
+    if (!session) return;
     try {
         Eigen::Vector3d translation(delta.twist.linear.x,delta.twist.linear.y,delta.twist.linear.z);
         Eigen::Vector3d rotation(delta.twist.angular.x,delta.twist.angular.y,delta.twist.angular.z);
         if (!translation.allFinite()||!rotation.allFinite()) throw std::invalid_argument("Invalid relative target");
-        std::lock_guard<std::mutex> lock(mutex_); if (!accepting_) return;
+        std::lock_guard<std::mutex> lock(mutex_); if (!target_session_.accepts(session)) return;
         vector_t goal=sample(time_);
         Eigen::Quaterniond frame=Eigen::Quaterniond::Identity();
         if (delta.header.frame_id==tcp_frame_) frame=quaternion(goal);
@@ -1383,10 +1422,11 @@ void TcpReferenceManager::acceptRelative(const geometry_msgs::msg::TwistStamped&
     } catch (const std::exception& e) { RCLCPP_WARN(node_->get_logger(),"Relative TCP target rejected: %s",e.what()); }
 }
 void TcpReferenceManager::acceptPath(const nav_msgs::msg::Path& path) {
-    if (!accepting_||path.poses.empty()) return;
+    const auto session = target_session_.token();
+    if (!session||path.poses.empty()) return;
     vector_array_t goals;
     if (!transformPath(path, goals)) return;
-    std::lock_guard<std::mutex> lock(mutex_); if (!accepting_) return;
+    std::lock_guard<std::mutex> lock(mutex_); if (!target_session_.accepts(session)) return;
     try { twist_active_=false; plan(goals,duration_); publish(); }
     catch (const std::exception& e) { RCLCPP_WARN(node_->get_logger(),"TCP path rejected: %s",e.what()); }
 }
@@ -1432,9 +1472,38 @@ void TcpReferenceManager::commitImmediate() {
     referenceManagerPtr_->setTargetTrajectories(TargetTrajectories({time_},{target_},{vector_t::Zero(input_dim_)}));
 }
 void TcpReferenceManager::setCurrentObservation(const SystemObservation& observation) {
+    observation_time_.store(observation.time, std::memory_order_release);
+}
+bool TcpReferenceManager::requestReset(const vector_t& pose, double time) {
+    if (pose.size() != 7 || !pose.allFinite() || !std::isfinite(time)) return false;
+    ResetRequest request;
+    std::copy_n(pose.data(), 7, request.pose.begin());
+    request.time = time;
+    request.sequence = requested_reset_ + 1;
+    if (!reset_mailbox_.tryWrite(request)) return false;
+    requested_reset_ = request.sequence;
+    return true;
+}
+bool TcpReferenceManager::resetReady() const {
+    return requested_reset_ != 0 && applied_reset_.load(std::memory_order_acquire) == requested_reset_;
+}
+void TcpReferenceManager::updateReference() {
+    // Never called by the realtime loop. Waiting behind a large path only
+    // delays initialization/next references, not hardware updates or stopping.
     std::lock_guard<std::mutex> lock(mutex_);
-    const double dt=observation.time-last_time_; time_=observation.time; last_time_=time_;
-    if (!accepting_||!twist_active_) return;
+    const auto reset = reset_mailbox_.read();
+    if (reset.sequence != applied_reset_.load(std::memory_order_relaxed)) {
+        current_ = target_ = Eigen::Map<const Eigen::Matrix<double, 7, 1>>(reset.pose.data());
+        time_ = last_time_ = reset.time;
+        twist_active_ = false;
+        commitImmediate();
+        publish();
+        applied_reset_.store(reset.sequence, std::memory_order_release);
+    }
+    const double now = observation_time_.load(std::memory_order_acquire);
+    const double dt=now-last_time_; time_=now; last_time_=time_;
+    if (!target_session_.token()) { twist_active_ = false; return; }
+    if (!twist_active_) return;
     if (std::chrono::duration<double>(std::chrono::steady_clock::now()-twist_received_).count()>0.2) { twist_active_=false; return; }
     if (dt<=0.0||dt>0.5) return;
     target_.head<3>()+=dt*Eigen::Vector3d(twist_.linear.x,twist_.linear.y,twist_.linear.z);
@@ -1443,28 +1512,22 @@ void TcpReferenceManager::setCurrentObservation(const SystemObservation& observa
     commitImmediate(); publish();
 }
 void TcpReferenceManager::setAcceptingTargets(bool accept) {
-    accepting_=accept; if (!accept) { std::lock_guard<std::mutex> lock(mutex_); twist_active_=false; }
-}
-void TcpReferenceManager::setCurrentTcpPose(const vector_t& pose,bool update) {
-    std::lock_guard<std::mutex> lock(mutex_); current_=target_=pose; times_.clear(); poses_.clear();
-    if (update) commitImmediate();
-}
-void TcpReferenceManager::resetTargetStateCache() {
-    std::lock_guard<std::mutex> lock(mutex_); twist_active_=false; last_time_=-1.0; times_.clear(); poses_.clear(); target_=current_;
+    target_session_.setAccepting(accept);
 }
 void TcpReferenceManager::publish() const {
     if (!target_pub_) return;
     geometry_msgs::msg::PoseStamped p; p.header.frame_id=base_frame_; p.header.stamp=node_->now(); p.pose=rosPose(target_); target_pub_->publish(p);
 }
-void TcpReferenceManager::publishCurrentTargetsFromCache() { std::lock_guard<std::mutex> lock(mutex_); publish(); }
 
 void TcpReferenceManager::circle(const arms_ros2_control_msgs::srv::ExecuteCircle::Request& request,
                                 arms_ros2_control_msgs::srv::ExecuteCircle::Response& response) {
     const auto& parameters=request.circle_params;
-    if (!accepting_) throw std::invalid_argument("TCP tracking is paused");
+    const auto session = target_session_.token();
+    if (!session) throw std::invalid_argument("TCP tracking is paused");
     if (!parameters.arm_name.empty()&&parameters.arm_name!="tcp"&&parameters.arm_name!=tcp_frame_)
         throw std::invalid_argument("Select the configured TCP frame");
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!target_session_.accepts(session)) throw std::invalid_argument("TCP tracking is paused or session changed");
     const vector_t start=sample(time_);
     Eigen::Vector3d center,axis; double angle;
     vector_t end=start;
@@ -1520,4 +1583,4 @@ void TcpReferenceManager::circle(const arms_ros2_control_msgs::srv::ExecuteCircl
     twist_active_=false;times_=std::move(times);poses_=std::move(poses);target_=poses_.back();publish();
     response.success=true; response.estimated_duration=times_.back()-times_.front(); response.message="TCP circle accepted";
 }
-} // namespace zephyr::mpc_wholebody
+} // namespace zephyr::mpc

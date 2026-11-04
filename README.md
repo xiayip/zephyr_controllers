@@ -7,7 +7,7 @@ This is a meta-package that groups all custom ROS2 controllers developed for the
 This meta-package includes the following controller packages:
 
 ### Core Controllers
-- **mpc_wholebody_controller** - Zephyr mobile-base and arm MPC integration with predicted robot poses and a target-coordinate RViz panel; consumes unmodified OCS2 libraries
+- **[mpc_controller](mpc_controller/README.md)** - Fixed-base arm or mobile manipulator MPC integration with predicted robot poses and a target-coordinate RViz panel; consumes unmodified OCS2 libraries
 - **battery_state_broadcaster** - Controller to publish readings of Battery state
 - **dexhand_controller** - Dexterous hand controller
 - **gravity_compensation_model** - Realtime Pinocchio gravity model and feed-forward shaping library

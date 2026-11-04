@@ -4,7 +4,7 @@
 // Created for OCS2 Arm Controller
 //
 
-#include "mpc_wholebody_controller/mpc_wholebody_controller.h"
+#include "mpc_controller/mpc_controller.h"
 #include <algorithm>
 #include <pluginlib/class_list_macros.hpp>
 #include <pinocchio/algorithm/frames.hpp>
@@ -21,7 +21,7 @@
 #include <ocs2_controller_common/mpc/MpcExecutionParams.hpp>
 #include <pinocchio/algorithm/model.hpp>
 
-namespace zephyr::mpc_wholebody
+namespace zephyr::mpc
 {
     using namespace ocs2;
     using namespace ocs2::mobile_manipulator;
@@ -95,7 +95,7 @@ namespace zephyr::mpc_wholebody
     }
     using config_type = controller_interface::interface_configuration_type;
 
-    controller_interface::InterfaceConfiguration mpc_wholebody_controller::command_interface_configuration() const
+    controller_interface::InterfaceConfiguration mpc_controller::command_interface_configuration() const
     {
         controller_interface::InterfaceConfiguration conf = {config_type::INDIVIDUAL, {}};
         const std::string prefix = command_prefix_.empty() ? "" : command_prefix_ + "/";
@@ -111,7 +111,7 @@ namespace zephyr::mpc_wholebody
         return conf;
     }
 
-    controller_interface::InterfaceConfiguration mpc_wholebody_controller::state_interface_configuration() const
+    controller_interface::InterfaceConfiguration mpc_controller::state_interface_configuration() const
     {
         controller_interface::InterfaceConfiguration conf = {config_type::INDIVIDUAL, {}};
 
@@ -127,7 +127,7 @@ namespace zephyr::mpc_wholebody
         return conf;
     }
 
-    controller_interface::return_type mpc_wholebody_controller::update(
+    controller_interface::return_type mpc_controller::update(
         const rclcpp::Time& time, const rclcpp::Duration& period)
     {
         ctrl_comp_->beginRtCycle();
@@ -138,18 +138,28 @@ namespace zephyr::mpc_wholebody
             valid = ctrl_comp_->updateObservation(time);
         }
         if (execution_->consumeFailure()) pause_requested_ = true;
+        if (ctrl_comp_->pose_reference_manager_->consumeFailure()) pause_requested_ = true;
+        const auto collision = ctrl_comp_->collisionStatus();
         if (valid && !pause_requested_.load(std::memory_order_acquire) &&
-            ctrl_comp_->interface_->isSelfCollisionEnabled() && ctrl_comp_->isSelfCollisionActive())
+            collision != CollisionStatus::Safe && collision != CollisionStatus::Pending)
         {
             pause_requested_ = true;
-            RCLCPP_ERROR(get_node()->get_logger(), "MPC paused by self-collision check; resume with ~/pause after resolving it");
+            const char* reason = collision == CollisionStatus::Collision ? "collision" :
+                collision == CollisionStatus::Invalid ? "collision check failed" : "collision check stale";
+            RCLCPP_ERROR(get_node()->get_logger(), "MPC paused: %s; resolve before explicit ~/pause resume", reason);
         }
-        if (!valid || pause_requested_.load(std::memory_order_acquire))
+        if (!valid || collision == CollisionStatus::Pending || pause_requested_.load(std::memory_order_acquire))
         {
             execution_->pause();
             publishTrackingStatus(false);
         }
-        else publishTrackingStatus(execution_->tick(time));
+        else
+        {
+            const bool tracking = execution_->tick(time);
+            // Output validation faults hold immediately and latch in this cycle.
+            if (execution_->consumeFailure()) pause_requested_ = true;
+            publishTrackingStatus(tracking && !pause_requested_.load(std::memory_order_acquire));
+        }
         if (valid)
         {
             auto scope = ctrl_comp_->rtScopeViz();
@@ -160,7 +170,7 @@ namespace zephyr::mpc_wholebody
         return controller_interface::return_type::OK;
     }
 
-    controller_interface::CallbackReturn mpc_wholebody_controller::on_init()
+    controller_interface::CallbackReturn mpc_controller::on_init()
     {
         try
         {
@@ -187,7 +197,7 @@ namespace zephyr::mpc_wholebody
         }
     }
 
-    controller_interface::CallbackReturn mpc_wholebody_controller::on_configure(const rclcpp_lifecycle::State&)
+    controller_interface::CallbackReturn mpc_controller::on_configure(const rclcpp_lifecycle::State&)
     {
         tracking_status_publisher_ = get_node()->create_publisher<std_msgs::msg::Int32>(
             "/fsm_state", rclcpp::QoS(1).transient_local());
@@ -202,13 +212,13 @@ namespace zephyr::mpc_wholebody
                 response->message = request->data ? "Pause requested" : "Resume requested";
             });
         kinematics_service_ = get_node()->create_service<arms_ros2_control_msgs::srv::KinematicsService>(
-            "kinematics_service", std::bind(&mpc_wholebody_controller::handleKinematicsService, this,
+            "kinematics_service", std::bind(&mpc_controller::handleKinematicsService, this,
                                             std::placeholders::_1, std::placeholders::_2));
         ctrl_comp_->pose_reference_manager_->setAcceptingTargets(false);
         return CallbackReturn::SUCCESS;
     }
 
-    controller_interface::CallbackReturn mpc_wholebody_controller::on_activate(
+    controller_interface::CallbackReturn mpc_controller::on_activate(
         const rclcpp_lifecycle::State& /*previous_state*/)
     {
         // clear out vectors in case of restart
@@ -282,9 +292,14 @@ namespace zephyr::mpc_wholebody
         return CallbackReturn::SUCCESS;
     }
 
-    void mpc_wholebody_controller::stopExecution()
+    void mpc_controller::stopExecution()
     {
         pause_requested_ = true;
+        if (ctrl_comp_)
+        {
+            ctrl_comp_->pose_reference_manager_->setAcceptingTargets(false);
+            ctrl_comp_->holdLastSentPositions();
+        }
         if (execution_) execution_->stop();
         if (ctrl_comp_)
         {
@@ -294,7 +309,7 @@ namespace zephyr::mpc_wholebody
         }
         tracking_active_ = false;
     }
-    controller_interface::CallbackReturn mpc_wholebody_controller::on_deactivate(const rclcpp_lifecycle::State&)
+    controller_interface::CallbackReturn mpc_controller::on_deactivate(const rclcpp_lifecycle::State&)
     {
         stopExecution();
         ctrl_comp_->holdLastSentPositions();
@@ -303,7 +318,7 @@ namespace zephyr::mpc_wholebody
         ctrl_interfaces_.clear();
         return CallbackReturn::SUCCESS;
     }
-    controller_interface::CallbackReturn mpc_wholebody_controller::on_cleanup(const rclcpp_lifecycle::State&)
+    controller_interface::CallbackReturn mpc_controller::on_cleanup(const rclcpp_lifecycle::State&)
     {
         stopExecution();
         tracking_status_timer_.reset();
@@ -311,18 +326,18 @@ namespace zephyr::mpc_wholebody
         kinematics_service_.reset();
         return CallbackReturn::SUCCESS;
     }
-    controller_interface::CallbackReturn mpc_wholebody_controller::on_error(const rclcpp_lifecycle::State&)
+    controller_interface::CallbackReturn mpc_controller::on_error(const rclcpp_lifecycle::State&)
     {
         stopExecution();
         return CallbackReturn::SUCCESS;
     }
-    controller_interface::CallbackReturn mpc_wholebody_controller::on_shutdown(const rclcpp_lifecycle::State&)
+    controller_interface::CallbackReturn mpc_controller::on_shutdown(const rclcpp_lifecycle::State&)
     {
         stopExecution();
         return CallbackReturn::SUCCESS;
     }
 
-    void mpc_wholebody_controller::handleKinematicsService(
+    void mpc_controller::handleKinematicsService(
         const std::shared_ptr<arms_ros2_control_msgs::srv::KinematicsService::Request> request,
         const std::shared_ptr<arms_ros2_control_msgs::srv::KinematicsService::Response> response)
     {
@@ -343,7 +358,7 @@ namespace zephyr::mpc_wholebody
         }
     }
 
-    void mpc_wholebody_controller::publishTrackingStatus(bool active)
+    void mpc_controller::publishTrackingStatus(bool active)
     {
         const bool changed = tracking_active_.exchange(active, std::memory_order_acq_rel) != active;
         if (changed)
@@ -352,7 +367,7 @@ namespace zephyr::mpc_wholebody
             publishStatusMessage();
         }
     }
-    void mpc_wholebody_controller::publishStatusMessage()
+    void mpc_controller::publishStatusMessage()
     {
         if (!tracking_status_publisher_ || !get_node()->get_node_base_interface()->get_context()->is_valid()) return;
         std_msgs::msg::Int32 status;
@@ -489,6 +504,7 @@ void MpcExecution::start()
 {
     stop();
     initialized_ = false;
+    reference_reset_requested_ = false;
     failed_ = false;
     job_ = Job::Idle;
     running_ = true;
@@ -508,6 +524,7 @@ void MpcExecution::pause()
     job_.compare_exchange_strong(expected, Job::Idle, std::memory_order_acq_rel);
     if (initialized_) component_->clearTrajectoryVisualization();
     initialized_ = false;
+    reference_reset_requested_ = false;
     component_->holdLastSentPositions();
 }
 bool MpcExecution::requestSolve()
@@ -525,9 +542,19 @@ bool MpcExecution::tick(const rclcpp::Time& time)
             component_->holdLastSentPositions();
             return false;
         }
-        component_->pose_reference_manager_->resetTargetStateCache();
+        if (!reference_reset_requested_)
+        {
+            reference_reset_requested_ = component_->requestReferenceReset();
+            component_->holdLastSentPositions();
+            return false;
+        }
+        if (!component_->pose_reference_manager_->resetReady())
+        {
+            component_->holdLastSentPositions();
+            return false;
+        }
+        reference_reset_requested_ = false;
         component_->resetMpc();
-        component_->publishCachedCurrentTargets();
         component_->requestVisualizationUpdate();
         last_request_time_ = time;
         initialized_ = true;
@@ -541,7 +568,12 @@ bool MpcExecution::tick(const rclcpp::Time& time)
     }
     if ((time - last_request_time_).seconds() >= period_sec_ && requestSolve())
         last_request_time_ = time;
-    component_->evaluatePolicy(time);
+    if (!component_->evaluatePolicy(time))
+    {
+        pause();
+        failed_.store(true, std::memory_order_release);
+        return false;
+    }
     return true;
 }
 void MpcExecution::workerLoop()
@@ -566,4 +598,4 @@ void MpcExecution::workerLoop()
 }
 }
 
-PLUGINLIB_EXPORT_CLASS(zephyr::mpc_wholebody::mpc_wholebody_controller, controller_interface::ControllerInterface)
+PLUGINLIB_EXPORT_CLASS(zephyr::mpc::mpc_controller, controller_interface::ControllerInterface)

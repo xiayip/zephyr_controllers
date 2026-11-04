@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-#include "mpc_wholebody_controller/control/StagedMotion.h"
+#include "mpc_controller/control/StagedMotion.h"
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -8,7 +8,7 @@
 #include <pinocchio/algorithm/frames.hpp>
 #include <rclcpp/logging.hpp>
 
-namespace zephyr::mpc_wholebody {
+namespace zephyr::mpc {
 using namespace ocs2;
 
 const char* motionPhaseName(MotionPhase phase) {
@@ -413,4 +413,4 @@ void StagedReferenceManager::reset() {
     coordinator_->reset();
     *solve_state_ = StagedMotionState{};
 }
-} // namespace zephyr::mpc_wholebody
+} // namespace zephyr::mpc

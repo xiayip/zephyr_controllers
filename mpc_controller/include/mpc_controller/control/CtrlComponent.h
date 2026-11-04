@@ -19,9 +19,10 @@
 #include <vector>
 
 #include <ocs2_controller_common/rt/RtCycleTiming.h>
-#include <mpc_wholebody_controller/visualization/mpc_visualizer.h>
+#include <mpc_controller/visualization/mpc_visualizer.h>
 
-#include <mpc_wholebody_controller/control/StagedMotion.h>
+#include <mpc_controller/control/StagedMotion.h>
+#include <mpc_controller/control/ControlSafety.h>
 #include <ocs2_core/Types.h>
 #include <ocs2_mobile_manipulator/MobileManipulatorInterface.h>
 #include <ocs2_mpc/MPC_BASE.h>
@@ -48,10 +49,10 @@
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_listener.hpp>
 #include <arms_ros2_control_msgs/srv/execute_circle.hpp>
-#include <mpc_wholebody_controller/srv/execute_tcp_path.hpp>
+#include <mpc_controller/srv/execute_tcp_path.hpp>
 
 // TCP target interfaces and reference trajectories.
-namespace zephyr::mpc_wholebody {
+namespace zephyr::mpc {
 /** One real TCP, with no arm selector or ROS name translation. */
 class TcpReferenceManager final : public ocs2::ReferenceManagerDecorator {
 public:
@@ -60,10 +61,23 @@ public:
     void subscribe(const rclcpp_lifecycle::LifecycleNode::SharedPtr& node);
     void setAcceptingTargets(bool accept);
     void setCurrentObservation(const ocs2::SystemObservation& observation);
-    void setCurrentTcpPose(const ocs2::vector_t& pose, bool update = false);
-    void resetTargetStateCache();
-    void publishCurrentTargetsFromCache();
+    /** Nonblocking request; caller retries while the mailbox is busy. */
+    bool requestReset(const ocs2::vector_t& pose, double time);
+    bool resetReady() const;
+    bool consumeFailure() { return failed_.exchange(false, std::memory_order_acq_rel); }
 private:
+    void updateReference(); // Executor timer only, never controller_manager::update.
+    struct ResetRequest {
+        std::array<double, 7> pose{};
+        double time{0};
+        uint64_t sequence{0};
+    };
+    TryWriteMailbox<ResetRequest> reset_mailbox_;
+    uint64_t requested_reset_{0}; // RT writer only
+    std::atomic<uint64_t> applied_reset_{0};
+    std::atomic<double> observation_time_{0};
+    std::atomic_bool failed_{false};
+    rclcpp::TimerBase::SharedPtr reference_timer_;
     bool transform(const geometry_msgs::msg::PoseStamped& pose, ocs2::vector_t& result) const;
     bool transformPath(const nav_msgs::msg::Path& path, ocs2::vector_array_t& goals) const;
     void acceptPose(const geometry_msgs::msg::PoseStamped& pose, bool interpolate);
@@ -76,7 +90,7 @@ private:
     void circle(const arms_ros2_control_msgs::srv::ExecuteCircle::Request& request,
                 arms_ros2_control_msgs::srv::ExecuteCircle::Response& response);
     mutable std::mutex mutex_;
-    std::atomic_bool accepting_{false};
+    TargetSession target_session_;
     std::string base_frame_, tcp_frame_;
     size_t input_dim_;
     rclcpp_lifecycle::LifecycleNode::SharedPtr node_;
@@ -98,7 +112,7 @@ private:
     rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr relative_sub_;
     rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
     rclcpp::Service<arms_ros2_control_msgs::srv::ExecuteCircle>::SharedPtr circle_service_;
-    rclcpp::Service<::mpc_wholebody_controller::srv::ExecuteTcpPath>::SharedPtr path_service_;
+    rclcpp::Service<::mpc_controller::srv::ExecuteTcpPath>::SharedPtr path_service_;
 };
 struct TcpTrajectorySample {
     double stamp_sec{0.0};
@@ -133,11 +147,15 @@ private:
 
         /** Commit only complete, finite feedback. False means hold outputs this cycle. */
         bool updateObservation(const rclcpp::Time& time);
-        void evaluatePolicy(const rclcpp::Time& time);
+        /** False is a latched execution fault; outputs are already held. */
+        bool evaluatePolicy(const rclcpp::Time& time);
         /** Command the mobile base. The default zero command is used outside OCS2 mode. */
         void stopMobileBase() const;
-        /** Reset observation/targets and MPC node. Does NOT block for the first policy (RT-safe). */
+        /** Reset only after the solver is idle and the reference reset is acknowledged.
+         * Does not wait for the first policy; this is not a hard-RT guarantee.
+         */
         void resetMpc();
+        bool requestReferenceReset();
         /** True once the first MPC policy after resetMpc() is available. */
         [[nodiscard]] bool initialPolicyReceived() const;
         void advanceMpc();
@@ -145,12 +163,10 @@ private:
         void setMpcPeriodSec(double period_sec);
         /** Hold joints at last commanded positions (used while waiting for initial policy). */
         void holdLastSentPositions() const;
-        /** Publish TCP current_target from cache (call on OCS2 enter for marker sync). */
-        void publishCachedCurrentTargets() const;
 
         /**
          * Prediction, self-collision markers and recording on an independent periodic worker
-         * (not RT update). FCL judgment runs on viz thread; RT only reads collision_active_.
+         * (not RT update). RT consumes a timestamped collision result, not a display flag.
          * Start on controller activate, stop on deactivate. Request updates via
          * maybeRequestVisualizationUpdate() from the common control path (the active lifetime).
          */
@@ -175,14 +191,7 @@ private:
         // Torque calculation for force control
         vector_t calculateStaticTorques() const;
 
-        /**
-         * RT-safe: viz thread already compared FCL min distance to configured threshold.
-         * The controller only consumes this flag (no threshold re-judgment).
-         */
-        bool isSelfCollisionActive() const
-        {
-            return collision_active_.load(std::memory_order_acquire);
-        }
+        CollisionStatus collisionStatus() const;
 
         // Get node reference
         std::shared_ptr<rclcpp_lifecycle::LifecycleNode> getNode() const { return node_; }
@@ -261,6 +270,7 @@ private:
         struct VisualizationSnapshot
         {
             SystemObservation observation;
+            int64_t observed_at_us{0};
             /** Command-overlay q for FCL + collision markers (obs base + last_sent joints). */
             vector_t collision_state;
             bool has_pred{false};
@@ -290,8 +300,9 @@ private:
         std::shared_ptr<const zephyr::mpc_visualization::TimedPrediction> solver_prediction_; // atomic worker -> RT
         std::shared_ptr<const zephyr::mpc_visualization::TimedPrediction> active_prediction_; // RT only
         double last_recorded_observation_time_{-1.0}; // viz worker only
-        /** Viz-thread judgment (valid FCL && min_dist <= configured thr); RT only loads. */
-        std::atomic_bool collision_active_{false};
+        CollisionWatchdog collision_watchdog_;
+        int64_t collision_started_us_{0};
+        double collision_check_timeout_{0.25};
         /** Published via atomic_store/load only (RT → viz handoff, no mutex). */
         std::shared_ptr<VisualizationSnapshot> visualization_snapshot_;
         /** RT-only staging for pred samples; folded into snapshot in requestVisualizationUpdate(). */
@@ -304,14 +315,15 @@ private:
         std::string planning_urdf_variant_; // must be "xacro"
         std::string planning_urdf_path_; // xacro-generated URDF cache path
         std::vector<std::string> joint_names_;
+        std::vector<int> arm_torque_indices_;
+        vector_t arm_torques_;
+        vector_t reset_tcp_pose_;
         bool mobile_base_enabled_{false};
         std::size_t base_state_offset_{0};
         double future_time_offset_; // Number of control cycles ahead to sample.
-        /// cached MPC observation state (which is different from real observation on purpose)
-        bool cached_ob_state_;
-        rclcpp::Time last_execute_time_;
-        vector_t cached_last_action_;
-        std::atomic<double> hardware_latency_{0.2};
+        double policy_max_age_{0.5};
+        bool policy_valid_{false};
+        std::chrono::steady_clock::time_point policy_received_at_{};
         std::string traj_record_dir_{"/tmp/traj_record"};
         rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle_;
         rclcpp::node_interfaces::PostSetParametersCallbackHandle::SharedPtr post_parameter_callback_handle_;

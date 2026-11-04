@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>mpc_wholebody_controller</name>
+  <name>mpc_controller</name>
   <version>1.0.0</version>
-  <description>Zephyr mobile manipulator MPC controller and prediction visualization using upstream OCS2 libraries.</description>
+  <description>Zephyr fixed-base arm or mobile manipulator MPC controller using upstream OCS2 libraries.</description>
   <maintainer email="yipeng.xia@hotmail.com">xiayip</maintainer>
   <license>Apache-2.0</license>
   <buildtool_depend>ament_cmake</buildtool_depend>
@@ -34,6 +34,7 @@
   <depend>rviz_common</depend>
   <depend>qtbase5-dev</depend>
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>eigen</test_depend>
   <export>
     <build_type>ament_cmake</build_type>
   </export>

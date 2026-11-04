@@ -17,11 +17,11 @@
 #include <std_msgs/msg/int32.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 
-#include "mpc_wholebody_controller/control/CtrlComponent.h"
+#include "mpc_controller/control/CtrlComponent.h"
 
 #include <arms_controller_common/CtrlInterfaces.h>
 #include "arms_ros2_control_msgs/srv/kinematics_service.hpp"
-namespace zephyr::mpc_wholebody
+namespace zephyr::mpc
 {
 /** Runs only OCS2. Solver work stays off the controller_manager update thread. */
 class MpcExecution
@@ -45,6 +45,7 @@ private:
     std::atomic_bool failed_{false};
     std::atomic<Job> job_{Job::Idle};
     bool initialized_{false}; // controller thread only
+    bool reference_reset_requested_{false}; // Wait for non-RT reference reset before starting MPC.
     double period_sec_{0.02};
     int sleep_ms_{2};
     rclcpp::Time last_request_time_{0, 0, RCL_ROS_TIME};
@@ -65,11 +66,11 @@ private:
 };
 
     using ControlMode = arms_controller_common::ControlMode;
-    class mpc_wholebody_controller final : public controller_interface::ControllerInterface
+    class mpc_controller final : public controller_interface::ControllerInterface
     {
     public:
-        mpc_wholebody_controller() = default;
-        ~mpc_wholebody_controller() override = default;
+        mpc_controller() = default;
+        ~mpc_controller() override = default;
 
         controller_interface::CallbackReturn on_init() override;
         controller_interface::CallbackReturn on_configure(const rclcpp_lifecycle::State& previous_state) override;

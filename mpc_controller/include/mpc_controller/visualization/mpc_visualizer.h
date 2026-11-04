@@ -23,7 +23,6 @@
 #include <pinocchio/multibody/geometry.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
-#include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <std_msgs/msg/string.hpp>
 
@@ -77,19 +76,14 @@ struct mpc_visualizer_config {
     std::string base_frame;
     /** Frame in which FK poses are expressed (odom for an OCS2 mobile-base state). */
     std::string visualization_frame;
-    /** The first three state entries are mobile-base x, y, and yaw. */
-    bool mobile_base_enabled{false};
     bool prediction_visualization_enabled{true};
     double ghost_interval{0.2};
     size_t ghost_count{5};
     double marker_lifetime{0.15};
     double control_period{0.02};
     std::string tcp_ee_frame;
-    /// Body/torso frame for reference FK (wheel humanoid). Empty: callers use identity pose for body reference block.
-    std::string body_frame;
-    /// Optional head frame; publish current pose only when present in the model.
-    std::string head_frame;
     std::optional<PinocchioGeometryInterface> pinocchio_geometry;
+    bool self_collision_enabled{false};
     scalar_t self_collision_activation_distance{0};
 };
 
@@ -112,24 +106,14 @@ public:
     /** Min distance from the last successful publishDistances under the mutex. */
     scalar_t getLastMinDistance() const;
 
-    /** One FK into RT Data; extract TCP / body / head (7-vectors). No ROS publish. */
-    struct EndEffectorPoses {
-        vector_t tcp = vector_t::Zero(7);
-        vector_t body = vector_t::Zero(7);
-        vector_t head = vector_t::Zero(7);
-    };
-    EndEffectorPoses computeEndEffectorPoses(const vector_t& state) const;
-
-    /** Throttled PoseStamped publish (default 50 Hz). Control FK must use computeEndEffectorPoses. */
-    void publishEndEffectorPoses(const rclcpp::Time& time, const EndEffectorPoses& poses) const;
-    void publishEndEffectorPose(const rclcpp::Time& time, const vector_t& state) const;
+    /** Throttled publish of an already computed TCP pose; does not run FK. */
+    void publishTcpPose(const rclcpp::Time& time, const vector_t& pose) const;
     void setPosePublishPeriod(double period_sec);
 
+    /** Control thread only: FK into RT Data, returning (x,y,z,qx,qy,qz,qw). */
     vector_t computeEndEffectorPose(const vector_t& state) const;
     /** Worker thread only; never touches the RT FK cache. */
     vector_t computeRecordedEndEffectorPose(const vector_t& state) const;
-    /** 7-dim pose (x,y,z, qx,qy,qz,qw) of body_frame in base; identity at origin if body_frame empty or missing. */
-    vector_t computeBodyFramePose(const vector_t& state) const;
 
     void clearTrajectoryHistory();
 
@@ -138,8 +122,6 @@ private:
     vector_t extractFramePose7(const pinocchio::Data& data, pinocchio::FrameIndex frame_id) const;
     static void fillPoseStamped(geometry_msgs::msg::PoseStamped& msg, const rclcpp::Time& time,
                                 const std::string& frame_id, const vector_t& pose7);
-    void publishPose(const rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr& pub,
-                     const rclcpp::Time& time, const vector_t& pose7) const;
     void appendPredictedRobotMarkers(visualization_msgs::msg::MarkerArray& marker_array);
 
     visualization_msgs::msg::Marker createTrajectoryLineMarker(const std::vector<vector_t>& poses,
@@ -152,8 +134,6 @@ private:
 
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr trajectory_marker_publisher_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr tcp_end_effector_pose_publisher_;
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr body_frame_pose_publisher_;
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr head_frame_pose_publisher_;
 
     std::unique_ptr<GeometryInterfaceVisualization> geometry_visualization_;
     /** Guards geometry_visualization_ (viz-thread publishDistances / getLastMinDistance). */
@@ -174,11 +154,7 @@ private:
     pinocchio::GeometryModel visual_geometry_model_;
     std::unique_ptr<pinocchio::GeometryData> visual_geometry_data_;
     pinocchio::FrameIndex tcp_ee_frame_id_{0};
-    pinocchio::FrameIndex body_frame_id_{0};
-    pinocchio::FrameIndex head_frame_id_{0};
     bool tcp_ee_frame_valid_{false};
-    bool body_frame_valid_{false};
-    bool head_frame_valid_{false};
 
     double pose_publish_period_sec_{0.02};
     mutable rclcpp::Time last_pose_publish_time_{0, 0, RCL_ROS_TIME};
