@@ -1,0 +1,42 @@
+# upstream provenance
+
+This package adapts the ros2_control integration from
+https://github.com/fiveages-sim/arms_ros2_control under Apache-2.0.
+The complete upstream license is included in `LICENSE`.
+
+Baseline: `2309556624b41d0f45267c369358e35bcdd8f431` (the local origin/main at migration).
+
+| Local implementation | Source at baseline |
+| --- | --- |
+| `src/mpc_wholebody_controller.cpp`, corresponding header | `controller/ocs2_arm_controller/src/Ocs2ArmController.cpp`, corresponding header |
+| `src/control`, `include/.../control` | `controller/ocs2_arm_controller/src/control`, corresponding headers |
+| MPC worker in `src/mpc_wholebody_controller.cpp` | Replaces the former FSM adaptation with direct OCS2 execution |
+| `src/visualization/mpc_visualizer.cpp`, corresponding header | `libraries/ocs2_controller_common/src/visualization/Ocs2PinocchioVisualizer.cpp`, corresponding header |
+| `plugin/tcp_rviz.cpp` and `plugin/tcp_rviz.hpp` (Qt AUTOMOC) | Zephyr addition previously kept inside `command/arms_rviz_control_plugin` |
+
+The controller integration is adapted locally because the upstream controller
+is `final`, owns its component privately, and has no extension point for the
+mobile-base observation/command offsets or replacement visualizer.
+All adapted C++ symbols live in `zephyr` namespaces to avoid collisions with
+upstream libraries. Only the Zephyr integration and visualization are built
+here. MPC/DDP solvers, model construction, costs/constraints, common control interfaces
+and scheduling remain linked upstream implementations. Native single-TCP references,
+IK/FK, marker interaction, pose UI and recording are implemented locally without arm-side
+name translation. The TCP error display reuses the upstream ErrorDashboard renderer
+without its upstream topic subscription layer. No source-file injection, include-directory shadowing, duplicate
+package names, or post-clone patch step is used.
+
+The `ocs2_wbc_controller` entry in arms_ros2_control is an uninitialized external
+submodule in this workspace. This migration preserves the working mobile
+manipulator MPC model rather than switching to a different controller/model.
+
+Updating upstream libraries requires rebuilding their dependants. Upstream API
+changes may require adapting this package; upstream changes to copied controller
+integration do not propagate automatically. Compare the listed source files
+against this recorded baseline when adopting such changes.
+
+The marker server lives in the RViz plugin and shares the RViz ROS node.
+No standalone marker executable is needed, and the headless controller does not load Qt.
+
+The native TcpReferenceManager declaration and implementation are consolidated in
+CtrlComponent.h/.cpp; the prediction visualizer remains a separate module.
