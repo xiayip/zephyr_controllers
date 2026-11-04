@@ -1,0 +1,7 @@
+<library path="mpc_wholebody_controller">
+  <class name="mpc_wholebody_controller/mpc_wholebody_controller"
+         type="zephyr::mpc_wholebody::mpc_wholebody_controller"
+         base_class_type="controller_interface::ControllerInterface">
+    <description>Zephyr arm and mobile-base MPC using upstream OCS2.</description>
+  </class>
+</library>
