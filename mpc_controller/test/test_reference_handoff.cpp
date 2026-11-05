@@ -2,9 +2,10 @@
 #include <gtest/gtest.h>
 #include <condition_variable>
 #include <future>
+#include <limits>
 #include <thread>
 #include <ocs2_oc/synchronized_module/ReferenceManager.h>
-#include "mpc_controller/control/CtrlComponent.h"
+#include "mpc_controller/control/TcpReferenceManager.h"
 
 using namespace zephyr::mpc;
 using namespace std::chrono_literals;
@@ -59,6 +60,25 @@ protected:
     ocs2::vector_t committedTarget() {
         wrapped->preSolverRun(10, 11, ocs2::vector_t::Zero(6));
         return wrapped->getTargetTrajectories().stateTrajectory.front();
+    }
+    template<class Message>
+    void send(const char* topic, const Message& message) {
+        auto pub = node->create_publisher<Message>(topic, 1);
+        pub->on_activate();
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (!pub->get_subscription_count() && std::chrono::steady_clock::now() < deadline) {
+            executor.spin_some();
+            std::this_thread::sleep_for(1ms);
+        }
+        ASSERT_GT(pub->get_subscription_count(), 0u);
+        pub->publish(message);
+        // Include rejected/paused requests: they deliberately produce no ack.
+        const auto delivered = std::chrono::steady_clock::now() + 100ms;
+        while (std::chrono::steady_clock::now() < delivered) {
+            executor.spin_some();
+            std::this_thread::sleep_for(1ms);
+        }
+        wrapped->preSolverRun(10, 11, ocs2::vector_t::Zero(6));
     }
     rclcpp_lifecycle::LifecycleNode::SharedPtr node;
     rclcpp::executors::SingleThreadedExecutor executor;
@@ -134,4 +154,76 @@ TEST_F(ReferenceHandoff, BusyReferenceCallbackCannotBlockControlOrPause) {
     EXPECT_FALSE(reference->consumeFailure());
     ASSERT_TRUE(spinUntilReset());
     EXPECT_EQ(committedTarget(), pose);
+}
+
+TEST_F(ReferenceHandoff, StandardPathTopicInterpolatesAndIgnoresTargetsWhenPaused) {
+    ASSERT_TRUE(reference->requestReset(pose, 10));
+    ASSERT_TRUE(spinUntilReset());
+    reference->setAcceptingTargets(true);
+    nav_msgs::msg::Path path;
+    path.header.frame_id = "base";
+    geometry_msgs::msg::PoseStamped goal;
+    goal.pose.position.x = 0.1;
+    goal.pose.position.y = 0.2;
+    goal.pose.position.z = 0.31;
+    goal.pose.orientation.w = 1;
+    path.poses.push_back(goal);
+    send("target_path", path);
+    const auto& target = wrapped->getTargetTrajectories();
+    ASSERT_GT(target.stateTrajectory.size(), 1u);
+    EXPECT_NEAR(target.stateTrajectory.back()(2), 0.31, 1e-12);
+    EXPECT_GE(target.timeTrajectory.back() - target.timeTrajectory.front(), 2.0);
+    reference->setAcceptingTargets(false);
+    path.poses.front().pose.position.z = 0.32;
+    send("target_path", path);
+    EXPECT_NEAR(wrapped->getTargetTrajectories().stateTrajectory.back()(2), 0.31, 1e-12);
+}
+
+TEST_F(ReferenceHandoff, StandardPathRejectsEmptyInvalidAndUntransformablePoses) {
+    ASSERT_TRUE(reference->requestReset(pose, 10));
+    ASSERT_TRUE(spinUntilReset());
+    reference->setAcceptingTargets(true);
+    nav_msgs::msg::Path path;
+    path.header.frame_id = "base";
+    send("target_path", path);
+    EXPECT_EQ(committedTarget(), pose);
+    path.poses.emplace_back();  // Invalid zero quaternion.
+    send("target_path", path);
+    EXPECT_EQ(committedTarget(), pose);
+    path.poses.front().pose.orientation.w = 1;
+    path.poses.front().pose.position.z = std::numeric_limits<double>::quiet_NaN();
+    send("target_path", path);
+    EXPECT_EQ(committedTarget(), pose);
+    path.poses.front().pose.position.z = 0.5;
+    path.poses.front().header.frame_id = "missing_frame";  // Overrides path frame.
+    send("target_path", path);
+    EXPECT_EQ(committedTarget(), pose);
+}
+
+TEST_F(ReferenceHandoff, PoseStreamUsedByRvizIsImmediateAndSessionGated) {
+    ASSERT_TRUE(reference->requestReset(pose, 10));
+    ASSERT_TRUE(spinUntilReset());
+    reference->setAcceptingTargets(true);
+    geometry_msgs::msg::Pose target;
+    target.position.x = 0.1;
+    target.position.y = 0.2;
+    target.position.z = 0.31;
+    target.orientation.w = 2;  // Normalized by the reference manager.
+    send("tcp_target", target);
+    EXPECT_DOUBLE_EQ(committedTarget()(2), 0.31);
+    EXPECT_DOUBLE_EQ(committedTarget()(6), 1.0);
+    EXPECT_EQ(wrapped->getTargetTrajectories().stateTrajectory.size(), 1u);
+    reference->setAcceptingTargets(false);
+    target.position.z = 0.5;
+    send("tcp_target", target);
+    EXPECT_DOUBLE_EQ(committedTarget()(2), 0.31);
+}
+
+TEST_F(ReferenceHandoff, DoesNotAdvertiseCustomMotionServices) {
+    for (const auto& [name, types] : node->get_service_names_and_types()) {
+        EXPECT_NE(name, "/mpc_control_tests/execute_path");
+        EXPECT_NE(name, "/mpc_control_tests/execute_tcp_circle");
+        for (const auto& type : types)
+            EXPECT_EQ(type.find("zephyr_msgs/"), std::string::npos);
+    }
 }

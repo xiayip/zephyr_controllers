@@ -1,28 +1,34 @@
 # mpc_controller
 
-支持固定底座单机械臂，或单机械臂加移动底盘的 MPC 控制器，依赖原版 OCS2 和
-`arms_ros2_control` 公共库。包名、控制器类名和导出的插件名均为小写。
+支持固定底座单机械臂，或单机械臂加移动底盘的 MPC 控制器，直接依赖原版 OCS2。
+不再需要安装或构建 `arms_ros2_control` 的任何包。包名、控制器类名和插件名均为小写。
 
 ## 组成与依赖
 
 | 文件 | 功能 |
 | --- | --- |
-| `src/mpc_controller.cpp` | 生命周期、求解线程、暂停以及单 TCP FK/IK 服务 |
-| `src/control/CtrlComponent.cpp` | TCP 目标与参考轨迹、实测状态送入 MPC、执行求解结果、底盘限速/死区与可选 CSV 记录 |
+| `src/mpc_controller.cpp` | 生命周期、求解线程、暂停及服务注册 |
+| `src/control/TcpKinematics.cpp` | 基于 Pinocchio 的标准 FK/IK 服务，不执行运动 |
+| `include/mpc_controller/control/JointInterfaces.h` | 关节接口句柄及最近位置命令；不维护无用的导数历史 |
+| `include/mpc_controller/runtime/` | 线程调度、执行周期计算和可选耗时统计 |
+| `src/control/CtrlComponent.cpp` | 模型加载、实测观测、求解结果执行、保护与工作线程协调 |
+| `src/control/TcpReferenceManager.cpp` | TCP 目标输入、坐标转换与 OCS2 参考轨迹生成 |
+| `src/control/TcpTrajectoryRecorder.cpp` | 实测/预测 TCP 的缓冲与 CSV 写出 |
 | `src/control/StagedMotion.cpp` | 机械臂优先、底盘接近和停稳后的任务切换 |
 | `src/visualization/mpc_visualizer.cpp` | TCP 位姿、两色轨迹、分身及其时间对齐 |
 | `plugin/tcp_rviz.cpp` | 可拖动的单 TCP 坐标轴、坐标输入、完整位姿输入和误差显示 |
 
-控制模块的声明放在同名头文件中。`TcpReferenceManager` 类的声明与实现已合入
-`CtrlComponent.h/.cpp`，保留独立类职责；`mpc_visualizer.h/.cpp` 继续独立。
+控制模块的声明放在同名头文件中。目标处理、CSV 记录和可视化各自独立成文件，
+由 `CtrlComponent` 协调，仍属于同一个包；没有增加新的抽象层或独立节点。
 交互坐标轴由 RViz 面板共享，使用 RViz 已有的 ROS 节点。
 三个 RViz 界面类在 `plugin/tcp_rviz.hpp` 中声明，在 `plugin/tcp_rviz.cpp` 中实现；Qt 元对象代码由 AUTOMOC 自动生成。
 TCP 接入 MPC 的主要链路为：
 `tcp_target/stamped → TcpReferenceManager → OCS2 参考轨迹 → 求解器 → CtrlComponent → 关节与底盘命令`。
 
 MPC 求解器与优化模型使用未修改的 `ocs2_mobile_manipulator`、`ocs2_ddp`、`ocs2_mpc`。
-调度与公共控制接口继续调用 `ocs2_controller_common` 和 `arms_controller_common`。
-本地只实现单 TCP 接口及 Zephyr 的观测、执行和显示逻辑。
+关节接口、调度/计时及单 TCP 误差 HUD 是本包内的少量辅助代码；不复制 MPC 算法。
+目标输入和服务均复用标准 ROS 类型，不依赖 `zephyr_msgs`。
+画圆等形状生成放在上层示例，不属于控制器的执行接口。
 代码来源、迁移基线和维护边界见 [UPSTREAM.md](UPSTREAM.md)。
 
 ## 注册与兼容
@@ -34,8 +40,9 @@ C++ 类为 `zephyr::mpc::mpc_controller`。
 单机械臂 mock 使用实例名 `mpc_controller`，只加载一个 MPC 控制器。
 RViz 的本地 TCP 面板直接连接 TCP 话题，不再使用控制器别名或左右臂重映射。
 
-ROS 包、C++ 头文件路径、插件 XML、共享库、RViz 插件和 `ExecuteTcpPath` 服务类型
-均已使用新名称；不提供旧包名兼容别名。已有外部 YAML、RViz 配置或客户端需同步迁移。
+ROS 包、C++ 头文件路径、插件 XML、共享库和 RViz 插件均已使用新名称；
+不提供旧包名兼容别名。已有外部 YAML、RViz 配置或客户端需同步迁移。
+本次服务类型有不兼容变更，见下文服务迁移表。
 从旧包切换时请在新终端加载新的安装环境，避免旧安装残留干扰插件发现。
 
 固定底座模型任务在 `zephyr_arm_description/config/ocs2/task.info`，控制器参数在
@@ -45,30 +52,35 @@ ROS 包、C++ 头文件路径、插件 XML、共享库、RViz 插件和 `Execute
 
 ## 编译
 
-控制保护修复已在 Jazzy/aarch64 下隔离编译并测试：OCS2 `1.4.0`、
-`arms_ros2_control` 提交 `2309556624b41d0f45267c369358e35bcdd8f431`。
-该组合需要的上游包是 `arms_ros2_control_msgs`、`arms_controller_common`、
-`ocs2_controller_common` 和 `arms_rviz_control_plugin`；本插件不依赖上游的
-`ocs2_arm_controller`。不要直接混用任意最新版本：测试发现 OCS2
-`1.4.2.main.e81351c` 与上述公共库的碰撞显示构造接口不兼容。
+基线为 ROS Jazzy/aarch64、OCS2 `1.4.0`。升级 OCS2 需要单独验证 API/ABI，
+不要混用未验证的 `1.4.2.main` 预发布库。来源提交只用于归属与对照，不是构建依赖。
 
-系统依赖（ROS Jazzy、ros2_control、RViz/Qt 等）按 `package.xml` 安装；
-OCS2 使用上述匹配版本的二进制安装包或已构建的源码 underlay。
-上述四个 `arms_ros2_control` 包需从记录的源码提交构建，不能仅安装本插件。
-这些外部依赖不打包进本仓库，也不要对上游打补丁。
+| 依赖 | 获取方式 / 是否适合放 Dockerfile |
+| --- | --- |
+| OCS2 算法及 ROS 桥接：`ocs2_core/oc/mpc/ddp/mobile_manipulator`、`ocs2_pinocchio_interface`、`ocs2_self_collision`、`ocs2_self_collision_visualization`、`ocs2_ros_interfaces`、`ocs2_msgs` | 固定版本的二进制包，或匹配源码构建的 underlay；可在镜像构建阶段安装，不能以普通 ROS apt 包存在为前提 |
+| ROS 2、ros2_control、TF2、realtime_tools、标准消息、`moveit_msgs` | 按 `package.xml` 由 rosdep/apt 安装，适合 Dockerfile |
+| Eigen、Boost、Pinocchio | rosdep/apt；Pinocchio 必须与 OCS2 的构建版本兼容 |
+| RViz、Qt、interactive_markers | 可选界面构建依赖，默认开启；适合 Dockerfile |
 
-在开发容器中先加载 OCS2 与上述公共库的安装环境；以下命令假设其他 Zephyr
-依赖也已安装到工作区。它只构建本次新增/改名的三个包，不隐式下载外部依赖：
+`moveit_msgs` 只提供服务/消息定义，不需要启动 MoveIt、move_group 或 Servo。
+本包不再生成 rosidl 接口。下面的命令假设 OCS2 underlay 和其他 Zephyr 依赖已安装；
+新终端只加载需要的环境，不要沿用旧 `arms_*` underlay：
 
 ```bash
 cd /workspaces/zephyr-dev/zephyr_ws
 source /opt/ros/jazzy/setup.bash
+# 若 OCS2 不在系统前缀，先 source 对应 underlay 的 setup.bash。
 source install/setup.bash
 colcon build \
   --packages-select mpc_controller zephyr_arm_description zephyr_arm_bringup \
   --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 source install/setup.bash
 ```
+
+只构建控制器核心、不编译 Qt/RViz 插件时，给构建命令增加
+`-DBUILD_MPC_RVIZ_PLUGIN=OFF`。它与运行时的 `show_rviz:=false` 不同；
+请使用新的 build/install 目录，避免旧的 RViz 插件安装产物残留。
+`package.xml` 仍声明默认 GUI 构建所需依赖；此 CMake 开关不会自动过滤 rosdep 安装列表。
 
 验证改名和 mock 配置：
 
@@ -81,7 +93,7 @@ colcon test-result --verbose
 
 以下单臂入口位于配套 `zephyr_arm_ros2` 工作区改动中，目前暂留本地，
 **不随本次控制器 `dev_mpc` 推送发布**。仅拉取本控制器仓库不会获得该 launch/task 配置；
-本包本身只提供插件、服务定义和 RViz 面板。
+本包本身只提供控制器及 RViz 插件，不需要另建自定义消息。
 
 固定底座单臂 mock（默认打开 RViz）：
 
@@ -101,8 +113,10 @@ ros2 launch zephyr_arm_bringup mpc_mock.launch.py show_rviz:=false
 - 包含法兰、Gemini 305、OmniPicker 的几何，TCP 为 `omni_picker_tcp`。
 - MPC 中夹爪固定闭合，mock 初始夹爪归一化位置为 `1.0`；本轮不要开合夹爪，
   否则显示与规划几何会不一致。夹爪实时几何更新尚未接入。
-- 自碰撞检查启用，52 对来自现有 SRDF 的排除规则；没有新增碰撞忽略。
-  不含桌面、Z2 车厢或动态环境，不能用作这些场景的安全证明。
+- 当前本地单臂 mock 的 `selfCollision.activate=false`：暂时关闭 MPC 自碰撞代价和
+  运行时自碰撞检查，隔离验证控制链。原有 52 对配置保留，没有修改 SRDF 排除规则。
+  碰撞模型简化并验证后再启用；不含桌面、Z2 车厢或动态环境，不能用作安全证明。
+  控制器库没有全局关闭开关改动，其他配置仍按各自的 `selfCollision.activate` 工作。
 - GenericSystem 是理想位置跟随，不模拟电机动力学、MIT 力矩、刚度或通信延迟。
 
 查看加载状态与 TCP：
@@ -116,21 +130,31 @@ ros2 topic echo /fsm_state --once
 控制器类型应为 `mpc_controller/mpc_controller`；生命周期 `active` 不代表 MPC
 未暂停，需要同时查看 `/fsm_state` 和诊断日志。TCP 指令与暂停接口见下文。
 
-### 当前 mock 验证状态（2026-11-04）
+### 当前 mock 验证状态（2026-11-05）
 
-新包及 RViz 插件编译通过，三个控制器已实际加载并激活，测试汇总 60 项通过
-（包含 CTest 包装项）。但尚未完成目标运动/跟踪验证：沿用高精度 STL 碰撞网格时，
-离线一轮 52 对距离查询约 97 ms，首次 MPC 求解约 15.9 s，
-运行触发 `collision check stale` 并保持暂停。求解目标周期为 20 ms。
-高密度碰撞网格是已确认的耗时来源，需继续做求解耗时分解及保守碰撞模型简化。
-没有通过关闭碰撞、放宽超时或忽略旧策略来绕过此问题；没有发布运动目标，测试节点已退出。
-RViz 配置已提供，当前运行验证使用 `show_rviz:=false`，GUI 尚未验收。
+控制器核心与 RViz 插件重新编译通过，链接和导出的构建依赖不再包含 `zephyr_msgs`。
+65 项 C++ 测试及 19 项 bringup Python 测试通过，覆盖标准路径输入、无效位姿拒绝、
+暂停后忽略新目标、RViz 位姿流和非阻塞参考交接；不改求解器、控制增益及原保护逻辑。
+
+隔离 headless mock 中三个控制器 active、`/fsm_state=3`：
+- 标准 `/target_path` 执行 TCP +Z 1 cm 及返回，4 秒后末端位置误差分别约 0.051/0.054 mm。
+- 上层示例以 50 Hz 发布位姿目标，YZ 平面半径 2 cm、10 秒一圈；
+  近时反馈位置误差 RMS 约 2.20 mm，回到起点并保持 3 秒后误差约 0.053 mm。
+- ROS 图中两个自定义运动服务均不存在。测试进程已退出。
+- 前一轮已验证 RViz 可拖动小球，并通过交互标记完成 TCP 向上 2 cm 及返回；
+  本轮标准位姿流单测保留该入口，不改标记插件。
+
+这些数据只验证理想 mock 连通性，非严格同步的性能测量，不代表真机精度或避障能力。
+此前高精度 STL 的 52 对碰撞距离查询约 97 ms、首次求解约 15.9 s，曾触发
+`collision check stale`。当前仍按开发安排仅在单臂 mock 暂关碰撞，
+模型简化和性能验收待完成。夹爪 mock 已改为仅 position 命令以匹配 GenericSystem，
+没有改变原真机接口或放宽限位。
 
 ## 后续更新上游
 
-保持外部 `arms_ros2_control` 工作树干净，在该仓库更新到所需上游版本后，
-重新构建变动的公共库和本包。算法库中的兼容优化可以直接复用；若公共 API 改变，
-在本包做适配。迁入的控制器胶水代码需要按 UPSTREAM.md 中的来源表对比上游变化。
+升级 OCS2 后重新构建本包并运行回归测试；API 适配留在本包，不修改上游源码。
+`arms_ros2_control` 仅作为代码来源参考，更新它不会影响当前控制器。
+迁入的辅助代码需按 UPSTREAM.md 的来源表人工对比，不会自动跟随上游更新。
 
 迁移前备份（不在 colcon 源码扫描范围内）：
 `/home/mscape/zephyr_migration_backups/20261026T073726Z`。
@@ -163,7 +187,7 @@ RViz 配置已提供，当前运行验证使用 `show_rviz:=false`，GUI 尚未�
 | 带坐标系的位姿目标（PoseStamped） | `/tcp_target/stamped` |
 | 速度目标（Twist） | `/tcp_target/twist` |
 | 相对位移目标（TwistStamped） | `/tcp_target/relative` |
-| 单 TCP 圆弧服务 | `/execute_tcp_circle` |
+| 分段位姿路径（Path） | `/target_path` |
 
 `tcp_ee_frame` 是本包的末端配置参数，默认读取 task.info 的 eeFrame。
 当前两个 Zephyr 模型的真实 TF 末端仍为 `omni_picker_tcp`，本次仅统一控制接口命名，
@@ -172,27 +196,89 @@ RViz 配置已提供，当前运行验证使用 `show_rviz:=false`，GUI 尚未�
 不再声明 `left_ee_frame`，不再重映射任何左右臂话题，也不再安装
 `tcp_compatibility.h` 或 `zephyr_mpc_launch.tcp_interfaces`。
 
-- `CtrlComponent.cpp` 中的 `TcpReferenceManager` 直接连接 OCS2 的 `ReferenceManagerInterface`，处理绝对位姿、
+- `TcpReferenceManager.cpp` 直接连接 OCS2 的 `ReferenceManagerInterface`，处理绝对位姿、
   带坐标系位姿、速度流、相对位移和路径；坐标转换失败会拒绝目标。
 - `tcp_rviz.cpp` 中的 `TcpTargetManager` 创建名称为实际 TCP 帧的六自由度交互坐标轴，
   支持连续拖动和右键手动发送。XYZ 和完整位姿两个面板在同一 RViz 节点中共享一个服务端。
   不再安装或启动独立的 `tcp_target_manager` 可执行程序。现有 InteractiveMarkers 显示器的
-  Namespace 仍为 `/tcp_target_manager`，不需要修改 RViz 配置。
+  `Interactive Markers Namespace` 应为 `/tcp_target_manager`（Jazzy 不使用旧 `Update Topic` 字段）。
   关闭全部目标输入面板或退出 RViz 后，交互服务端随之销毁；控制器继续接受其他程序的 TCP 命令。
   `/tcp_current_target` 使用 transient-local 缓存，后打开的界面可获得最近一次目标。
 - `tcp_pose_panel` 提供完整位置/四元数输入和相对位姿命令；`target_coordinate_panel` 保留 XYZ 快捷输入。
-- `tcp_error_display` 直接订阅 TCP 当前位姿与目标，复用上游误差图形绘制组件，保留误差数值和趋势图。
-- FK/IK 服务继续使用 `arms_ros2_control_msgs/srv/KinematicsService` 消息格式，
-  其中 `arm_type` 填 `omni_picker_tcp`、`tcp` 或留空；不会转换为上游机械臂选择字符串。
-  支持本地 DLS、BFGS 和 AUTO 求解，使用当前模型的关节限位。
+- `tcp_error_display` 使用本地单 TCP 误差 HUD，显示位置/角度误差及趋势图；没有 body/head 卡片。
+- FK/IK 使用标准 MoveIt 服务类型；内部仍由 Pinocchio 求解，不经过 MoveIt 规划器。
 - CSV 记录文件为 `real_tcp.csv`、`pred_tcp.csv`，没有左右臂分支。
 
-路径可发布到 `/target_path`（`nav_msgs/Path`），也可调用 `/execute_path`。
-该服务现使用本包的 `mpc_controller/srv/ExecuteTcpPath`：请求字段为 `path`
-和 `trajectory_duration`，旧的双臂 `ExecutePath` 请求需要迁移。
-`/execute_tcp_circle` 沿用上游 `ExecuteCircle` 消息定义以复用传输格式，
-`circle_params.arm_name` 填实际 TCP 帧、`tcp` 或留空；只处理单 TCP 几何字段。
-路径插值使用五次时间曲线和四元数球面插值，并根据速度、加速度及 jerk 配置延长段时长。
+路径统一发布到 `/target_path`（`nav_msgs/Path`），不再提供两个自定义运动服务。
+每个 Pose 的 frame_id 优先于 Path 的 frame_id；均为空时使用 MPC 基坐标系。
+新路径替换当前参考，不排队。路径从当前采样参考开始，按段做五次时间插值及四元数球面插值，
+每段在途径点处减速到零；`movel_duration` 是整条路径的基础时长，速度、加速度和 jerk
+限制可以延长它。参数在初始化时读取，**Path 的时间戳不作为轨迹时间表**。
+
+连续遥操或圆轨迹使用 `/tcp_target`（`geometry_msgs/Pose`）位姿流，坐标必须是 MPC 基坐标系。
+该入口直接更新参考，不经过上述路径插值/限速；发送端负责连续性和目标速度，
+控制器原有关节约束及保护仍生效。不要同时运行多个目标发送器。
+配套 mock 画圆示例位于 `zephyr_arm_bringup/scripts/mpc_circle_demo.py`：
+
+```bash
+# 已启动 mpc_mock.launch.py，FSM=3；期间不要拖动 RViz 小球。
+ros2 run zephyr_arm_bringup mpc_circle_demo.py --plane yz --radius 0.02 --duration 10
+```
+
+此示例只允许 GenericSystem，保持当前 TCP 姿态，绕一圈返回起点后保持 3 秒并退出。
+普通 topic 没有接收确认、到位反馈或目标取消语义；通过实际 TCP/FSM 判断跟踪情况。
+暂停时忽略新目标。停止发送只会保留最后目标，暂停跟踪请调用控制器的 `~/pause`。
+
+### 服务迁移与 FK/IK 约束
+
+| 服务 | 当前类型 | 迁移要求 |
+| --- | --- | --- |
+| `~/pause` | `std_srvs/srv/SetBool` | 不变 |
+| `~/compute_fk` | `moveit_msgs/srv/GetPositionFK` | 替代旧 `~/kinematics_service` 的 FK 分支 |
+| `~/compute_ik` | `moveit_msgs/srv/GetPositionIK` | 替代旧 `~/kinematics_service` 的 IK 分支 |
+
+已删除 `ExecuteTcpPath.srv` 和 `ExecuteTcpCircle.srv`，旧客户端改发标准话题；
+没有保留旧服务类型的兼容包装，否则仍会引入被解除的依赖。以上非私有名称在 launch
+设置命名空间时跟随命名空间；`~/compute_*` 的前缀是控制器实例名，默认 `/mpc_controller`。
+
+FK/IK 是**离线运动学查询，不发送关节命令**。请求须提供全部已配置机械臂关节的
+`robot_state.joint_state.name/position`，允许重排，拒绝缺失、重复、未知关节及非有限值。
+`is_diff` 必须为 false，不接受附着物或多自由度状态；移动底盘不包含在这组关节中。
+FK 支持模型内存在的帧；IK 只支持配置的单 TCP。输入/输出坐标系只能是配置的 `baseFrame`
+或空字符串（表示 baseFrame），不做任意 TF 查询。
+IK 的 `group_name` 默认 `arm`；`ik_link_name` 为空时使用配置 TCP。
+`avoid_collisions=true`、额外约束、多末端请求会明确返回错误，**不会默默忽略**。
+本服务不能用于证明姿态/路径无碰撞。成功时 `error_code.val=1`，IK 解保留请求关节顺序。
+
+求解设置位于控制器的 `ros__parameters`，只在初始化读取，在线修改会被拒绝：
+
+```yaml
+kinematics:
+  group: arm
+  solver: auto             # auto: 先 DLS，必要时 BFGS；也可 dls/bfgs
+  max_iterations: 300      # 每种方法、每次尝试的上限，共用请求的超时预算
+  tolerance: 0.0001        # SE(3) 残差范数，非碰撞/路径容差
+  damping: 0.01
+  timeout: 0.1             # 请求 timeout=0 时使用的总计算预算，秒
+  random_restart: false    # true 最多四次尝试，要求有限关节限位
+```
+
+请求的 `timeout` 覆盖默认值，范围 `(0, 60]` 秒；包含等待运动学模型互斥锁的时间。
+到期返回 `TIMED_OUT`，未收敛返回 `NO_IK_SOLUTION`，失败不返回可执行关节解。
+
+只查询 ready 姿态的 FK（不会移动机械臂）：
+
+```bash
+ros2 service call /mpc_controller/compute_fk moveit_msgs/srv/GetPositionFK \
+  "{header: {frame_id: base_link}, fk_link_names: [omni_picker_tcp], robot_state: {
+    joint_state: {name: [joint1, joint2, joint3, joint4, joint5, joint6],
+                  position: [0.0, 1.6, 1.0, 0.0, -0.5, 0.0]}}}"
+```
+
+IK 调用用同一组 `robot_state` 作为种子，将 FK 返回的 `pose_stamped[0]` 放入
+`GetPositionIK` 的 `ik_request.pose_stamped`，并设 `group_name: arm`、
+`ik_link_name: omni_picker_tcp`、`avoid_collisions: false`。不要把 `moveit_msgs`
+接口类型理解成已经运行了 MoveIt 的 PlanningScene 碰撞检查。
 
 运动学服务的机械臂求解器使用独立的降维模型：锁定底盘的虚拟自由度，
 并把参考原点移到 task.info 指定的 baseFrame，避免把六维关节向量传给九维移动模型。
@@ -228,6 +314,7 @@ TCP 参考轨迹生成、Twist 积分和目标发布只在非实时回调执行�
 
 | 参数类别 | 更新规则 |
 | --- | --- |
+| `planning_urdf_path` | 必须指向已展开的 URDF 文件；保留文件/模型校验，不再需要固定值标记 `planning_urdf_variant` |
 | `cached_ob_state`、`hardware_latency` | 仅接受 `false`、`0.0`；迁移检查参数，不支持在线启用旧功能 |
 | `policy_max_age` | 默认 `0.5` 秒，策略 ROS 时间年龄和接收后的单调时钟年龄上限；初始化读取 |
 | `collision_check_timeout` | 默认 `0.25` 秒，碰撞检查所用观测的最大年龄；初始化读取，须覆盖至少两个检查周期 |
@@ -248,7 +335,7 @@ TCP 参考轨迹生成、Twist 积分和目标发布只在非实时回调执行�
 单 TCP 可视化也不再包含类人机器人的 body/head 帧、额外 FK 结果和
 `body_current_pose` / `head_current_pose` 发布器。只计算并发布实际 TCP，
 保持原有发布节流及实时/显示线程独立 FK 缓存。移动底盘的里程计与协同控制不受影响。
-本包已移除 HOME、HOLD、MOVEJ 状态类和对应动作；OCS2 参考轨迹管理仍调用上游公共库。
+本包已移除 HOME、HOLD、MOVEJ 状态类和对应动作；参考轨迹直接交给 OCS2 公共接口。
 
 ### 输出与故障边界
 

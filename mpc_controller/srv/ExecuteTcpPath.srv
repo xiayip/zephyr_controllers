@@ -1,7 +1,0 @@
-# Waypoints for the single configured TCP. Pose frames override path.header.
-nav_msgs/Path path
-float64 trajectory_duration
----
-bool success
-string message
-float64 estimated_duration

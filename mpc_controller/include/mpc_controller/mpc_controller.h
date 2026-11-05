@@ -19,8 +19,8 @@
 
 #include "mpc_controller/control/CtrlComponent.h"
 
-#include <arms_controller_common/CtrlInterfaces.h>
-#include "arms_ros2_control_msgs/srv/kinematics_service.hpp"
+#include <mpc_controller/control/JointInterfaces.h>
+#include "mpc_controller/control/TcpKinematics.h"
 namespace zephyr::mpc
 {
 /** Runs only OCS2. Solver work stays off the controller_manager update thread. */
@@ -51,21 +51,7 @@ private:
     rclcpp::Time last_request_time_{0, 0, RCL_ROS_TIME};
 };
 
-class TcpKinematics {
-public:
-    TcpKinematics(pinocchio::Model model,const std::vector<std::string>& joints,std::string tcp_frame);
-    void handle(const arms_ros2_control_msgs::srv::KinematicsService::Request& request,
-                arms_ros2_control_msgs::srv::KinematicsService::Response& response);
-private:
-    pinocchio::Model model_;
-    pinocchio::Data data_;
-    std::string tcp_frame_;
-    pinocchio::FrameIndex frame_;
-    std::vector<int> indices_;
-    std::mutex mutex_;
-};
-
-    using ControlMode = arms_controller_common::ControlMode;
+    using ControlMode = zephyr::mpc::ControlMode;
     class mpc_controller final : public controller_interface::ControllerInterface
     {
     public:
@@ -124,13 +110,8 @@ private:
         std::shared_ptr<CtrlComponent> ctrl_comp_;
         std::unique_ptr<MpcExecution> execution_;
 
-        // Kinematics service
-        rclcpp::Service<arms_ros2_control_msgs::srv::KinematicsService>::SharedPtr kinematics_service_;
+        rclcpp::Service<moveit_msgs::srv::GetPositionFK>::SharedPtr fk_service_;
+        rclcpp::Service<moveit_msgs::srv::GetPositionIK>::SharedPtr ik_service_;
         std::shared_ptr<TcpKinematics> kinematics_;
-
-        // Service handler
-        void handleKinematicsService(
-            const std::shared_ptr<arms_ros2_control_msgs::srv::KinematicsService::Request> request,
-            const std::shared_ptr<arms_ros2_control_msgs::srv::KinematicsService::Response> response);
     };
 }

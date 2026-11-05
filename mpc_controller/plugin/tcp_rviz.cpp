@@ -2,7 +2,7 @@
 // Zephyr adaptation of fiveages-sim/arms_ros2_control; see UPSTREAM.md.
 
 #include "tcp_rviz.hpp"
-#include <arms_rviz_control_plugin/error_dashboard.hpp>
+#include "error_dashboard.hpp"
 #include <algorithm>
 #include <unordered_map>
 #include <interactive_markers/interactive_marker_server.hpp>
@@ -339,7 +339,7 @@ void tcp_error_display::onDisable() { if(dashboard_)dashboard_->hide(); }
 void tcp_error_display::reset() { Display::reset();if(dashboard_)dashboard_->clearHistory();std::lock_guard<std::mutex> lock(data_->mutex);data_->have_actual=data_->have_target=false; }
 void tcp_error_display::update(float wall_dt,float) {
     if(!isEnabled())return;
-    if(!dashboard_) { dashboard_=std::make_unique<arms_rviz_control_plugin::ErrorDashboard>();dashboard_->setActive({true,false,false,false});dashboard_->setScale(scale_->getFloat());dashboard_->show();return; }
+    if(!dashboard_) { dashboard_=std::make_unique<ErrorDashboard>();dashboard_->setScale(scale_->getFloat());dashboard_->show();return; }
     dashboard_->show();elapsed_+=wall_dt;if(elapsed_<0.1f)return;elapsed_=0;dashboard_->refreshLayout();
     std::lock_guard<std::mutex> lock(data_->mutex);
     bool valid=false;
@@ -363,7 +363,7 @@ void tcp_error_display::update(float wall_dt,float) {
             valid=true;
         } else status=QStringLiteral("位姿数据无效");
     }
-    dashboard_->setRow(0,mm,degrees,valid,status,thresholds_);
+    dashboard_->setReading(mm,degrees,valid,status,thresholds_);
 }
 void tcp_error_display::load(const rviz_common::Config& config) {
     Display::load(config);

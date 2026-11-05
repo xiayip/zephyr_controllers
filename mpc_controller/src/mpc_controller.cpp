@@ -8,17 +8,11 @@
 #include <algorithm>
 #include <pluginlib/class_list_macros.hpp>
 #include <pinocchio/algorithm/frames.hpp>
-#include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/algorithm/joint-configuration.hpp>
-#include <pinocchio/spatial/explog.hpp>
-#include <Eigen/Cholesky>
 #include <chrono>
-#include <random>
 #include <stdexcept>
-#include <cctype>
-#include <limits>
 
-#include <ocs2_controller_common/mpc/MpcExecutionParams.hpp>
+#include <mpc_controller/runtime/MpcExecutionParams.hpp>
 #include <pinocchio/algorithm/model.hpp>
 
 namespace zephyr::mpc
@@ -128,7 +122,7 @@ namespace zephyr::mpc
     }
 
     controller_interface::return_type mpc_controller::update(
-        const rclcpp::Time& time, const rclcpp::Duration& period)
+        const rclcpp::Time& time, const rclcpp::Duration& /*period*/)
     {
         ctrl_comp_->beginRtCycle();
         ctrl_comp_->applyRtLoopSchedulingOnce();
@@ -163,10 +157,9 @@ namespace zephyr::mpc
         if (valid)
         {
             auto scope = ctrl_comp_->rtScopeViz();
-            ctrl_comp_->maybeRequestVisualizationUpdate(time);
+            ctrl_comp_->maybeRequestVisualizationUpdate();
         }
         ctrl_comp_->endRtCycle(tracking_active_ ? "ocs2" : "paused");
-        ctrl_interfaces_.recordCommandMotion(period.seconds());
         return controller_interface::return_type::OK;
     }
 
@@ -181,11 +174,19 @@ namespace zephyr::mpc
             state_interface_types_ = auto_declare<std::vector<std::string>>("state_interfaces", state_interface_types_);
             ctrl_interfaces_.pd_gains_ = auto_declare<std::vector<double>>("pd_gains", ctrl_interfaces_.pd_gains_);
             auto_declare<int>("mpc_frequency", 0);
+            KinematicsOptions ik_options;
+            ik_options.group = auto_declare<std::string>("kinematics.group", "arm");
+            ik_options.solver = auto_declare<std::string>("kinematics.solver", "auto");
+            ik_options.max_iterations = auto_declare<int>("kinematics.max_iterations", 300);
+            ik_options.tolerance = auto_declare<double>("kinematics.tolerance", 1e-4);
+            ik_options.damping = auto_declare<double>("kinematics.damping", 0.01);
+            ik_options.timeout = auto_declare<double>("kinematics.timeout", 0.1);
+            ik_options.random_restart = auto_declare<bool>("kinematics.random_restart", false);
             ctrl_comp_ = std::make_shared<CtrlComponent>(get_node(), ctrl_interfaces_);
             const auto& info = ctrl_comp_->interface_->getManipulatorModelInfo();
             const auto model = makeTcpKinematicsModel(
                 ctrl_comp_->interface_->getPinocchioInterface().getModel(), joint_names_, info.baseFrame);
-            kinematics_ = std::make_shared<TcpKinematics>(model, joint_names_, info.eeFrame);
+            kinematics_ = std::make_shared<TcpKinematics>(model, joint_names_, info.eeFrame, info.baseFrame, ik_options);
             execution_ = std::make_unique<MpcExecution>(ctrl_comp_, ctrl_interfaces_.frequency_);
             RCLCPP_INFO(get_node()->get_logger(), "Direct OCS2 controller initialized; TCP=%s", info.eeFrame.c_str());
             return CallbackReturn::SUCCESS;
@@ -211,9 +212,24 @@ namespace zephyr::mpc
                 response->success = true;
                 response->message = request->data ? "Pause requested" : "Resume requested";
             });
-        kinematics_service_ = get_node()->create_service<arms_ros2_control_msgs::srv::KinematicsService>(
-            "kinematics_service", std::bind(&mpc_controller::handleKinematicsService, this,
-                                            std::placeholders::_1, std::placeholders::_2));
+        fk_service_ = get_node()->create_service<moveit_msgs::srv::GetPositionFK>("~/compute_fk",
+            [this](moveit_msgs::srv::GetPositionFK::Request::SharedPtr request,
+                   moveit_msgs::srv::GetPositionFK::Response::SharedPtr response) {
+                try { kinematics_->fk(*request, *response); }
+                catch (const std::exception& error) {
+                    response->error_code.val = moveit_msgs::msg::MoveItErrorCodes::FAILURE;
+                    response->error_code.message = error.what();
+                }
+            });
+        ik_service_ = get_node()->create_service<moveit_msgs::srv::GetPositionIK>("~/compute_ik",
+            [this](moveit_msgs::srv::GetPositionIK::Request::SharedPtr request,
+                   moveit_msgs::srv::GetPositionIK::Response::SharedPtr response) {
+                try { kinematics_->ik(*request, *response); }
+                catch (const std::exception& error) {
+                    response->error_code.val = moveit_msgs::msg::MoveItErrorCodes::FAILURE;
+                    response->error_code.message = error.what();
+                }
+            });
         ctrl_comp_->pose_reference_manager_->setAcceptingTargets(false);
         return CallbackReturn::SUCCESS;
     }
@@ -276,7 +292,6 @@ namespace zephyr::mpc
             initial_positions.push_back(*value);
         }
         ctrl_interfaces_.last_sent_joint_positions_ = std::move(initial_positions);
-        ctrl_interfaces_.recordCommandMotion(0.0);
         if (ctrl_interfaces_.control_mode_ == ControlMode::MIX && ctrl_interfaces_.pd_gains_.size() >= 2)
         {
             for (auto& interface : ctrl_interfaces_.joint_kp_command_interface_)
@@ -323,7 +338,8 @@ namespace zephyr::mpc
         stopExecution();
         tracking_status_timer_.reset();
         pause_service_.reset();
-        kinematics_service_.reset();
+        fk_service_.reset();
+        ik_service_.reset();
         return CallbackReturn::SUCCESS;
     }
     controller_interface::CallbackReturn mpc_controller::on_error(const rclcpp_lifecycle::State&)
@@ -335,27 +351,6 @@ namespace zephyr::mpc
     {
         stopExecution();
         return CallbackReturn::SUCCESS;
-    }
-
-    void mpc_controller::handleKinematicsService(
-        const std::shared_ptr<arms_ros2_control_msgs::srv::KinematicsService::Request> request,
-        const std::shared_ptr<arms_ros2_control_msgs::srv::KinematicsService::Response> response)
-    {
-        if (!kinematics_)
-        {
-            response->success = false;
-            response->message = "Kinematics not initialized";
-            return;
-        }
-        try
-        {
-            kinematics_->handle(*request, *response);
-        }
-        catch (const std::exception& error)
-        {
-            response->success = false;
-            response->message = std::string("TCP kinematics failed: ") + error.what();
-        }
     }
 
     void mpc_controller::publishTrackingStatus(bool active)
@@ -375,125 +370,13 @@ namespace zephyr::mpc
         tracking_status_publisher_->publish(status);
     }
 
-// Single-TCP FK/IK service implementation.
-
-TcpKinematics::TcpKinematics(pinocchio::Model model,const std::vector<std::string>& joints,std::string tcp_frame)
-    : model_(std::move(model)),data_(model_),tcp_frame_(std::move(tcp_frame)),frame_(model_.getFrameId(tcp_frame_)) {
-    if (frame_>=model_.frames.size()||model_.nq!=model_.nv) throw std::invalid_argument("Invalid TCP kinematics model");
-    for (const auto& name:joints) {
-        const auto id=model_.getJointId(name);
-        if (id>=model_.joints.size()||model_.joints[id].nq()!=1) throw std::invalid_argument("Invalid TCP joint: "+name);
-        indices_.push_back(model_.joints[id].idx_q());
-    }
-}
-void TcpKinematics::handle(const arms_ros2_control_msgs::srv::KinematicsService::Request& request,
-                           arms_ros2_control_msgs::srv::KinematicsService::Response& response) {
-    const auto began=std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(mutex_);
-    response.success=false;
-    if (!request.arm_type.empty()&&request.arm_type!="tcp"&&request.arm_type!=tcp_frame_)
-        throw std::invalid_argument("Select arm_type="+tcp_frame_);
-    if (request.operation_type!="fk"&&request.operation_type!="ik") throw std::invalid_argument("operation_type must be fk or ik");
-    if (request.joint_angles.size()!=indices_.size()) throw std::invalid_argument("Provide one angle per configured arm joint");
-    Eigen::VectorXd q=pinocchio::neutral(model_);
-    for (size_t i=0;i<indices_.size();++i) {
-        if (!std::isfinite(request.joint_angles[i])) throw std::invalid_argument("Nonfinite joint angle");
-        q(indices_[i])=request.joint_angles[i];
-    }
-    const auto clamp=[&](Eigen::VectorXd value) { return value.cwiseMax(model_.lowerPositionLimit).cwiseMin(model_.upperPositionLimit).eval(); };
-    const auto writePose=[&](const pinocchio::SE3& transform) {
-        geometry_msgs::msg::Pose p; const Eigen::Quaterniond rotation(transform.rotation());
-        p.position.x=transform.translation().x(); p.position.y=transform.translation().y(); p.position.z=transform.translation().z();
-        p.orientation.x=rotation.x(); p.orientation.y=rotation.y(); p.orientation.z=rotation.z(); p.orientation.w=rotation.w();
-        response.result_poses={p};
-    };
-    if (request.operation_type=="fk") {
-        pinocchio::framesForwardKinematics(model_,data_,q); writePose(data_.oMf[frame_]);
-        response.is_out_of_range=(q.array()<model_.lowerPositionLimit.array()).any()||(q.array()>model_.upperPositionLimit.array()).any();
-        response.success=true; response.used_solver="FK"; response.message="TCP FK complete";
-    } else {
-        if (request.target_poses.size()!=1) throw std::invalid_argument("Provide exactly one TCP target pose");
-        const auto& p=request.target_poses.front();
-        Eigen::Quaterniond orientation(p.orientation.w,p.orientation.x,p.orientation.y,p.orientation.z);
-        const Eigen::Vector3d position(p.position.x,p.position.y,p.position.z);
-        if (!position.allFinite()||!orientation.coeffs().allFinite()||orientation.norm()<1e-9) throw std::invalid_argument("Invalid IK target");
-        const pinocchio::SE3 target(orientation.normalized().toRotationMatrix(),position);
-        std::string solver=request.solver_type.empty()?"auto":request.solver_type;
-        std::transform(solver.begin(),solver.end(),solver.begin(),[](unsigned char c){return std::tolower(c);});
-        if (solver!="dls"&&solver!="bfgs"&&solver!="auto") throw std::invalid_argument("solver_type must be dls, bfgs or auto");
-        const int iterations=request.max_iterations>0?std::min(request.max_iterations,10000):300;
-        const double tolerance=request.tolerance>0?request.tolerance:1e-4;
-        const double damping=request.dls_damping>0?request.dls_damping:0.01;
-        if (!std::isfinite(tolerance)||!std::isfinite(damping)) throw std::invalid_argument("Invalid IK parameters");
-        Eigen::VectorXd best=clamp(q); double best_error=std::numeric_limits<double>::infinity();
-        const auto errorAt=[&](const Eigen::VectorXd& value) {
-            pinocchio::framesForwardKinematics(model_,data_,value);
-            return pinocchio::log6(data_.oMf[frame_].actInv(target)).toVector().eval();
-        };
-        std::mt19937 generator(0);
-        const int attempts=request.enable_random_restart?4:1;
-        for (int attempt=0;attempt<attempts&&!response.success;++attempt) {
-            q=best;
-            if (attempt) for (int i:indices_) q(i)=std::uniform_real_distribution<double>(model_.lowerPositionLimit(i),model_.upperPositionLimit(i))(generator);
-            for (const auto& method: solver=="auto"?std::vector<std::string>{"dls","bfgs"}:std::vector<std::string>{solver}) {
-                Eigen::MatrixXd inverse_hessian=Eigen::MatrixXd::Identity(model_.nv,model_.nv);
-                Eigen::VectorXd old_gradient,old_q;
-                for (int iteration=0;iteration<iterations;++iteration) {
-                    const Eigen::VectorXd error=errorAt(q); const double norm=error.norm();
-                    if (norm<best_error) { best_error=norm; best=q; }
-                    ++response.iterations; response.used_solver=method;
-                    if (norm<=tolerance) { response.success=true; break; }
-                    Eigen::Matrix<double,6,Eigen::Dynamic> jacobian(6,model_.nv); jacobian.setZero();
-                    pinocchio::computeFrameJacobian(model_,data_,q,frame_,pinocchio::LOCAL,jacobian);
-                    Eigen::Matrix<double,6,6> log_jacobian;
-                    pinocchio::Jlog6(data_.oMf[frame_].actInv(target).inverse(),log_jacobian);
-                    jacobian=-log_jacobian*jacobian;
-                    const Eigen::VectorXd gradient=jacobian.transpose()*error;
-                    Eigen::VectorXd step;
-                    if (method=="dls") {
-                        Eigen::Matrix<double,6,6> normal=jacobian*jacobian.transpose(); normal.diagonal().array()+=damping*damping;
-                        step=-jacobian.transpose()*normal.ldlt().solve(error);
-                    } else {
-                        if (old_gradient.size()) {
-                            const Eigen::VectorXd s=q-old_q,y=gradient-old_gradient; const double sy=s.dot(y);
-                            if (sy>1e-12) {
-                                const Eigen::MatrixXd v=Eigen::MatrixXd::Identity(model_.nv,model_.nv)-s*y.transpose()/sy;
-                                inverse_hessian=v*inverse_hessian*v.transpose()+s*s.transpose()/sy;
-                            }
-                        }
-                        step=-inverse_hessian*gradient;
-                        if (step.dot(gradient)>=0.0) { inverse_hessian.setIdentity(); step=-gradient; }
-                        old_q=q; old_gradient=gradient;
-                    }
-                    if (!step.allFinite()) break;
-                    const double maximum=step.cwiseAbs().maxCoeff(); if (maximum>0.25) step*=0.25/maximum;
-                    bool improved=false;
-                    for (double scale=1.0;scale>=1e-5;scale*=0.5) {
-                        Eigen::VectorXd candidate=clamp(q+scale*step);
-                        if (errorAt(candidate).squaredNorm()<error.squaredNorm()) { q=std::move(candidate); improved=true; break; }
-                    }
-                    if (!improved) break;
-                }
-                if (response.success) break;
-                q=best;
-            }
-        }
-        q=best; response.final_error=best_error;
-        for (int i:indices_) response.result_joint_angles.push_back(q(i));
-        pinocchio::framesForwardKinematics(model_,data_,q); writePose(data_.oMf[frame_]);
-        response.message=response.success?"TCP IK converged":"TCP IK did not converge within joint limits";
-        response.additional_info="TCP="+tcp_frame_+"; failure does not prove geometric unreachability";
-    }
-    response.computation_time_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-began).count();
-}
-
 // MPC worker scheduling belongs to this controller.
 
 MpcExecution::MpcExecution(std::shared_ptr<CtrlComponent> component, double frequency)
     : component_(std::move(component))
 {
     const auto node = component_->getNode();
-    const auto params = ocs2::controller_common::computeMpcExecutionParams(
+    const auto params = runtime::computeMpcExecutionParams(
         frequency, node->get_parameter("mpc_frequency").as_int(), node->get_logger());
     period_sec_ = params.mpc_period_sec;
     sleep_ms_ = params.thread_sleep_ms;

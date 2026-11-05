@@ -13,7 +13,7 @@
 #include <mutex>
 #include <rviz_common/display.hpp>
 #include <rviz_common/properties/float_property.hpp>
-namespace arms_rviz_control_plugin { class ErrorDashboard; }
+namespace zephyr::mpc_rviz { class ErrorDashboard; }
 
 namespace zephyr::mpc_rviz
 {
@@ -92,7 +92,7 @@ private:
     std::shared_ptr<Data> data_{std::make_shared<Data>()};
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr actual_,target_;
     // Reuse upstream rendering only; all subscriptions and error logic are native TCP.
-    std::unique_ptr<arms_rviz_control_plugin::ErrorDashboard> dashboard_;
+    std::unique_ptr<ErrorDashboard> dashboard_;
     rviz_common::properties::FloatProperty* scale_;
     std::array<double,4> thresholds_{5,20,1,5};
     float elapsed_{0};

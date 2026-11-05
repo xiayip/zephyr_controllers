@@ -18,11 +18,13 @@
 #include <unordered_map>
 #include <vector>
 
-#include <ocs2_controller_common/rt/RtCycleTiming.h>
+#include <mpc_controller/runtime/RtCycleTiming.h>
 #include <mpc_controller/visualization/mpc_visualizer.h>
 
 #include <mpc_controller/control/StagedMotion.h>
 #include <mpc_controller/control/ControlSafety.h>
+#include <mpc_controller/control/TcpReferenceManager.h>
+#include <mpc_controller/control/TcpTrajectoryRecorder.h>
 #include <ocs2_core/Types.h>
 #include <ocs2_mobile_manipulator/MobileManipulatorInterface.h>
 #include <ocs2_mpc/MPC_BASE.h>
@@ -37,106 +39,17 @@
 #include <realtime_tools/realtime_buffer.hpp>
 #include <realtime_tools/realtime_publisher.hpp>
 
-#include <arms_controller_common/CtrlInterfaces.h>
-#include <array>
+#include <mpc_controller/control/JointInterfaces.h>
 #include <pinocchio/multibody/data.hpp>
 
 #include <ocs2_mpc/SystemObservation.h>
-#include <ocs2_oc/synchronized_module/ReferenceManagerDecorator.h>
-#include <geometry_msgs/msg/pose_stamped.hpp>
-#include <geometry_msgs/msg/twist_stamped.hpp>
-#include <nav_msgs/msg/path.hpp>
-#include <tf2_ros/buffer.hpp>
-#include <tf2_ros/transform_listener.hpp>
-#include <arms_ros2_control_msgs/srv/execute_circle.hpp>
-#include <mpc_controller/srv/execute_tcp_path.hpp>
 
-// TCP target interfaces and reference trajectories.
 namespace zephyr::mpc {
-/** One real TCP, with no arm selector or ROS name translation. */
-class TcpReferenceManager final : public ocs2::ReferenceManagerDecorator {
-public:
-    TcpReferenceManager(std::shared_ptr<ocs2::ReferenceManagerInterface> wrapped,
-                        std::string base_frame, std::string tcp_frame, size_t input_dim);
-    void subscribe(const rclcpp_lifecycle::LifecycleNode::SharedPtr& node);
-    void setAcceptingTargets(bool accept);
-    void setCurrentObservation(const ocs2::SystemObservation& observation);
-    /** Nonblocking request; caller retries while the mailbox is busy. */
-    bool requestReset(const ocs2::vector_t& pose, double time);
-    bool resetReady() const;
-    bool consumeFailure() { return failed_.exchange(false, std::memory_order_acq_rel); }
-private:
-    void updateReference(); // Executor timer only, never controller_manager::update.
-    struct ResetRequest {
-        std::array<double, 7> pose{};
-        double time{0};
-        uint64_t sequence{0};
-    };
-    TryWriteMailbox<ResetRequest> reset_mailbox_;
-    uint64_t requested_reset_{0}; // RT writer only
-    std::atomic<uint64_t> applied_reset_{0};
-    std::atomic<double> observation_time_{0};
-    std::atomic_bool failed_{false};
-    rclcpp::TimerBase::SharedPtr reference_timer_;
-    bool transform(const geometry_msgs::msg::PoseStamped& pose, ocs2::vector_t& result) const;
-    bool transformPath(const nav_msgs::msg::Path& path, ocs2::vector_array_t& goals) const;
-    void acceptPose(const geometry_msgs::msg::PoseStamped& pose, bool interpolate);
-    void acceptRelative(const geometry_msgs::msg::TwistStamped& delta);
-    void acceptPath(const nav_msgs::msg::Path& path);
-    void plan(const std::vector<ocs2::vector_t>& poses, double duration);
-    ocs2::vector_t sample(double time) const;
-    void publish() const;
-    void commitImmediate();
-    void circle(const arms_ros2_control_msgs::srv::ExecuteCircle::Request& request,
-                arms_ros2_control_msgs::srv::ExecuteCircle::Response& response);
-    mutable std::mutex mutex_;
-    TargetSession target_session_;
-    std::string base_frame_, tcp_frame_;
-    size_t input_dim_;
-    rclcpp_lifecycle::LifecycleNode::SharedPtr node_;
-    std::shared_ptr<tf2_ros::Buffer> tf_;
-    std::shared_ptr<tf2_ros::TransformListener> listener_;
-    ocs2::vector_t target_, current_;
-    double time_{0.0}, last_time_{-1.0};
-    ocs2::scalar_array_t times_;
-    ocs2::vector_array_t poses_;
-    geometry_msgs::msg::Twist twist_;
-    std::chrono::steady_clock::time_point twist_received_{};
-    bool twist_active_{false};
-    double duration_{2.0}, interval_{0.04}, max_linear_{0.3}, max_angular_{1.0};
-    double max_linear_acc_{1.0}, max_angular_acc_{2.0}, max_linear_jerk_{2.0}, max_angular_jerk_{4.0};
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pub_;
-    rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr pose_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr stamped_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr twist_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr relative_sub_;
-    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
-    rclcpp::Service<arms_ros2_control_msgs::srv::ExecuteCircle>::SharedPtr circle_service_;
-    rclcpp::Service<::mpc_controller::srv::ExecuteTcpPath>::SharedPtr path_service_;
-};
-struct TcpTrajectorySample {
-    double stamp_sec{0.0};
-    std::array<double,3> position{};
-    std::array<double,4> quat_xyzw{0,0,0,1};
-};
-class TcpTrajectoryRecorder {
-public:
-    ~TcpTrajectoryRecorder();
-    void setEnabled(bool enabled,const std::string& directory);
-    bool enabled() const { return enabled_.load(); }
-    void appendActual(const TcpTrajectorySample& sample);
-    void appendPredicted(const TcpTrajectorySample& sample);
-private:
-    std::atomic_bool enabled_{false};
-    std::mutex mutex_;
-    std::string directory_;
-    std::vector<TcpTrajectorySample> actual_,predicted_;
-};
 
     using namespace ocs2;
     using namespace ocs2::mobile_manipulator;
-    // Use CtrlInterfaces from arms_controller_common
-    using CtrlInterfaces = arms_controller_common::CtrlInterfaces;
+    // Local ros2_control interface storage
+    using CtrlInterfaces = JointInterfaces;
 
     class CtrlComponent
     {
@@ -175,12 +88,12 @@ private:
         void stopVisualizationThread();
         void requestVisualizationUpdate();
         /** Supply the newest measured observation on every control cycle. */
-        void maybeRequestVisualizationUpdate(const rclcpp::Time& time);
+        void maybeRequestVisualizationUpdate();
 
         void beginRtCycle() { rt_timing_.beginCycle(); }
         void endRtCycle(const std::string& status) { rt_timing_.endCycle(status, node_->get_logger()); }
-        controller_common::RtCycleTiming::Scope rtScopeObs() { return rt_timing_.scope(&rt_timing_.obs_us); }
-        controller_common::RtCycleTiming::Scope rtScopeViz() { return rt_timing_.scope(&rt_timing_.viz_us); }
+        runtime::RtCycleTiming::Scope rtScopeObs() { return rt_timing_.scope(&rt_timing_.obs_us); }
+        runtime::RtCycleTiming::Scope rtScopeViz() { return rt_timing_.scope(&rt_timing_.viz_us); }
         void applyWorkerThreadScheduling(const char* thread_name) const;
         /** Pin the 500 Hz controller_manager thread away from the MPC core (once). */
         void applyRtLoopSchedulingOnce();
@@ -215,7 +128,7 @@ private:
         void publishMobileBaseCommand(const geometry_msgs::msg::Twist& command) const;
         void applyBaseCommandDeadband(geometry_msgs::msg::Twist& command);
 
-        /** Requires launch-injected xacro planning URDF (planning_urdf_path). */
+        /** Requires a launch-injected, expanded planning URDF (planning_urdf_path). */
         std::string resolvePlanningUrdfPath() const;
         /** Split isolcpus: RT / MPC / DDP+viz, and pin DDP ThreadPool before GaussNewtonDDP_MPC construction. */
         void prepareThreadIsolation();
@@ -312,8 +225,7 @@ private:
 
         // Configuration
         std::string robot_name_;
-        std::string planning_urdf_variant_; // must be "xacro"
-        std::string planning_urdf_path_; // xacro-generated URDF cache path
+        std::string planning_urdf_path_; // Expanded URDF file path
         std::vector<std::string> joint_names_;
         std::vector<int> arm_torque_indices_;
         vector_t arm_torques_;
@@ -333,7 +245,7 @@ private:
         rcl_interfaces::msg::SetParametersResult on_parameter_change(
             const std::vector<rclcpp::Parameter>& parameters);
 
-        controller_common::RtCycleTiming rt_timing_;
+        runtime::RtCycleTiming rt_timing_;
         int thread_priority_{0};
         std::vector<int> cpu_affinity_;
         std::vector<int> rt_loop_cpus_;
