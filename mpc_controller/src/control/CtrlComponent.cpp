@@ -848,17 +848,9 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         for (size_t i = 0; i < joint_names_.size() &&
                             i + base_state_offset_ < static_cast<size_t>(future_state.size()); ++i)
         {
-            ctrl_interfaces_.setJointPositionCommand(
-                i, future_state(static_cast<Eigen::Index>(i + base_state_offset_)));
-        }
-        if (mixed)
-        {
-            for (size_t i = 0; i < joint_names_.size() &&
-                                i + base_state_offset_ < static_cast<size_t>(future_input.size()); ++i)
-            {
-                std::ignore = ctrl_interfaces_.joint_velocity_command_interface_[i].get().
-                    set_value(future_input(static_cast<Eigen::Index>(i + base_state_offset_)));
-            }
+            ctrl_interfaces_.setJointMotionCommand(
+                i, future_state(static_cast<Eigen::Index>(i + base_state_offset_)),
+                future_input(static_cast<Eigen::Index>(i + base_state_offset_)));
         }
         return true;
     }

@@ -281,6 +281,13 @@ namespace zephyr::mpc
             RCLCPP_ERROR(get_node()->get_logger(), "Cannot activate: joint position feedback is incomplete");
             return CallbackReturn::ERROR;
         }
+        if (ctrl_interfaces_.joint_position_command_interface_.size() != joint_names_.size() ||
+            (!ctrl_interfaces_.joint_velocity_command_interface_.empty() &&
+             ctrl_interfaces_.joint_velocity_command_interface_.size() != joint_names_.size()))
+        {
+            RCLCPP_ERROR(get_node()->get_logger(), "Cannot activate: incomplete position/velocity commands");
+            return CallbackReturn::ERROR;
+        }
         for (const auto& interface : ctrl_interfaces_.joint_position_state_interface_)
         {
             const auto value = interface.get().get_optional();

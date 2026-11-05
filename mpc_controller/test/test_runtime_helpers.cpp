@@ -49,6 +49,28 @@ TEST(JointInterfaces, RedetectsModeAfterInterfaceChange) {
   EXPECT_EQ(i.control_mode_, ControlMode::POSITION);
 }
 
+TEST(JointInterfaces, PositionAdapterReceivesVelocityWithoutEnablingTorqueOutput) {
+  double position = 0.0, velocity = 9.0;
+  auto pc = std::make_shared<hardware_interface::CommandInterface>("adapter/joint", "position", &position);
+  auto vc = std::make_shared<hardware_interface::CommandInterface>("adapter/joint", "velocity", &velocity);
+  hardware_interface::LoanedCommandInterface pl(pc, nullptr), vl(vc, nullptr);
+  JointInterfaces interfaces;
+  interfaces.joint_position_command_interface_.push_back(pl);
+  interfaces.last_sent_joint_positions_.resize(1);
+  interfaces.setJointMotionCommand(0, 0.1, 0.2); // Position-only mock is unchanged.
+  EXPECT_DOUBLE_EQ(position, 0.1);
+  EXPECT_DOUBLE_EQ(velocity, 9.0);
+  interfaces.joint_velocity_command_interface_.push_back(vl);
+  interfaces.detectAndSetControlMode();
+  EXPECT_EQ(interfaces.control_mode_, ControlMode::POSITION);
+  interfaces.setJointMotionCommand(0, 0.3, -0.2);
+  EXPECT_DOUBLE_EQ(position, 0.3);
+  EXPECT_DOUBLE_EQ(velocity, -0.2);
+  EXPECT_DOUBLE_EQ(interfaces.last_sent_joint_positions_[0], 0.3);
+  interfaces.setJointMotionCommand(0, 0.3, 0.0);
+  EXPECT_DOUBLE_EQ(velocity, 0.0);
+}
+
 TEST(RuntimeHelpers, ExecutionCadencePreservesPreviousDefaults) {
   const auto logger = rclcpp::get_logger("cadence_test");
   const auto explicit_rate =

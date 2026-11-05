@@ -43,6 +43,13 @@ struct JointInterfaces {
         joint_position_command_interface_[index].get().set_value(value);
     last_sent_joint_positions_[index] = value;
   }
+  // Position adapters may expose velocity without effort. Do not mistake that
+  // for torque/MIT output, or leave their velocity reference from a previous JTC.
+  void setJointMotionCommand(size_t index, double position, double velocity) {
+    setJointPositionCommand(index, position);
+    if (!joint_velocity_command_interface_.empty())
+      std::ignore = joint_velocity_command_interface_[index].get().set_value(velocity);
+  }
   void clear() {
     joint_position_command_interface_.clear();
     joint_velocity_command_interface_.clear();

@@ -289,6 +289,17 @@ IK 调用用同一组 `robot_state` 作为种子，将 FK 返回的 `pose_stampe
 
 ## 观测、线程和参数更新
 
+### 接入现有位置适配器
+
+`command_prefix: zephyr_arm_position_adapter` 配合
+`command_interfaces: [position, velocity]` 会认领适配器的参考接口，
+状态仍读取 `joint1/position` 等真实关节接口。MPC 同时发送预测位置和速度；
+暂停/停用将速度参考归零。此组合仍是位置输出模式，不计算额外重力力矩，
+Kp/Kd、重力与摩擦前馈继续由下游 Position Adapter 管理。
+只配置 `[position]` 的 mock/CSP 输出保持原行为。
+切换时不能让 JTC/Servo 与 MPC 同时认领同一适配器接口；Z2 真机入口默认
+只加载 MPC 为 inactive，保留 JTC，见 `z2_bringup/README.md`。
+
 控制观测始终来自实测关节和里程计，包括暂停后重新初始化；不再用上一周期的
 关节命令覆盖反馈。旧 YAML 必须删除观测缓存参数，或明确设置
 `cached_ob_state: false`、`hardware_latency: 0.0`。其他值会拒绝初始化，
