@@ -64,13 +64,18 @@ public:
    * @param linear_velocity_x Linear velocity in the x direction (m/s).
    * @param linear_velocity_y Linear velocity in the y direction (m/s).
    * @param angular_velocity_z Angular velocity about the z-axis (rad/s).
+   * @param steering_angles Measured wheel directions in the canonical joint convention.
+   * @param steering_limit Symmetric physical steering travel limit (rad).
+   * @param steering_limit_hysteresis Direction approximation band at that limit (rad).
+   * @param drive_alignment_tolerance Wait for steering within this error; zero disables (rad).
    * @return Array of wheel commands (steering angles and drive velocities).
    */
 
   std::array<WheelCommand, 4> compute_wheel_commands(
     double linear_velocity_x, double linear_velocity_y, double angular_velocity_z,
     const std::array<double, 4> & steering_angles,
-    double steering_limit = 1.5707963267948966) const;
+    double steering_limit = 1.5707963267948966,
+    double steering_limit_hysteresis = 0.0, double drive_alignment_tolerance = 0.0) const;
 
   BaseVelocity estimate_velocity(
     const std::array<double, 4> & wheel_velocities,

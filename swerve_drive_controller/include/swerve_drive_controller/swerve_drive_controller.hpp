@@ -71,6 +71,8 @@ private:
 
   SwerveDriveKinematics kinematics_;
   double steering_limit_ = 1.5707963267948966;
+  double steering_limit_hysteresis_ = 0.0;
+  double drive_alignment_tolerance_ = 0.0;
   std::chrono::milliseconds command_timeout_{500};
   bool use_stamped_vel_ = false;
   bool enable_odom_tf_ = true;

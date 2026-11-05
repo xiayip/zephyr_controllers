@@ -79,6 +79,8 @@ controller_interface::CallbackReturn SwerveController::on_init()
     auto_declare<double>("chassis_width", 0.0);
     auto_declare<double>("wheel_radius", 0.0);
     auto_declare<double>("steering_limit", steering_limit_);
+    auto_declare<double>("steering_limit_hysteresis", steering_limit_hysteresis_);
+    auto_declare<double>("drive_alignment_tolerance", drive_alignment_tolerance_);
     auto_declare<double>("max_wheel_velocity", 0.0);
     auto_declare<double>("center_of_rotation", 0.0);
     auto_declare<double>("cmd_vel_timeout", 0.5);
@@ -183,6 +185,18 @@ controller_interface::CallbackReturn SwerveController::on_configure(
     steering_limit_ = node->get_parameter("steering_limit").as_double();
     if (steering_limit_ <= 0.0 || steering_limit_ > M_PI) {
       throw std::invalid_argument("steering_limit must be in the range (0, pi]");
+    }
+    steering_limit_hysteresis_ = node->get_parameter("steering_limit_hysteresis").as_double();
+    if (!std::isfinite(steering_limit_hysteresis_) || steering_limit_hysteresis_ < 0.0 ||
+      steering_limit_hysteresis_ > 0.25)
+    {
+      throw std::invalid_argument("steering_limit_hysteresis must be in the range [0, 0.25]");
+    }
+    drive_alignment_tolerance_ = node->get_parameter("drive_alignment_tolerance").as_double();
+    if (!std::isfinite(drive_alignment_tolerance_) || drive_alignment_tolerance_ < 0.0 ||
+      drive_alignment_tolerance_ > M_PI_2)
+    {
+      throw std::invalid_argument("drive_alignment_tolerance must be in the range [0, pi/2]");
     }
 
     const double max_wheel_velocity = node->get_parameter("max_wheel_velocity").as_double();
@@ -368,7 +382,8 @@ controller_interface::return_type SwerveController::update(
     0.0, 0.0, 0.0, current_steering_positions, steering_limit_) :
     kinematics_.compute_wheel_commands(
     command.linear_x, command.linear_y, command.angular_z,
-    current_steering_positions, steering_limit_);
+    current_steering_positions, steering_limit_, steering_limit_hysteresis_,
+    drive_alignment_tolerance_);
 
   for (std::size_t index = 0; index < wheel_commands.size(); ++index) {
     if (max_wheel_velocities_[index] > 0.0) {

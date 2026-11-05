@@ -30,13 +30,26 @@ SwerveDriveKinematics::SwerveDriveKinematics(
 
 std::array<WheelCommand, 4> SwerveDriveKinematics::compute_wheel_commands(
   double linear_velocity_x, double linear_velocity_y, double angular_velocity_z,
-  const std::array<double, 4> & steering_angles, double steering_limit) const
+  const std::array<double, 4> & steering_angles, double steering_limit,
+  double steering_limit_hysteresis, double drive_alignment_tolerance) const
 {
   if (steering_limit <= 0.0 || steering_limit > M_PI) {
     throw std::invalid_argument("steering_limit must be in the range (0, pi]");
   }
+  if (!std::isfinite(steering_limit_hysteresis) || steering_limit_hysteresis < 0.0 ||
+    steering_limit_hysteresis > 0.25)
+  {
+    throw std::invalid_argument("steering_limit_hysteresis must be in the range [0, 0.25]");
+  }
+
+  if (!std::isfinite(drive_alignment_tolerance) || drive_alignment_tolerance < 0.0 ||
+    drive_alignment_tolerance > M_PI_2)
+  {
+    throw std::invalid_argument("drive_alignment_tolerance must be in the range [0, pi/2]");
+  }
 
   std::array<WheelCommand, 4> wheel_commands{};
+  bool wheels_aligned = true;
   constexpr double velocity_epsilon = 1.0e-6;
 
   for (std::size_t index = 0; index < wheel_commands.size(); ++index) {
@@ -51,8 +64,13 @@ std::array<WheelCommand, 4> SwerveDriveKinematics::compute_wheel_commands(
 
     const double direct_angle = normalize_angle(std::atan2(wheel_linear_y, wheel_linear_x));
     const double reverse_angle = normalize_angle(direct_angle + M_PI);
-    const bool direct_is_valid = std::abs(direct_angle) <= steering_limit;
-    const bool reverse_is_valid = std::abs(reverse_angle) <= steering_limit;
+    // Near +/-90 degrees, tiny vx sign changes must not turn a lateral wheel
+    // through 180 degrees. Admit a small angular approximation when it avoids
+    // that reversal, but never command beyond the physical steering limit.
+    const bool direct_is_valid =
+      std::abs(direct_angle) <= steering_limit + steering_limit_hysteresis;
+    const bool reverse_is_valid =
+      std::abs(reverse_angle) <= steering_limit + steering_limit_hysteresis;
     const double direct_error = std::abs(normalize_angle(direct_angle - steering_angles[index]));
     const double reverse_error = std::abs(normalize_angle(reverse_angle - steering_angles[index]));
 
@@ -68,8 +86,25 @@ std::array<WheelCommand, 4> SwerveDriveKinematics::compute_wheel_commands(
     const double selected_angle = use_reverse ? reverse_angle : direct_angle;
     wheel_commands[index].steering_angle =
       std::clamp(selected_angle, -steering_limit, steering_limit);
+    // Project onto the clamped rolling direction without increasing wheel speed.
+    const double angle = wheel_commands[index].steering_angle;
     wheel_commands[index].drive_velocity =
+      steering_limit_hysteresis > 0.0 ?
+      (wheel_linear_x * std::cos(angle) + wheel_linear_y * std::sin(angle)) / wheel_radius_ :
       (use_reverse ? -wheel_speed : wheel_speed) / wheel_radius_;
+    if (drive_alignment_tolerance > 0.0 &&
+      std::abs(angle - steering_angles[index]) > drive_alignment_tolerance)
+    {
+      wheels_aligned = false;
+    }
+  }
+  // Coordinate all four wheels: moving during a large steering change causes
+  // cross-track drift and can make feedback repeatedly reverse the +/-90 branch.
+  // Keep steering commands, but wait until every rolling wheel has aligned.
+  if (!wheels_aligned) {
+    for (auto & command : wheel_commands) {
+      command.drive_velocity = 0.0;
+    }
   }
   return wheel_commands;
 }
