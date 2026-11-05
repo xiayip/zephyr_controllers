@@ -26,7 +26,7 @@ protected:
         config.base_frame = "base";
         config.visualization_frame = "world";
         config.tcp_ee_frame = "tcp";
-        config.prediction_visualization_enabled = false;
+        ASSERT_FALSE(config.prediction_visualization_enabled);
         visualizer = std::make_unique<mpc_visualizer>(node, ocs2::PinocchioInterface(model), config);
         visualizer->initialize();
         node->configure();
@@ -80,6 +80,7 @@ TEST_F(TcpVisualizer, PublishesOnlyTcpPoseWithFrameAndThrottlePreserved) {
     const auto topics = node->get_node_graph_interface()->get_publisher_names_and_types_by_node(
         node->get_name(), node->get_namespace());
     EXPECT_EQ(topics.count(topic), 1u);
+    EXPECT_EQ(topics.count("/mpc_visualizer_tests/trajectory_markers"), 0u);
     EXPECT_EQ(topics.count("/mpc_visualizer_tests/body_current_pose"), 0u);
     EXPECT_EQ(topics.count("/mpc_visualizer_tests/head_current_pose"), 0u);
 

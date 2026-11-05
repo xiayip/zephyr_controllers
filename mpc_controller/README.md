@@ -160,16 +160,18 @@ ros2 topic echo /fsm_state --once
 `/home/mscape/zephyr_migration_backups/20261026T073726Z`。
 其中包含来源提交、完整差异补丁和逐文件校验后的源文件归档。
 
-## 无界面运行与 Ranger 真机输出
+## 无界面运行与移动底盘输出
 
 单臂 `mpc_mock.launch.py show_rviz:=false` 可关闭窗口。以下是移动底盘输出配置说明，
 不能直接用于本节的固定底座 mock，也不表示已有 Z2 真机启动入口。
 
-真机配置设置 `base_command_profile: ranger`。启用分阶段控制时，MPC 在接近和协同阶段
-约束横向速度为零，使用前后移动、原地转向或弧线转向，匹配 Ranger 支持的命令组合。
+按底盘驱动能力选择 profile，而不是按真机/mock 区分。Z2 的全向 swerve 控制器使用
+`base_command_profile: omni`，允许带符号的 `vx/vy/wz`，支持倒退、横移、斜移和旋转。
+只有不支持横移与旋转同时执行的旧后端才选择 `ranger`。启用分阶段控制时，该 profile 在接近和协同阶段
+约束横向速度为零，使用前后移动、原地转向或弧线转向，匹配该旧后端的命令组合。
 未启用分阶段控制时，原输出适配仍在横移命令存在时抑制旋转。
 `base_max_linear_speed`、`base_max_angular_speed` 分别限制平面速度和角速度；0 表示不额外限幅。
-默认 `omni` 保留仿真的全向平移和旋转。这些设置在初始化时读取。
+默认 `omni` 不增加这些非完整运动约束。这些设置在初始化时读取，修改后需重新加载控制器。
 
 ## 单 TCP 接口
 
@@ -318,7 +320,9 @@ TCP 参考轨迹生成、Twist 积分和目标发布只在非实时回调执行�
 | `cached_ob_state`、`hardware_latency` | 仅接受 `false`、`0.0`；迁移检查参数，不支持在线启用旧功能 |
 | `policy_max_age` | 默认 `0.5` 秒，策略 ROS 时间年龄和接收后的单调时钟年龄上限；初始化读取 |
 | `collision_check_timeout` | 默认 `0.25` 秒，碰撞检查所用观测的最大年龄；初始化读取，须覆盖至少两个检查周期 |
-| `rt_timing_enabled`、`traj_record_enabled` | 可在线修改，只接受布尔值 |
+| `mock_debug_enabled` | 默认 `false`，仅 mock 配置设为 `true`，初始化后不可切换；不负责切换硬件插件 |
+| `rt_timing_enabled` | 可在线修改，只接受布尔值 |
+| `traj_record_enabled` | 默认 `false`；仅 mock 调试配置允许在线启用，普通/真机配置拒绝启用 |
 | `traj_record_dir` | 非空字符串；更换目录前先停止记录，下次开启记录时使用新目录 |
 | 模型/接口、底盘话题与坐标系、底盘限速/死区、线程配置、MPC/DDS 频率、预测显示开关、观测缓存与未来采样配置 | 只在初始化读取；在线更改会返回失败，修改 YAML/launch 后须重新加载控制器 |
 
@@ -378,6 +382,10 @@ MPC 根据目标到机械臂 `base_link` 原点的三维距离分配运动：
 - 底盘接近期间允许平移和转向，使车身正前方逐渐朝向目标，机械臂保持进入该阶段时的关节姿态。
   停车位置会补偿机械臂安装偏移随车身旋转的变化；位置误差与朝向误差都满足容差后才停车。
   朝向采用最短角度差，跨越 ±π 时不会绕远路。
+- 若设置 `base_approach_keep_heading: true`，接近阶段改为保持开始接近时的车头朝向，
+  停车点仍沿机械臂安装点到目标的方向选择，不把平移方向绑定到车头方向。
+  配合 `omni` 可直接倒退、横移和斜移；同一目标下不会因轻微朝向漂移反复重设目标朝向。
+  这只约束接近阶段，后续 `whole_body_tracking` 仍可由 MPC 联合优化旋转与机械臂。
 - TCP 位置误差大于 2 cm 或姿态误差大于 0.12 rad，且综合误差连续 2 秒未改善至少 3 mm，
   自动进入 `whole_body_tracking`：恢复 TCP 代价，释放底盘及机械臂输入，由 MPC 协同跟踪。
   停滞判断使用实测关节状态的 FK；综合误差为 `hypot(位置误差, 0.1 × 姿态误差)`。
@@ -404,6 +412,8 @@ MPC 根据目标到机械臂 `base_link` 原点的三维距离分配运动：
 | `base_parking_radius_ratio` | `0.65` | 远目标停车半径比例，不限制单臂跟踪范围 |
 | `base_parking_tolerance` | `0.025` | 底盘到停车点的距离容差，米 |
 | `base_heading_tolerance` | `0.08` | 车身停车朝向容差，弧度，约 4.6° |
+| `base_command_profile` | `omni` | 全向 swerve；`ranger` 是横移/旋转互斥的旧后端约束 |
+| `base_approach_keep_heading` | `true` | 接近阶段保持入口朝向；默认 false 保留朝向目标的旧行为 |
 | `tracking_stall_seconds` | `2.0` | 跟踪无明显进展后允许底盘协助的等待时间，秒 |
 | `tracking_position_tolerance` | `0.02` | 停滞判断的位置误差阈值，米 |
 | `tracking_orientation_tolerance` | `0.12` | 停滞判断的姿态误差阈值，弧度 |
@@ -419,7 +429,7 @@ MPC 根据目标到机械臂 `base_link` 原点的三维距离分配运动：
 执行端使用同一反馈和实测朝向，避免预测转向与输出限速不一致造成反复修正。
 朝向误差在 0.02 rad 内停止修正，外侧平滑增加角速度；停车朝向容差仍为 0.08 rad。
 朝向代价为 `0.5 × 1.0 × wrap(yaw - yaw_goal)^2`，位置代价仍为 `0.5 × 50 × ||p - p_goal||²`。
-真机 `base_command_profile: ranger` 在接近与协同阶段额外约束横向速度为零，采用前后移动与转向，
+旧后端配置 `base_command_profile: ranger` 在接近与协同阶段额外约束横向速度为零，采用前后移动与转向，
 Ranger 接近阶段使用停车点引导：转向速度随朝向误差平滑变化，平移速度随到点距离及转向角减小，
 防止受转向限速影响而绕着停车点打圈。该引导作为 MPC 输入等式约束用于预测，输出端执行同一引导；
 前进或后退方向在选定停车点时固定，避免经过侧向位置时反复翻转转向要求；朝向偏差超过 90° 时先转向再平移。
@@ -427,7 +437,7 @@ Ranger 接近阶段使用停车点引导：转向速度随朝向误差平滑变�
 仅在执行 Ranger 接近任务时允许低于空闲死区的减速命令，到点后由停稳阶段明确发送零速度。
 驶入停车容差的 0.6 倍范围后锁住平移、原地完成最终朝向；只有偏离超过容差的 2 倍才重新驶入，
 避免停车点附近反复切换驶入与对正。正常停车位置容差不变。
-规划和输出都避免向 Ranger 驱动同时发送横移与旋转；全向仿真仍可横移。
+该 profile 的规划和输出都避免同时发送横移与旋转；`omni` 不受此限制。
 输出端同步保持进入该阶段时的关节位置，避免旧策略或插值引入关节动作。
 停稳后恢复单臂 TCP 跟踪并锁住底盘；协同阶段直接使用原 TCP 代价并开放底盘和机械臂输入。
 预测与控制使用同一次求解，分身反映接近阶段的关节保持及协同阶段的跟踪动作。
@@ -476,17 +486,35 @@ Ranger 接近阶段使用停车点引导：转向速度随朝向误差平滑变�
 
 ## 独立控制预测显示
 
+控制器默认 `mock_debug_enabled: false`、`prediction_visualization_enabled: false`、
+`traj_record_enabled: false`。普通/真机配置不加载预测分身、不导出预测显示快照、不录制 CSV；
+此时 YAML 强行开启预测/录制会拒绝初始化，在线开启录制也会明确拒绝。
+`mock_debug_enabled` 是不可在线修改的配置许可，不是硬件探测或切换开关；不要在真机配置中开启。
+单臂及 Z2 的专用 `mpc_mock.launch.py` 会检查模拟硬件插件，配套 mock YAML 才开启该许可。
+
 `prediction_visualization_enabled` 同时控制两色预测轨迹与预测机器人分身，
 独立于 `show_rviz`。关闭后不加载分身的 visual mesh，不获取预测轨迹快照、
 不计算/发布预测轨迹和分身；TCP 当前位姿、目标管理、已配置的自碰撞检查和可选 CSV 记录继续工作。
 若碰撞检查和记录也未开启，显示工作线程空闲，不再创建观测显示快照。
 该参数在启动时生效，修改后需重新加载控制器。
 
-单臂 mock 默认开启预测显示。如需关闭，修改
+单臂与 Z2 mock 默认开启预测显示，但仍默认关闭录制。如需关闭显示，修改
 `zephyr_arm_bringup/config/mpc_mock_controllers.yaml` 中的该参数并重新启动。
 `show_rviz:=false` 只关闭窗口，不修改这个控制器参数。
 单机械臂入口生成临时的规划 URDF 和控制器参数文件，退出时清理；
 不覆盖正常控制器 YAML，也不修改上游包。
+
+仅在 mock 中需要录制时：
+
+```bash
+ros2 param set /mpc_controller traj_record_dir /tmp/traj_record
+ros2 param set /mpc_controller traj_record_enabled true
+# 完成采集后关闭录制，将缓存写入 CSV。
+ros2 param set /mpc_controller traj_record_enabled false
+```
+
+文件为 `real_tcp.csv`（反馈 FK）和 `pred_tcp.csv`（控制采样预测 FK），不包含输入目标轨迹。
+写入失败会报告错误并停止录制，不会让控制器进程退出；该次 CSV 可能缺失或不完整。
 
 
 ## 自动运行与暂停

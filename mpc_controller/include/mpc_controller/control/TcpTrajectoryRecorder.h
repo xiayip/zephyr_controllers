@@ -17,7 +17,9 @@ struct TcpTrajectorySample {
 class TcpTrajectoryRecorder {
 public:
   ~TcpTrajectoryRecorder();
-  void setEnabled(bool enabled, const std::string &directory);
+  // Stopping always disables recording. Return a CSV error instead of throwing
+  // file-system exceptions through a ROS parameter callback.
+  std::string setEnabled(bool enabled, const std::string &directory);
   bool enabled() const { return enabled_.load(); }
   void appendActual(const TcpTrajectorySample &sample);
   void appendPredicted(const TcpTrajectorySample &sample);

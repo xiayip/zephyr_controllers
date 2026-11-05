@@ -76,7 +76,7 @@ struct mpc_visualizer_config {
     std::string base_frame;
     /** Frame in which FK poses are expressed (odom for an OCS2 mobile-base state). */
     std::string visualization_frame;
-    bool prediction_visualization_enabled{true};
+    bool prediction_visualization_enabled{false};
     double ghost_interval{0.2};
     size_t ghost_count{5};
     double marker_lifetime{0.15};

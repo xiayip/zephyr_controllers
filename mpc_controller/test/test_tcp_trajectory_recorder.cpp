@@ -74,5 +74,32 @@ TEST_F(TcpRecorderTest, DestructorFlushesAnActiveSession) {
     EXPECT_EQ(read("real_tcp.csv").size(), 2u);
     EXPECT_EQ(read("pred_tcp.csv").size(), 1u);
 }
+TEST_F(TcpRecorderTest, BadDirectoryStopsRecordingWithoutThrowingAndAllowsNewSession) {
+    const auto not_directory = directory_ / "file";
+    std::ofstream(not_directory).put('x');
+    TcpTrajectoryRecorder recorder;
+    EXPECT_TRUE(recorder.setEnabled(true, (not_directory / "child").string()).empty());
+    recorder.appendActual(sample_);
+    EXPECT_FALSE(recorder.setEnabled(false, "").empty());
+    EXPECT_FALSE(recorder.enabled());
+    EXPECT_TRUE(recorder.setEnabled(true, directory_.string()).empty());
+    recorder.appendActual(sample_);
+    EXPECT_TRUE(recorder.setEnabled(false, "").empty());
+    EXPECT_EQ(read("real_tcp.csv").size(), 2u);
+}
+
+TEST_F(TcpRecorderTest, FileOpenAndBufferedWriteFailuresAreReportedWithoutThrowing) {
+    std::filesystem::create_directory(directory_ / "real_tcp.csv");
+    TcpTrajectoryRecorder recorder;
+    recorder.setEnabled(true, directory_.string());
+    EXPECT_FALSE(recorder.setEnabled(false, "").empty());
+    EXPECT_FALSE(recorder.enabled());
+    std::filesystem::remove(directory_ / "real_tcp.csv");
+    std::filesystem::create_symlink("/dev/full", directory_ / "real_tcp.csv");
+    recorder.setEnabled(true, directory_.string());
+    recorder.appendActual(sample_);
+    EXPECT_FALSE(recorder.setEnabled(false, "").empty());
+    EXPECT_FALSE(recorder.enabled());
+}
 } // namespace
 } // namespace zephyr::mpc

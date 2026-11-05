@@ -204,7 +204,8 @@ namespace zephyr::mpc {
         std::mutex visualization_wait_mutex_;
         std::atomic_bool trajectory_clear_requested_{false};
         std::atomic<uint64_t> visualization_epoch_{0};
-        bool prediction_visualization_enabled_{true}; // initialization only
+        bool mock_debug_enabled_{false}; // Initialization-only opt-in from mock launch/config.
+        bool prediction_visualization_enabled_{false}; // initialization only
         double prediction_ghost_interval_{0.2};
         int prediction_ghost_count_{5};
         double prediction_max_age_{0.5};

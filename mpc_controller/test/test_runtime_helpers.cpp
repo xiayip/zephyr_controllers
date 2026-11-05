@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mpc_controller/control/JointInterfaces.h"
+#include "mpc_controller/control/CtrlComponent.h"
 #include "mpc_controller/runtime/MpcExecutionParams.hpp"
 #include "mpc_controller/runtime/RtCycleTiming.h"
 #include <gtest/gtest.h>
@@ -74,4 +75,22 @@ TEST(RuntimeHelpers, TimingSamplesAreBoundedAndDisabledScopeDoesNothing) {
   uint32_t elapsed = 123;
   { auto scope = timer.scope(&elapsed); }
   EXPECT_EQ(elapsed, 123u);
+}
+
+TEST(RuntimeHelpers, ProductionRejectsDiagnosticsBeforeLoadingAnyRobotModel) {
+  rclcpp::init(0, nullptr);
+  for (const auto* parameter : {"prediction_visualization_enabled", "traj_record_enabled"}) {
+    rclcpp::NodeOptions options;
+    options.use_global_arguments(false).parameter_overrides({rclcpp::Parameter(parameter, true)});
+    auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("diagnostics_gate_test", options);
+    JointInterfaces interfaces;
+    try {
+      CtrlComponent component(node, interfaces);
+      ADD_FAILURE() << "Production accepted " << parameter;
+    } catch (const std::runtime_error& error) {
+      EXPECT_NE(std::string(error.what()).find("mock-only"), std::string::npos);
+    }
+    EXPECT_FALSE(node->get_parameter("mock_debug_enabled").as_bool());
+  }
+  rclcpp::shutdown();
 }

@@ -158,6 +158,54 @@ TEST(StagedMotion, HeadingUsesShortestTurnAcrossPiBoundary) {
     EXPECT_LT(plan.base_yaw_goal-initial_yaw, 0.06);
 }
 
+TEST(StagedMotion, KeepHeadingParksInAnyDirectionWithoutTurningTheMount) {
+    StagedMotionConfig config;
+    config.reach_radius = 1.0;
+    config.approach_keep_heading = true;
+    // Nonzero world pose and mount offset catch body/world-frame confusion.
+    const Eigen::Vector3d base(2.0, -1.0, 0.7);
+    const Eigen::Rotation2Dd rotation(base.z());
+    const Eigen::Vector2d arm_xy = base.head<2>() + rotation * Eigen::Vector2d(0.2, 0.1);
+    const Eigen::Vector3d arm(arm_xy.x(), arm_xy.y(), 0.5);
+    for (const Eigen::Vector2d& direction : {Eigen::Vector2d(1,0), Eigen::Vector2d(-1,0),
+            Eigen::Vector2d(0,1), Eigen::Vector2d(0,-1),
+            Eigen::Vector2d(1,1).normalized().eval(), Eigen::Vector2d(-1,-1).normalized().eval()}) {
+        ReachCoordinator c(config);
+        const Eigen::Vector2d target_xy = arm_xy + 1.2 * (rotation * direction);
+        const Eigen::Vector3d target(target_xy.x(), target_xy.y(), arm.z());
+        const auto plan = c.update(1.0, base, arm, target);
+        ASSERT_EQ(plan.phase, MotionPhase::Base);
+        EXPECT_DOUBLE_EQ(plan.parking_yaw, base.z());
+        EXPECT_NEAR((rotation.inverse() * (plan.base_goal - base.head<2>()) - 0.55 * direction).norm(), 0, 1e-12);
+        // Drift must not relatch the desired heading for an unchanged target.
+        const auto drift = c.update(1.1, {base.x(),base.y(),base.z()+0.01}, arm, target);
+        EXPECT_DOUBLE_EQ(drift.parking_yaw, plan.parking_yaw);
+        const Eigen::Vector2d translation = plan.base_goal - base.head<2>();
+        const auto arrived = c.update(1.2, {plan.base_goal.x(),plan.base_goal.y(),base.z()},
+            {arm.x()+translation.x(),arm.y()+translation.y(),arm.z()}, target);
+        EXPECT_EQ(arrived.phase, MotionPhase::Settling);
+    }
+}
+
+TEST(StagedMotion, OmniApproachLeavesSignedPlanarInputsFree) {
+    auto stage = std::make_shared<StagedMotionState>();
+    stage->phase = MotionPhase::Base;
+    stage->parking_yaw = 0.7;
+    auto constraint = makeStageInputConstraint(stage, false);
+    ocs2::PreComputation pre;
+    auto x = ocs2::vector_t::Zero(9).eval(); x(2) = 0.7;
+    for (double vx : {-0.1, 0.0, 0.1}) for (double vy : {-0.1, 0.0, 0.1}) {
+        auto u = ocs2::vector_t::Zero(9).eval(); u(0) = vx; u(1) = vy;
+        EXPECT_DOUBLE_EQ(constraint->getValue(0,x,u,pre).norm(), 0.0);
+        const auto linear = constraint->getLinearApproximation(0,x,u,pre);
+        EXPECT_DOUBLE_EQ(linear.dfdu.leftCols(2).norm(), 0.0);
+        u(3) = 0.01;
+        EXPECT_GT(constraint->getValue(0,x,u,pre).norm(), 0.0);
+    }
+    stage->phase = MotionPhase::Assist;
+    EXPECT_FALSE(constraint->isActive(0)); // Whole-body optimization may also yaw.
+}
+
 TEST(StagedMotion, ApproachUsesHeadingGuidanceWhileLockingArmForBothBackends) {
     const ocs2::vector_t x = ocs2::vector_t::Zero(9);
     ocs2::vector_t u = ocs2::vector_t::Zero(9);

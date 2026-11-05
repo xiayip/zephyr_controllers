@@ -26,6 +26,7 @@ struct StagedMotionConfig {
     double parking_radius_ratio{0.65};
     double parking_tolerance{0.025};
     double heading_tolerance{0.08};
+    bool approach_keep_heading{false}; // Latch entry yaw instead of facing the target.
     bool ranger_base{false};
     double heading_max_velocity{0.3};
     double approach_max_linear_velocity{0.15};

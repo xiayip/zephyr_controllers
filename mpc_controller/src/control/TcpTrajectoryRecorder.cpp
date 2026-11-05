@@ -15,14 +15,14 @@ TcpTrajectoryRecorder::~TcpTrajectoryRecorder() {
   } catch (...) {
   }
 }
-void TcpTrajectoryRecorder::setEnabled(bool enabled,
-                                       const std::string &directory) {
+std::string TcpTrajectoryRecorder::setEnabled(bool enabled,
+                                             const std::string &directory) {
   std::vector<TcpTrajectorySample> actual, predicted;
   std::string output;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (enabled == enabled_)
-      return;
+      return {};
     if (enabled) {
       directory_ = directory;
       actual_.clear();
@@ -30,30 +30,36 @@ void TcpTrajectoryRecorder::setEnabled(bool enabled,
       actual_.reserve(10000);
       predicted_.reserve(10000);
       enabled_ = true;
-      return;
+      return {};
     }
     enabled_ = false;
     actual.swap(actual_);
     predicted.swap(predicted_);
     output = directory_;
   }
-  std::filesystem::create_directories(output);
-  const auto write = [&](const char *name,
-                         const std::vector<TcpTrajectorySample> &samples) {
-    std::ofstream file(std::filesystem::path(output) / name);
-    file.exceptions(std::ios::badbit | std::ios::failbit);
-    file << "stamp_sec,x,y,z,qx,qy,qz,qw\n" << std::setprecision(17);
-    for (const auto &s : samples) {
-      file << s.stamp_sec;
-      for (double v : s.position)
-        file << ',' << v;
-      for (double v : s.quat_xyzw)
-        file << ',' << v;
-      file << '\n';
-    }
-  };
-  write("real_tcp.csv", actual);
-  write("pred_tcp.csv", predicted);
+  try {
+    std::filesystem::create_directories(output);
+    const auto write = [&](const char *name,
+                           const std::vector<TcpTrajectorySample> &samples) {
+      std::ofstream file(std::filesystem::path(output) / name);
+      file.exceptions(std::ios::badbit | std::ios::failbit);
+      file << "stamp_sec,x,y,z,qx,qy,qz,qw\n" << std::setprecision(17);
+      for (const auto &s : samples) {
+        file << s.stamp_sec;
+        for (double v : s.position)
+          file << ',' << v;
+        for (double v : s.quat_xyzw)
+          file << ',' << v;
+        file << '\n';
+      }
+      file.close(); // Detect buffered write failures before reporting success.
+    };
+    write("real_tcp.csv", actual);
+    write("pred_tcp.csv", predicted);
+    return {};
+  } catch (const std::exception &error) {
+    return error.what();
+  }
 }
 void TcpTrajectoryRecorder::appendActual(const TcpTrajectorySample &sample) {
   std::lock_guard<std::mutex> lock(mutex_);

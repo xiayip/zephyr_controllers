@@ -46,7 +46,8 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
 {
     if (ranger)
     {
-        // Ranger supports crab translation or yaw, never lateral motion plus yaw.
+        // Legacy Ranger backend profile: crab translation and yaw are exclusive.
+        // A full swerve/holonomic backend must use the omni profile instead.
         if (std::abs(command.linear.y) > 0.001)
         {
             command.angular.z = 0.0;
@@ -116,9 +117,17 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         if (!std::isfinite(policy_max_age_) || policy_max_age_ <= 0.0 ||
             !std::isfinite(collision_check_timeout_) || collision_check_timeout_ <= 0.0)
             throw std::runtime_error("Policy and collision timeouts must be finite and positive");
+        // Production defaults must not allocate prediction meshes or record CSV.
+        // Only hardware-checked mock launch profiles opt into these diagnostics.
+        mock_debug_enabled_ = auto_declare("mock_debug_enabled", false);
+        prediction_visualization_enabled_ = auto_declare("prediction_visualization_enabled", false);
         // Declare dir before enabled so both can be applied together from yaml/callback.
         traj_record_dir_ = auto_declare("traj_record_dir", std::string("/tmp/traj_record"));
         const bool traj_record_enabled = auto_declare("traj_record_enabled", false);
+        if (!mock_debug_enabled_ && (prediction_visualization_enabled_ || traj_record_enabled))
+        {
+            throw std::runtime_error("Prediction visualization and trajectory recording are mock-only; keep them disabled outside the mock launch/profile");
+        }
         if (traj_record_dir_.empty())
         {
             throw std::runtime_error("traj_record_dir must be nonempty");
@@ -142,7 +151,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
             throw std::runtime_error("dds_publish_hz must be finite and nonnegative");
         }
         dds_publish_period_sec_ = dds_publish_hz > 0.0 ? 1.0 / dds_publish_hz : 0.0;
-        prediction_visualization_enabled_ = auto_declare("prediction_visualization_enabled", true);
         const double prediction_publish_hz = auto_declare("prediction_publish_hz", 20.0);
         prediction_ghost_interval_ = auto_declare("prediction_ghost_interval", 0.2);
         prediction_ghost_count_ = auto_declare("prediction_ghost_count", 5);
@@ -166,6 +174,7 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         staged_config.parking_radius_ratio = auto_declare("base_parking_radius_ratio", 0.65);
         staged_config.parking_tolerance = auto_declare("base_parking_tolerance", 0.025);
         staged_config.heading_tolerance = auto_declare("base_heading_tolerance", 0.08);
+        staged_config.approach_keep_heading = auto_declare("base_approach_keep_heading", false);
         staged_config.tracking_stall_seconds = auto_declare("tracking_stall_seconds", 2.0);
         staged_config.tracking_position_tolerance = auto_declare("tracking_position_tolerance", 0.02);
         staged_config.tracking_orientation_tolerance = auto_declare("tracking_orientation_tolerance", 0.12);
@@ -410,11 +419,12 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
                  "base_angular_stop_threshold", "base_command_profile", "base_max_linear_speed",
                  "base_max_angular_speed", "planning_urdf_path",
                  "future_time_offset", "info_file_name", "ocs2_library_folder", "base_frame",
-                 "tcp_ee_frame", "prediction_visualization_enabled", "prediction_publish_hz",
+                 "tcp_ee_frame", "mock_debug_enabled", "prediction_visualization_enabled", "prediction_publish_hz",
                  "prediction_ghost_interval", "prediction_ghost_count", "prediction_max_age",
                  "staged_motion_enabled", "arm_workspace_frame", "arm_reach_radius",
                  "reach_switch_margin", "base_settle_seconds",
-                 "base_parking_radius_ratio", "base_parking_tolerance", "base_heading_tolerance", "tracking_stall_seconds",
+                 "base_parking_radius_ratio", "base_parking_tolerance", "base_heading_tolerance",
+                 "base_approach_keep_heading", "tracking_stall_seconds",
                  "tracking_position_tolerance", "tracking_orientation_tolerance",
                  "tracking_progress_threshold", "assist_no_progress_seconds",
                  "movel_duration", "movel_sample_interval", "movel_max_linear_velocity",
@@ -456,6 +466,10 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
                      param.get_type() != rclcpp::ParameterType::PARAMETER_BOOL)
             {
                 result.reason = name + " must be a bool";
+            }
+            else if (name == "traj_record_enabled" && param.as_bool() && !mock_debug_enabled_)
+            {
+                result.reason = "Trajectory recording is only available in the mock launch/profile";
             }
             else if (name == "traj_record_dir")
             {
@@ -504,9 +518,16 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         }
         if (traj_record_enabled_update.has_value())
         {
-            recorder_.setEnabled(*traj_record_enabled_update, traj_record_dir_);
-            RCLCPP_INFO(node_->get_logger(), "traj_record_enabled=%d, dir=%s",
-                        *traj_record_enabled_update, traj_record_dir_.c_str());
+            const auto error = recorder_.setEnabled(*traj_record_enabled_update, traj_record_dir_);
+            if (!error.empty())
+            {
+                RCLCPP_ERROR(node_->get_logger(), "Trajectory recording stopped but CSV save failed: %s", error.c_str());
+            }
+            else
+            {
+                RCLCPP_INFO(node_->get_logger(), "traj_record_enabled=%d, dir=%s",
+                            *traj_record_enabled_update, traj_record_dir_.c_str());
+            }
         }
     }
 
@@ -975,6 +996,9 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         last_recorded_observation_time_ = -1.0;
         collision_started_us_ = steadyMicroseconds();
         collision_watchdog_.reset();
+        // Production has no dynamically enabled recorder. Keep the worker only
+        // when configured collision monitoring needs it; never disable that check.
+        if (!mock_debug_enabled_ && !interface_->isSelfCollisionEnabled()) return;
         visualization_running_.store(true, std::memory_order_release);
         visualization_thread_ = std::thread(&CtrlComponent::visualizationThreadLoop, this);
     }

@@ -88,13 +88,16 @@ const StagedMotionState& ReachCoordinator::update(
                 desired_radius * desired_radius - offset.z() * offset.z()));
             const double planar_distance = offset.head<2>().norm();
             state_.base_yaw_goal = base.z();
-            if (planar_distance > 1e-6)
+            if (!config_.approach_keep_heading && planar_distance > 1e-6)
                 state_.base_yaw_goal += std::remainder(std::atan2(offset.y(), offset.x()) - base.z(), 2.0 * std::acos(-1.0));
             // Rotate the actual mount offset with the chassis. Otherwise turning
             // would shift the arm away from the intended parking circle.
             const Eigen::Vector2d mount = Eigen::Rotation2Dd(-base.z()) * (arm_origin.head<2>() - base.head<2>());
-            const Eigen::Vector2d forward(std::cos(state_.base_yaw_goal), std::sin(state_.base_yaw_goal));
-            state_.base_goal = target.head<2>() - planar_radius * forward -
+            // Parking direction and chassis orientation are independent for
+            // holonomic motion: a side/rear goal need not turn the vehicle.
+            Eigen::Vector2d approach(std::cos(state_.base_yaw_goal), std::sin(state_.base_yaw_goal));
+            if (planar_distance > 1e-6) approach = offset.head<2>() / planar_distance;
+            state_.base_goal = target.head<2>() - planar_radius * approach -
                 Eigen::Rotation2Dd(state_.base_yaw_goal) * mount;
             state_.parking_yaw = state_.base_yaw_goal;
             const Eigen::Vector2d travel = state_.base_goal - base.head<2>();
