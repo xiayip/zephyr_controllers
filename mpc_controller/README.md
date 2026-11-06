@@ -501,7 +501,7 @@ Ranger 接近阶段使用停车点引导：转向速度随朝向误差平滑变�
 `traj_record_enabled: false`。普通/真机配置不加载预测分身、不导出预测显示快照、不录制 CSV；
 此时 YAML 强行开启预测/录制会拒绝初始化，在线开启录制也会明确拒绝。
 `mock_debug_enabled` 是不可在线修改的配置许可，不是硬件探测或切换开关；不要在真机配置中开启。
-单臂及 Z2 的专用 `mpc_mock.launch.py` 会检查模拟硬件插件，配套 mock YAML 才开启该许可。
+单臂专用 `mpc_mock.launch.py` 会检查模拟硬件插件，配套 mock YAML 才开启该许可；Z2 已移除独立 mock 启动，由 `mock.launch.py load_mpc_controller:=true` 在代码中为 mock 开启。
 
 `prediction_visualization_enabled` 同时控制两色预测轨迹与预测机器人分身，
 独立于 `show_rviz`。关闭后不加载分身的 visual mesh，不获取预测轨迹快照、
