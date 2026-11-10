@@ -5,6 +5,7 @@
 //
 
 #include "mpc_controller/control/CtrlComponent.h"
+#include "mpc_controller/control/BaseKinematics.h"
 
 #include <mpc_controller/runtime/ThreadScheduling.h>
 #include <ocs2_core/thread_support/ThreadPool.h>
@@ -39,24 +40,11 @@ static int64_t steadyMicroseconds()
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
-// Adapt an omni MPC command to the chassis backend after applying deadbands.
+// Bound the chassis command after applying its kinematic constraint and deadbands.
 // Positive limits bound speed; zero leaves that axis unbounded.
-static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
-                                 bool ranger, double max_linear, double max_angular)
+static void limitBaseCommand(geometry_msgs::msg::Twist& command,
+                             double max_linear, double max_angular)
 {
-    if (ranger)
-    {
-        // Legacy Ranger backend profile: crab translation and yaw are exclusive.
-        // A full swerve/holonomic backend must use the omni profile instead.
-        if (std::abs(command.linear.y) > 0.001)
-        {
-            command.angular.z = 0.0;
-        }
-        else
-        {
-            command.linear.y = 0.0;
-        }
-    }
     const double speed = std::hypot(command.linear.x, command.linear.y);
     if (max_linear > 0.0 && speed > max_linear)
     {
@@ -166,34 +154,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
 
         robot_name_ = auto_declare("robot_name", std::string("cr5"));
         mobile_base_enabled_ = auto_declare("mobile_base_enabled", false);
-        StagedMotionConfig staged_config;
-        staged_config.enabled = auto_declare("staged_motion_enabled", false);
-        staged_config.arm_base_frame = auto_declare("arm_workspace_frame", std::string("base_link"));
-        staged_config.reach_radius = auto_declare("arm_reach_radius", 0.0);
-        staged_config.reach_switch_margin = auto_declare("reach_switch_margin", 0.02);
-        staged_config.parking_radius_ratio = auto_declare("base_parking_radius_ratio", 0.65);
-        staged_config.parking_tolerance = auto_declare("base_parking_tolerance", 0.025);
-        staged_config.heading_tolerance = auto_declare("base_heading_tolerance", 0.08);
-        staged_config.approach_keep_heading = auto_declare("base_approach_keep_heading", false);
-        staged_config.tracking_stall_seconds = auto_declare("tracking_stall_seconds", 2.0);
-        staged_config.tracking_position_tolerance = auto_declare("tracking_position_tolerance", 0.02);
-        staged_config.tracking_orientation_tolerance = auto_declare("tracking_orientation_tolerance", 0.12);
-        staged_config.tracking_progress_threshold = auto_declare("tracking_progress_threshold", 0.003);
-        staged_config.assist_no_progress_seconds = auto_declare("assist_no_progress_seconds", 4.0);
-        staged_config.settle_seconds = auto_declare("base_settle_seconds", 0.25);
-        if ((staged_config.enabled && !mobile_base_enabled_) ||
-            !std::isfinite(staged_config.reach_radius) || staged_config.reach_radius < 0.0 ||
-            !std::isfinite(staged_config.reach_switch_margin) || staged_config.reach_switch_margin < 0.0 ||
-            !std::isfinite(staged_config.parking_radius_ratio) || staged_config.parking_radius_ratio <= 0.0 || staged_config.parking_radius_ratio >= 1.0 ||
-            !std::isfinite(staged_config.parking_tolerance) || staged_config.parking_tolerance <= 0.0 ||
-            !std::isfinite(staged_config.heading_tolerance) || staged_config.heading_tolerance <= 0.0 || staged_config.heading_tolerance >= std::acos(-1.0) ||
-            !std::isfinite(staged_config.tracking_stall_seconds) || staged_config.tracking_stall_seconds <= 0.0 ||
-            !std::isfinite(staged_config.tracking_position_tolerance) || staged_config.tracking_position_tolerance <= 0.0 ||
-            !std::isfinite(staged_config.tracking_orientation_tolerance) || staged_config.tracking_orientation_tolerance <= 0.0 ||
-            !std::isfinite(staged_config.tracking_progress_threshold) || staged_config.tracking_progress_threshold <= 0.0 ||
-            !std::isfinite(staged_config.assist_no_progress_seconds) || staged_config.assist_no_progress_seconds <= 0.0 ||
-            !std::isfinite(staged_config.settle_seconds) || staged_config.settle_seconds <= 0.0)
-            throw std::runtime_error("Invalid staged motion configuration");
         const std::string base_odom_frame = auto_declare("base_odom_frame", std::string("odom"));
         base_odom_frame_ = base_odom_frame;
         const std::string base_odom_topic = auto_declare(
@@ -204,11 +164,8 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         base_angular_start_threshold_ = auto_declare("base_angular_start_threshold", 0.04);
         base_angular_stop_threshold_ = auto_declare("base_angular_stop_threshold", 0.02);
         base_command_profile_ = auto_declare("base_command_profile", std::string("omni"));
-        staged_config.ranger_base = base_command_profile_ == "ranger";
         base_max_linear_speed_ = auto_declare("base_max_linear_speed", 0.0);
-        staged_config.approach_max_linear_velocity = base_max_linear_speed_ > 0.0 ? base_max_linear_speed_ : 0.15;
         base_max_angular_speed_ = auto_declare("base_max_angular_speed", 0.0);
-        staged_config.heading_max_velocity = base_max_angular_speed_ > 0.0 ? base_max_angular_speed_ : 0.3;
         if ((base_command_profile_ != "omni" && base_command_profile_ != "ranger") ||
             !std::isfinite(base_max_linear_speed_) || base_max_linear_speed_ < 0.0 ||
             !std::isfinite(base_max_angular_speed_) || base_max_angular_speed_ < 0.0)
@@ -361,14 +318,11 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         pose_reference_manager_->subscribe(node_);
         // Extend a copy of the upstream problem through public APIs only.
         auto problem = interface_->getOptimalControlProblem();
-        if (staged_config.enabled)
+        if (mobile_base_enabled_ && base_command_profile_ == "ranger")
         {
-            staged_reference_ = std::make_shared<StagedReferenceManager>(pose_reference_manager_,
-                interface_->getPinocchioInterface(), interface_->getManipulatorModelInfo().eeFrame,
-                staged_config, node_->get_logger());
-            staged_reference_->augmentProblem(problem);
-            motion_phase_publisher_ = node_->create_publisher<std_msgs::msg::String>(
-                "~/motion_phase", rclcpp::QoS(1).transient_local());
+            const auto& model_info = interface_->getManipulatorModelInfo();
+            problem.equalityConstraintPtr->add("baseNoLateralVelocity",
+                makeNoLateralVelocityConstraint(model_info.stateDim, model_info.inputDim));
         }
         prepareThreadIsolation();
         mpc_ = std::make_unique<GaussNewtonDDP_MPC>(
@@ -381,8 +335,7 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
 
         mpc_mrt_interface_ = std::make_unique<MPC_MRT_Interface>(*mpc_);
 
-        if (staged_reference_) mpc_->getSolverPtr()->setReferenceManager(staged_reference_);
-        else mpc_->getSolverPtr()->setReferenceManager(pose_reference_manager_);
+        mpc_->getSolverPtr()->setReferenceManager(pose_reference_manager_);
 
         observation_.state = interface_->getInitialState();
         observation_.input = vector_t::Zero(interface_->getManipulatorModelInfo().inputDim);
@@ -421,12 +374,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
                  "future_time_offset", "info_file_name", "ocs2_library_folder", "base_frame",
                  "tcp_ee_frame", "mock_debug_enabled", "prediction_visualization_enabled", "prediction_publish_hz",
                  "prediction_ghost_interval", "prediction_ghost_count", "prediction_max_age",
-                 "staged_motion_enabled", "arm_workspace_frame", "arm_reach_radius",
-                 "reach_switch_margin", "base_settle_seconds",
-                 "base_parking_radius_ratio", "base_parking_tolerance", "base_heading_tolerance",
-                 "base_approach_keep_heading", "tracking_stall_seconds",
-                 "tracking_position_tolerance", "tracking_orientation_tolerance",
-                 "tracking_progress_threshold", "assist_no_progress_seconds",
                  "movel_duration", "movel_sample_interval", "movel_max_linear_velocity",
                  "movel_max_linear_acceleration", "movel_max_linear_jerk",
                  "movel_max_angular_velocity", "movel_max_angular_acceleration", "movel_max_angular_jerk"})
@@ -696,7 +643,7 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
             }
         }
         // Always feed real feedback back into MPC, including while holding for
-        // a policy/phase handoff. Commands are never substituted as observations.
+        // a policy handoff. Commands are never substituted as observations.
         mpc_mrt_interface_->setCurrentObservation(measured_observation_);
         if (!policy_active_)
         {
@@ -713,33 +660,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
             RCLCPP_ERROR(node_->get_logger(), "MPC policy invalid, expired, or outside its sampling horizon; explicit resume required");
             holdLastSentPositions();
             return false;
-        }
-        MotionPhase phase = MotionPhase::Arm;
-        StagedMotionState approach_state;
-        if (staged_reference_)
-        {
-            const auto plan = std::atomic_load_explicit(&staged_policy_, std::memory_order_acquire);
-            const auto& times = mpc_mrt_interface_->getPolicy().timeTrajectory_;
-            if (!policy_active_ || !plan || times.empty() ||
-                plan->epoch != visualization_epoch_.load(std::memory_order_acquire) ||
-                std::abs(plan->stage.policy_start - times.front()) > 1e-6)
-            {
-                mpc_mrt_interface_->setCurrentObservation(measured_observation_);
-                holdLastSentPositions();
-                return true; // Never apply a policy with a different phase/version.
-            }
-            phase = plan->stage.phase;
-            approach_state = plan->stage;
-            if ((phase == MotionPhase::Base || phase == MotionPhase::Settling || phase == MotionPhase::Unreachable) &&
-                phase != applied_motion_phase_)
-                held_arm_positions_ = measured_observation_.state.tail(joint_names_.size());
-            if (phase != applied_motion_phase_)
-            {
-                std_msgs::msg::String message;
-                message.data = motionPhaseName(phase);
-                motion_phase_publisher_->publish(message);
-            }
-            applied_motion_phase_ = phase;
         }
         {
             auto pub_scope = rt_timing_.scope(&rt_timing_.eval_obs_pub_us);
@@ -759,30 +679,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
                 future_time, policy.timeTrajectory_, policy.stateTrajectory_);
             future_input = LinearInterpolation::interpolate(
                 future_time, policy.timeTrajectory_, policy.inputTrajectory_);
-            if (staged_reference_)
-            {
-                if (phase == MotionPhase::Arm || phase == MotionPhase::Settling || phase == MotionPhase::Unreachable)
-                {
-                    future_input.head<3>().setZero();
-                    future_state.head<3>() = measured_observation_.state.head<3>();
-                    base_translation_active_ = base_rotation_active_ = false;
-                }
-                if (phase == MotionPhase::Base || phase == MotionPhase::Settling || phase == MotionPhase::Unreachable)
-                {
-                    future_input.tail(joint_names_.size()).setZero();
-                    future_state.tail(joint_names_.size()) = held_arm_positions_;
-                }
-            }
-            if (staged_reference_ && phase == MotionPhase::Base)
-            {
-                const double max_angular = base_max_angular_speed_ > 0.0 ? base_max_angular_speed_ : 0.3;
-                if (base_command_profile_ == "ranger")
-                    future_input.head<3>() = rangerApproachCommand(measured_observation_.state.head<3>(), approach_state,
-                        base_max_linear_speed_ > 0.0 ? base_max_linear_speed_ : 0.15, max_angular).input;
-                else
-                    future_input(2) = rangerHeadingCommand(measured_observation_.state(2),
-                        approach_state.parking_yaw, max_angular).velocity;
-            }
             if (recorder_.enabled())
             {
                 pending_viz_has_pred_ = true;
@@ -826,16 +722,12 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
                 command.linear.x = future_input(0);
                 command.linear.y = future_input(1);
                 command.angular.z = future_input(2);
-                // The staged Ranger model locks lateral speed. Remove solver
-                // residuals before the backend's mutually exclusive crab/yaw adapter.
-                if (staged_reference_ && base_command_profile_ == "ranger") command.linear.y = 0.0;
             }
-            // An active Ranger parking maneuver intentionally slows below the
-            // idle deadband. Arrival/settling explicitly sends zero to stop it.
-            if (!(staged_reference_ && phase == MotionPhase::Base && base_command_profile_ == "ranger"))
-                applyBaseCommandDeadband(command);
-            constrainBaseCommand(command, base_command_profile_ == "ranger",
-                                 base_max_linear_speed_, base_max_angular_speed_);
+            // Remove numerical lateral residuals before applying the planar
+            // deadband; Ranger's prediction uses the same vy=0 constraint.
+            if (base_command_profile_ == "ranger") command.linear.y = 0.0;
+            applyBaseCommandDeadband(command);
+            limitBaseCommand(command, base_max_linear_speed_, base_max_angular_speed_);
             publishMobileBaseCommand(command);
         }
         if (mixed)
@@ -865,15 +757,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
     void CtrlComponent::resetMpc()
     {
         clearTrajectoryVisualization();
-        if (staged_reference_) staged_reference_->reset();
-        applied_motion_phase_ = MotionPhase::Arm;
-        held_arm_positions_ = measured_observation_.state.tail(joint_names_.size());
-        if (motion_phase_publisher_)
-        {
-            std_msgs::msg::String message;
-            message.data = motionPhaseName(MotionPhase::Arm);
-            motion_phase_publisher_->publish(message);
-        }
         observation_ = measured_observation_;
         const auto& tcp_pose = reset_tcp_pose_;
         RCLCPP_INFO(node_->get_logger(),
@@ -925,14 +808,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         const auto t0 = std::chrono::steady_clock::now();
         const auto epoch = visualization_epoch_.load(std::memory_order_acquire);
         mpc_mrt_interface_->advanceMpc();
-        if (staged_reference_ && epoch == visualization_epoch_.load(std::memory_order_acquire))
-        {
-            auto plan = std::make_shared<StagedPolicy>();
-            plan->stage = staged_reference_->state();
-            plan->epoch = epoch;
-            std::shared_ptr<const StagedPolicy> immutable = std::move(plan);
-            std::atomic_store_explicit(&staged_policy_, std::move(immutable), std::memory_order_release);
-        }
         if (prediction_visualization_enabled_)
         {
             // Same worker owns the solver. Export the entire horizon separately from
@@ -1157,7 +1032,6 @@ static void constrainBaseCommand(geometry_msgs::msg::Twist& command,
         pending_viz_has_pred_ = false;
         visualization_epoch_.fetch_add(1, std::memory_order_acq_rel);
         active_prediction_.reset();
-        std::atomic_store_explicit(&staged_policy_, std::shared_ptr<const StagedPolicy>{}, std::memory_order_release);
         std::atomic_store_explicit(&solver_prediction_,
             std::shared_ptr<const zephyr::mpc_visualization::TimedPrediction>{}, std::memory_order_release);
         if (prediction_visualization_enabled_)

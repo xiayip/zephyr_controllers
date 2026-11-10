@@ -35,7 +35,6 @@ add_library(${controller_target} SHARED
   src/control/TcpKinematics.cpp
   src/control/TcpReferenceManager.cpp
   src/control/TcpTrajectoryRecorder.cpp
-  src/control/StagedMotion.cpp
   src/visualization/mpc_visualizer.cpp)
 set_target_properties(${controller_target} PROPERTIES OUTPUT_NAME ${PROJECT_NAME})
 target_compile_features(${controller_target} PUBLIC cxx_std_17)
@@ -98,8 +97,8 @@ if(BUILD_TESTING)
   target_include_directories(test_tcp_trajectory_recorder PRIVATE include)
   target_compile_features(test_tcp_trajectory_recorder PRIVATE cxx_std_17)
   target_link_libraries(test_tcp_trajectory_recorder Threads::Threads)
-  ament_add_gtest(test_staged_motion test/test_staged_motion.cpp)
-  target_link_libraries(test_staged_motion ${controller_target})
+  ament_add_gtest(test_base_kinematics test/test_base_kinematics.cpp)
+  target_link_libraries(test_base_kinematics ${controller_target})
   ament_add_gtest(test_tcp_kinematics test/test_tcp_kinematics.cpp)
   target_link_libraries(test_tcp_kinematics ${controller_target})
   ament_add_gtest(test_runtime_helpers test/test_runtime_helpers.cpp)

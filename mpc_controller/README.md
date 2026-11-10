@@ -14,7 +14,7 @@
 | `src/control/CtrlComponent.cpp` | 模型加载、实测观测、求解结果执行、保护与工作线程协调 |
 | `src/control/TcpReferenceManager.cpp` | TCP 目标输入、坐标转换与 OCS2 参考轨迹生成 |
 | `src/control/TcpTrajectoryRecorder.cpp` | 实测/预测 TCP 的缓冲与 CSV 写出 |
-| `src/control/StagedMotion.cpp` | 机械臂优先、底盘接近和停稳后的任务切换 |
+| `include/mpc_controller/control/BaseKinematics.h` | 旧底盘后端的横向速度约束；不安排底盘/机械臂动作顺序 |
 | `src/visualization/mpc_visualizer.cpp` | TCP 位姿、两色轨迹、分身及其时间对齐 |
 | `plugin/tcp_rviz.cpp` | 可拖动的单 TCP 坐标轴、坐标输入、完整位姿输入和误差显示 |
 
@@ -163,13 +163,13 @@ ros2 topic echo /fsm_state --once
 ## 无界面运行与移动底盘输出
 
 单臂 `mpc_mock.launch.py show_rviz:=false` 可关闭窗口。以下是移动底盘输出配置说明，
-不能直接用于本节的固定底座 mock，也不表示已有 Z2 真机启动入口。
+不能直接用于本节的固定底座 mock；Z2 的集成启动与真机验收开关见 `z2_bringup/README.md`。
 
-按底盘驱动能力选择 profile，而不是按真机/mock 区分。Z2 的全向 swerve 控制器使用
+按底盘驱动能力选择 profile，而不是按真机/mock 区分。支持完整全向命令的后端使用
 `base_command_profile: omni`，允许带符号的 `vx/vy/wz`，支持倒退、横移、斜移和旋转。
-只有不支持横移与旋转同时执行的旧后端才选择 `ranger`。启用分阶段控制时，该 profile 在接近和协同阶段
-约束横向速度为零，使用前后移动、原地转向或弧线转向，匹配该旧后端的命令组合。
-未启用分阶段控制时，原输出适配仍在横移命令存在时抑制旋转。
+不支持横移与旋转同时执行的旧后端使用 `ranger`：在优化问题中始终约束车体横向速度 `vy=0`，
+执行端同步去除数值残差，允许前后移动、转向与机械臂同时优化。不再在输出端临时切换横移/转向模式。
+当前 Z2 配置仍采用此保守 profile；切到 `omni` 前必须验证底盘后端的实际组合运动能力。
 `base_max_linear_speed`、`base_max_angular_speed` 分别限制平面速度和角速度；0 表示不额外限幅。
 默认 `omni` 不增加这些非完整运动约束。这些设置在初始化时读取，修改后需重新加载控制器。
 
@@ -381,82 +381,30 @@ colcon test --packages-select mpc_controller
 colcon test-result --verbose
 ```
 
-## 机械臂优先与底盘接近
+## 底盘与机械臂联合优化
 
-移动底盘模型可以启用 `staged_motion_enabled`（单臂 mock 关闭）。
-MPC 根据目标到机械臂 `base_link` 原点的三维距离分配运动：
+移动底盘模型将底盘位姿和关节角放入同一个 OCS2 问题，TCP 代价与输入代价持续生效。
+底盘和机械臂从收到目标起即可同时运动；实际如何分配运动由模型、限位和代价决定，
+并不强制每次都移动底盘，也不保证两者在指定时刻一起到位。
 
-- 目标在完整操作半径 `R` 内时，先由机械臂跟踪，不以停车半径限制正常跟踪。
-- 距离超过 `R + reach_switch_margin` 后，底盘平移接近；停车目标设为约 `0.65 × R`，
-  到停车点 2.5 cm 内才停止接近，不会刚进入最大伸展半径就停车。
-  目标高度较高时，停车距离适当增大以保留水平距离；这不是底盘碰撞避障距离。
-- 底盘接近期间允许平移和转向，使车身正前方逐渐朝向目标，机械臂保持进入该阶段时的关节姿态。
-  停车位置会补偿机械臂安装偏移随车身旋转的变化；位置误差与朝向误差都满足容差后才停车。
-  朝向采用最短角度差，跨越 ±π 时不会绕远路。
-- 若设置 `base_approach_keep_heading: true`，接近阶段改为保持开始接近时的车头朝向，
-  停车点仍沿机械臂安装点到目标的方向选择，不把平移方向绑定到车头方向。
-  配合 `omni` 可直接倒退、横移和斜移；同一目标下不会因轻微朝向漂移反复重设目标朝向。
-  这只约束接近阶段，后续 `whole_body_tracking` 仍可由 MPC 联合优化旋转与机械臂。
-- TCP 位置误差大于 2 cm 或姿态误差大于 0.12 rad，且综合误差连续 2 秒未改善至少 3 mm，
-  自动进入 `whole_body_tracking`：恢复 TCP 代价，释放底盘及机械臂输入，由 MPC 协同跟踪。
-  停滞判断使用实测关节状态的 FK；综合误差为 `hypot(位置误差, 0.1 × 姿态误差)`。
-  目标位置相对检测起点变化超过 3 cm，或姿态变化超过 0.15 rad，会重新计时。
-- 协同阶段到达上述误差阈值后进入停稳等待；若连续 4 秒也没有进一步改善，结束该次协同尝试，
-  同一目标不会反复启动底盘。更换目标或误差重新收敛后允许下一次尝试。
-- 停车或协同结束后，里程计平移速度低于 0.01 m/s、角速度低于 0.02 rad/s，
-  且连续保持 0.25 秒，才恢复单臂 TCP 跟踪。新选的范围内目标会取消旧停车任务并等待停稳。
+本地的 `StagedMotion` 已删除，包括距离球判定、停车点引导、先底盘后机械臂的输入锁定、
+停滞后才协同的状态机及 `/mpc_controller/motion_phase` 话题。
+旧的 `staged_motion_enabled`、`arm_workspace_frame`、`arm_reach_radius`、
+`reach_switch_margin`、`base_parking_*`、`base_heading_tolerance`、
+`base_approach_keep_heading`、`tracking_stall_seconds`、`tracking_position_tolerance`、
+`tracking_orientation_tolerance`、`tracking_progress_threshold`、
+`assist_no_progress_seconds` 和 `base_settle_seconds` 不再使用，请从私有配置中移除。
+不再提供基于估算操作半径的 `unreachable_height` 拦截；上层仍须验证目标可达性和工作空间。
+不要把求解器返回策略等同于目标可达或路径无碰撞。
 
-`R` 在控制器初始化时从当前规划 URDF 估算：在六个关节限位内做 4096 个确定性采样，
-再局部细化最大 TCP 距离。计算采用当前 `omni_picker_tcp` 和实际安装变换。
-这是位置包络估计，不能保证范围内任意末端姿态均可达；可用 `arm_reach_radius`（米）覆盖。
-若目标高度本身超出整个半径，则保持位置并报告 `unreachable_height`，新目标回到可达高度后自动恢复。
+`ranger` 仅保留独立的底盘运动学约束 `vy=0`，不锁机械臂，不指定停车点或转向时序；
+`omni` 不添加该约束。两者均保留既有输出限速、死区、里程计检查、策略超时和暂停/故障处理。
+单臂模型不添加底盘约束。没有修改上游 OCS2，也没有增加新的同步到达算法。
 
-移动底盘接线时可在控制器参数中配置下列值，修改后重新加载控制器；
-示例不代表当前 Z2 仓库的默认参数或真机验收结果：
-
-| 参数 | 示例配置 | 说明 |
-| --- | --- | --- |
-| `staged_motion_enabled` | `true` | 启用分阶段控制；单机械臂默认关闭 |
-| `arm_workspace_frame` | `base_link` | 位于所有机械臂活动关节之前的安装坐标系 |
-| `arm_reach_radius` | `0.0` | 0 表示按 URDF 估算，正数指定半径（米） |
-| `reach_switch_margin` | `0.02` | 超出半径多少米才启动远目标接近 |
-| `base_parking_radius_ratio` | `0.65` | 远目标停车半径比例，不限制单臂跟踪范围 |
-| `base_parking_tolerance` | `0.025` | 底盘到停车点的距离容差，米 |
-| `base_heading_tolerance` | `0.08` | 车身停车朝向容差，弧度，约 4.6° |
-| `base_command_profile` | `omni` | 全向 swerve；`ranger` 是横移/旋转互斥的旧后端约束 |
-| `base_approach_keep_heading` | `true` | 接近阶段保持入口朝向；默认 false 保留朝向目标的旧行为 |
-| `tracking_stall_seconds` | `2.0` | 跟踪无明显进展后允许底盘协助的等待时间，秒 |
-| `tracking_position_tolerance` | `0.02` | 停滞判断的位置误差阈值，米 |
-| `tracking_orientation_tolerance` | `0.12` | 停滞判断的姿态误差阈值，弧度 |
-| `tracking_progress_threshold` | `0.003` | 重置停滞计时所需的综合误差改善量，米 |
-| `assist_no_progress_seconds` | `4.0` | 协同阶段无进一步改善时结束本次尝试，秒 |
-| `base_settle_seconds` | `0.25` | 底盘连续停稳的等待时间 |
-| `base_max_linear_speed` | `0.15` | 底盘平移合速度上限，m/s |
-| `base_max_angular_speed` | `0.3` | 旋转速度上限，rad/s；真机值需单独验证 |
-
-本地 `control/StagedMotion.cpp` 在上游问题的副本中添加输入等式约束。
-接近阶段暂停 TCP 代价，使用底盘位置与朝向代价，并以关节速度等式约束锁住机械臂。
-全向底盘的平移仍由 MPC 优化，转向采用有界朝向反馈，并作为输入等式约束进入预测；
-执行端使用同一反馈和实测朝向，避免预测转向与输出限速不一致造成反复修正。
-朝向误差在 0.02 rad 内停止修正，外侧平滑增加角速度；停车朝向容差仍为 0.08 rad。
-朝向代价为 `0.5 × 1.0 × wrap(yaw - yaw_goal)^2`，位置代价仍为 `0.5 × 50 × ||p - p_goal||²`。
-旧后端配置 `base_command_profile: ranger` 在接近与协同阶段额外约束横向速度为零，采用前后移动与转向，
-Ranger 接近阶段使用停车点引导：转向速度随朝向误差平滑变化，平移速度随到点距离及转向角减小，
-防止受转向限速影响而绕着停车点打圈。该引导作为 MPC 输入等式约束用于预测，输出端执行同一引导；
-前进或后退方向在选定停车点时固定，避免经过侧向位置时反复翻转转向要求；朝向偏差超过 90° 时先转向再平移。
-接近阶段不再单独优化 Ranger 的速度输入，协同跟踪阶段仍由 MPC 优化前后移动、转向及机械臂。
-仅在执行 Ranger 接近任务时允许低于空闲死区的减速命令，到点后由停稳阶段明确发送零速度。
-驶入停车容差的 0.6 倍范围后锁住平移、原地完成最终朝向；只有偏离超过容差的 2 倍才重新驶入，
-避免停车点附近反复切换驶入与对正。正常停车位置容差不变。
-该 profile 的规划和输出都避免同时发送横移与旋转；`omni` 不受此限制。
-输出端同步保持进入该阶段时的关节位置，避免旧策略或插值引入关节动作。
-停稳后恢复单臂 TCP 跟踪并锁住底盘；协同阶段直接使用原 TCP 代价并开放底盘和机械臂输入。
-预测与控制使用同一次求解，分身反映接近阶段的关节保持及协同阶段的跟踪动作。
-扩展使用 OCS2 公共接口，无需修改上游目录。
-
-`/mpc_controller/motion_phase` 发布当前阶段：
-`arm_tracking`、`base_approach`、`whole_body_tracking`、`base_settling` 或 `unreachable_height`。
-暂停/恢复会重置阶段，并以当前 TCP 初始化目标。
+`task.info` 中 `inputCost.R.base/arm` 影响运动分配，`endEffector` 与
+`finalEndEffector` 影响 TCP 跟踪；不同量纲的权重不能直接解释为运动比例。
+当前 `mpc.timeHorizon` 是滚动预测时域，不是完成期限。
+删除分阶段策略不会自动启用碰撞检查；原有 commissioning 配置的避障限制仍然有效。
 
 ## 预测轨迹与分身的时间对齐
 

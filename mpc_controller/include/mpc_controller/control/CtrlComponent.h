@@ -21,7 +21,6 @@
 #include <mpc_controller/runtime/RtCycleTiming.h>
 #include <mpc_controller/visualization/mpc_visualizer.h>
 
-#include <mpc_controller/control/StagedMotion.h>
 #include <mpc_controller/control/ControlSafety.h>
 #include <mpc_controller/control/TcpReferenceManager.h>
 #include <mpc_controller/control/TcpTrajectoryRecorder.h>
@@ -164,17 +163,6 @@ namespace zephyr::mpc {
         std::string base_command_profile_{"omni"};
         double base_max_linear_speed_{0.0};
         double base_max_angular_speed_{0.0};
-
-        struct StagedPolicy
-        {
-            StagedMotionState stage;
-            uint64_t epoch{0};
-        };
-        std::shared_ptr<StagedReferenceManager> staged_reference_;
-        std::shared_ptr<const StagedPolicy> staged_policy_; // atomic solver -> RT handoff
-        MotionPhase applied_motion_phase_{MotionPhase::Arm}; // RT only
-        vector_t held_arm_positions_; // Held during base approach, settling, and unreachable-height phases.
-        rclcpp::Publisher<std_msgs::msg::String>::SharedPtr motion_phase_publisher_;
 
         // Visualization component
         std::unique_ptr<zephyr::mpc_visualization::mpc_visualizer> visualizer_;
