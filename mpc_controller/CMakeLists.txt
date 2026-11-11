@@ -35,6 +35,8 @@ add_library(${controller_target} SHARED
   src/control/TcpKinematics.cpp
   src/control/TcpReferenceManager.cpp
   src/control/MotionActionServer.cpp
+  src/control/RuntimeMotionProfile.cpp
+  src/control/MotionProfileServer.cpp
   src/control/TcpTrajectoryRecorder.cpp
   src/visualization/mpc_visualizer.cpp)
 set_target_properties(${controller_target} PROPERTIES OUTPUT_NAME ${PROJECT_NAME})
@@ -93,6 +95,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_reference_handoff ${controller_target} Threads::Threads)
   ament_add_gtest(test_motion_action test/test_motion_action.cpp)
   target_link_libraries(test_motion_action ${controller_target} Threads::Threads)
+  ament_add_gtest(test_runtime_motion_profile test/test_runtime_motion_profile.cpp)
+  target_link_libraries(test_runtime_motion_profile ${controller_target} Threads::Threads)
+  ament_add_gtest(test_motion_profile_server test/test_motion_profile_server.cpp)
+  target_link_libraries(test_motion_profile_server ${controller_target} Threads::Threads)
   ament_add_gtest(test_tcp_visualizer test/test_tcp_visualizer.cpp)
   target_link_libraries(test_tcp_visualizer ${controller_target} Threads::Threads)
   ament_add_gtest(test_tcp_trajectory_recorder

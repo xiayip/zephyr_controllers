@@ -23,6 +23,8 @@
 
 #include <mpc_controller/control/ControlSafety.h>
 #include <mpc_controller/control/TcpReferenceManager.h>
+#include <mpc_controller/control/MotionRuntime.h>
+#include <mpc_controller/control/RuntimeMotionProfile.h>
 #include <mpc_controller/control/TcpTrajectoryRecorder.h>
 #include <ocs2_core/Types.h>
 #include <ocs2_mobile_manipulator/MobileManipulatorInterface.h>
@@ -54,7 +56,8 @@ namespace zephyr::mpc {
     {
     public:
         explicit CtrlComponent(const std::shared_ptr<rclcpp_lifecycle::LifecycleNode>& node,
-                               CtrlInterfaces& ctrl_interfaces);
+                               CtrlInterfaces& ctrl_interfaces,
+                               std::shared_ptr<MotionRuntime> motion_runtime = nullptr);
         ~CtrlComponent();
 
         /** Commit only complete, finite feedback. False means hold outputs this cycle. */
@@ -62,6 +65,8 @@ namespace zephyr::mpc {
         const std::array<double, 7>& measuredTcpPose() const { return measured_tcp_pose_; }
         /** False is a latched execution fault; outputs are already held. */
         bool evaluatePolicy(const rclcpp::Time& time);
+        /** RT-only: active policy and profile transition gate both match the request. */
+        bool profileOutputReady() const;
         /** Command the mobile base. The default zero command is used outside OCS2 mode. */
         bool stopMobileBase() const;
         /** Reset only after the solver is idle and the reference reset is acknowledged.
@@ -121,6 +126,7 @@ namespace zephyr::mpc {
         /** True after first successful updatePolicy() swap; cleared in resetMpc(). */
         bool policy_active_{false};
         std::shared_ptr<TcpReferenceManager> pose_reference_manager_;
+        std::shared_ptr<RuntimeMotionProfile> runtime_profile_;
         TcpTrajectoryRecorder recorder_;
 
         // Observation state
@@ -139,6 +145,7 @@ namespace zephyr::mpc {
 
         std::shared_ptr<rclcpp_lifecycle::LifecycleNode> node_;
         CtrlInterfaces& ctrl_interfaces_;
+        std::shared_ptr<MotionRuntime> motion_runtime_;
 
         rclcpp::Publisher<ocs2_msgs::msg::MpcObservation>::SharedPtr mpc_observation_publisher_;
         rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr base_command_publisher_;

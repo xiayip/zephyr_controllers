@@ -179,6 +179,13 @@ namespace zephyr::mpc
         sample.received_ns = motionSteadyNs();
         sample.valid = valid;
         sample.stop_ack = action_stop && held ? stop_token : 0;
+        const auto& profile = ctrl_comp_->runtime_profile_->activeConfig();
+        // MRT observers retain their last slot across reset; do not advertise
+        // that retired revision while waiting for the first replacement policy.
+        sample.profile_revision = ctrl_comp_->policy_active_ ? profile.revision : 0;
+        sample.profile_base_mode = profile.base_mode;
+        sample.profile_tcp_cost_scale = profile.tcp_cost_scale;
+        sample.profile_input_cost_scale = profile.input_cost_scale;
         sample.reason = motion_fault_.load();
         if (action_stop) sample.state = MotionStatus::STOPPING;
         else if (!valid) {
@@ -188,7 +195,8 @@ namespace zephyr::mpc
         else if (pause_requested_) {
             sample.state = MotionStatus::PAUSED;
             sample.reason = MotionStatus::PAUSE_REQUESTED;
-        } else sample.state = tracking_active_ && ctrl_comp_->policy_active_ ? MotionStatus::IDLE : MotionStatus::INITIALIZING;
+        } else sample.state = tracking_active_ && ctrl_comp_->policy_active_ && ctrl_comp_->profileOutputReady() ?
+            MotionStatus::IDLE : MotionStatus::INITIALIZING;
         motion_runtime_->samples.tryWrite(sample);
         ctrl_comp_->endRtCycle(tracking_active_ ? "ocs2" : "paused");
         return controller_interface::return_type::OK;
@@ -213,7 +221,7 @@ namespace zephyr::mpc
             ik_options.damping = auto_declare<double>("kinematics.damping", 0.01);
             ik_options.timeout = auto_declare<double>("kinematics.timeout", 0.1);
             ik_options.random_restart = auto_declare<bool>("kinematics.random_restart", false);
-            ctrl_comp_ = std::make_shared<CtrlComponent>(get_node(), ctrl_interfaces_);
+            ctrl_comp_ = std::make_shared<CtrlComponent>(get_node(), ctrl_interfaces_, motion_runtime_);
             const auto& info = ctrl_comp_->interface_->getManipulatorModelInfo();
             const auto model = makeTcpKinematicsModel(
                 ctrl_comp_->interface_->getPinocchioInterface().getModel(), joint_names_, info.baseFrame);
@@ -233,6 +241,9 @@ namespace zephyr::mpc
     {
         if (!motion_server_) motion_server_ = std::make_unique<MotionActionServer>(
             get_node(), ctrl_comp_->pose_reference_manager_, motion_runtime_);
+        if (!profile_server_) profile_server_ = std::make_unique<MotionProfileServer>(
+            get_node(), ctrl_comp_->pose_reference_manager_, ctrl_comp_->runtime_profile_,
+            motion_runtime_);
         tracking_status_publisher_ = get_node()->create_publisher<std_msgs::msg::Int32>(
             "/fsm_state", rclcpp::QoS(1).transient_local());
         // Periodic status also supports clients using volatile QoS.

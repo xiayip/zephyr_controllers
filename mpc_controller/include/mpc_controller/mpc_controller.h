@@ -22,6 +22,7 @@
 #include <mpc_controller/control/JointInterfaces.h>
 #include "mpc_controller/control/TcpKinematics.h"
 #include "mpc_controller/control/MotionActionServer.h"
+#include "mpc_controller/control/MotionProfileServer.h"
 namespace zephyr::mpc
 {
 /** Runs only OCS2. Solver work stays off the controller_manager update thread. */
@@ -111,6 +112,7 @@ private:
         std::atomic<uint16_t> motion_fault_{MotionStatus::NONE};
         std::shared_ptr<MotionRuntime> motion_runtime_{std::make_shared<MotionRuntime>()};
         std::unique_ptr<MotionActionServer> motion_server_;
+        std::unique_ptr<MotionProfileServer> profile_server_;
         std::shared_ptr<CtrlComponent> ctrl_comp_;
         std::unique_ptr<MpcExecution> execution_;
 

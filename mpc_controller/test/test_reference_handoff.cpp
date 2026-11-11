@@ -57,6 +57,13 @@ protected:
         }
         return reference->resetReady();
     }
+    void spinFor(std::chrono::milliseconds duration) {
+        const auto deadline = std::chrono::steady_clock::now() + duration;
+        while (std::chrono::steady_clock::now() < deadline) {
+            executor.spin_some();
+            std::this_thread::sleep_for(1ms);
+        }
+    }
     ocs2::vector_t committedTarget() {
         wrapped->preSolverRun(10, 11, ocs2::vector_t::Zero(6));
         return wrapped->getTargetTrajectories().stateTrajectory.front();
@@ -226,4 +233,115 @@ TEST_F(ReferenceHandoff, DoesNotAdvertiseCustomMotionServices) {
         for (const auto& type : types)
             EXPECT_EQ(type.find("zephyr_msgs/"), std::string::npos);
     }
+}
+
+TEST_F(ReferenceHandoff, ProfileHoldReplacesTrajectoryAndBlocksEveryInputAcrossPauseResume) {
+    ocs2::SystemObservation observation;
+    observation.time = 10;
+    reference->setCurrentObservation(observation);
+    ASSERT_TRUE(reference->requestReset(pose, 10));
+    ASSERT_TRUE(spinUntilReset());
+    reference->setAcceptingTargets(true);
+    geometry_msgs::msg::PoseStamped target;
+    target.header.frame_id = "base";
+    target.pose.position.x = 0.1;
+    target.pose.position.y = 0.2;
+    target.pose.position.z = 0.9;
+    target.pose.orientation.w = 1;
+    send("tcp_target/stamped", target);
+    ASSERT_GT(wrapped->getTargetTrajectories().stateTrajectory.size(), 1u);
+
+    auto measured = pose;
+    measured(2) = 0.32;
+    ASSERT_TRUE(reference->beginProfileChange(measured));
+    EXPECT_EQ(committedTarget(), measured);
+    EXPECT_EQ(wrapped->getTargetTrajectories().stateTrajectory.size(), 1u);
+    EXPECT_FALSE(reference->claimMotion());
+    reference->setAcceptingTargets(false);
+    reference->setAcceptingTargets(true);  // Lifecycle resume cannot release the profile gate.
+    EXPECT_FALSE(reference->claimMotion());
+
+    send("tcp_target", target.pose);
+    EXPECT_EQ(committedTarget(), measured);
+    send("tcp_target/stamped", target);
+    EXPECT_EQ(committedTarget(), measured);
+    geometry_msgs::msg::TwistStamped delta;
+    delta.twist.linear.z = 0.2;
+    send("tcp_target/relative", delta);
+    EXPECT_EQ(committedTarget(), measured);
+    send("tcp_target/twist", delta.twist);
+    observation.time = 10.05;
+    reference->setCurrentObservation(observation);
+    spinFor(30ms);
+    EXPECT_EQ(committedTarget(), measured);
+    nav_msgs::msg::Path path;
+    path.header.frame_id = "base";
+    path.poses.push_back(target);
+    send("target_path", path);
+    EXPECT_EQ(committedTarget(), measured);
+
+    measured(2) = 0.33;  // Retrying an unacknowledged change refreshes its measured hold.
+    ASSERT_TRUE(reference->beginProfileChange(measured));
+    EXPECT_EQ(committedTarget(), measured);
+    EXPECT_FALSE(reference->claimMotion());
+}
+
+TEST_F(ReferenceHandoff, ProfileChangeCannotStealMotionAndInvalidHoldDoesNotReserveInputs) {
+    ASSERT_TRUE(reference->requestReset(pose, 10));
+    ASSERT_TRUE(spinUntilReset());
+    reference->setAcceptingTargets(true);
+    ASSERT_TRUE(reference->claimMotion());
+    EXPECT_FALSE(reference->beginProfileChange(pose));
+    EXPECT_TRUE(reference->motionSessionValid());
+    reference->releaseMotion();
+
+    auto invalid = pose;
+    invalid.tail<4>().setZero();
+    EXPECT_FALSE(reference->beginProfileChange(invalid));
+    invalid = pose;
+    invalid(0) = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(reference->beginProfileChange(invalid));
+    EXPECT_FALSE(reference->beginProfileChange(ocs2::vector_t::Zero(6)));
+    ASSERT_TRUE(reference->claimMotion());
+    reference->releaseMotion();
+    ASSERT_TRUE(reference->beginProfileChange(pose));
+    EXPECT_FALSE(reference->claimMotion());
+    reference->endProfileChange();
+    EXPECT_TRUE(reference->claimMotion());
+    reference->releaseMotion();
+}
+
+TEST_F(ReferenceHandoff, ProfileReleaseNeverReplaysCachedTwistAndAcceptsFreshTargets) {
+    ocs2::SystemObservation observation;
+    observation.time = 10;
+    reference->setCurrentObservation(observation);
+    ASSERT_TRUE(reference->requestReset(pose, 10));
+    ASSERT_TRUE(spinUntilReset());
+    reference->setAcceptingTargets(true);
+    geometry_msgs::msg::Twist twist;
+    twist.linear.x = 0.1;
+    send("tcp_target/twist", twist);
+    observation.time = 10.05;
+    reference->setCurrentObservation(observation);
+    spinFor(20ms);
+    ASSERT_GT(committedTarget()(0), pose(0));  // The cached stream was active before the handoff.
+
+    auto measured = pose;
+    measured(2) = 0.34;
+    ASSERT_TRUE(reference->beginProfileChange(measured));
+    reference->endProfileChange();
+    observation.time = 10.10;
+    reference->setCurrentObservation(observation);
+    spinFor(20ms);  // Less than the 200 ms twist watchdog: cancellation, not expiry, must hold it.
+    EXPECT_EQ(committedTarget(), measured);
+
+    geometry_msgs::msg::Pose fresh;
+    fresh.position.x = 0.1;
+    fresh.position.y = 0.2;
+    fresh.position.z = 0.36;
+    fresh.orientation.w = 1;
+    send("tcp_target", fresh);
+    EXPECT_DOUBLE_EQ(committedTarget()(2), 0.36);
+    EXPECT_TRUE(reference->claimMotion());
+    reference->releaseMotion();
 }

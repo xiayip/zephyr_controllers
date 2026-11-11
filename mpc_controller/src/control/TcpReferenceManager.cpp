@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Zephyr adaptation of fiveages-sim/arms_ros2_control; see UPSTREAM.md.
 #include "mpc_controller/control/TcpReferenceManager.h"
+#include "mpc_controller/control/RuntimeMotionProfile.h"
 
 #include <Eigen/Geometry>
 #include <algorithm>
@@ -58,6 +59,17 @@ TcpReferenceManager::TcpReferenceManager(
       base_frame_(std::move(base_frame)), tcp_frame_(std::move(tcp_frame)),
       input_dim_(input_dim), target_(vector_t::Zero(7)) {
   target_(6) = 1.0;
+}
+void TcpReferenceManager::setRuntimeProfile(std::shared_ptr<RuntimeMotionProfile> profile) {
+  runtime_profile_ = std::move(profile);
+}
+void TcpReferenceManager::preSolverRun(scalar_t init_time, scalar_t final_time,
+                                     const vector_t& initial_state) {
+  // Capture profile FIRST. A new profile is submitted only after its measured
+  // hold reference was queued; the reverse ordering could pair a new revision
+  // with the preceding motion's reference for one solve.
+  if (runtime_profile_) runtime_profile_->captureBeforeReferenceUpdate();
+  referenceManagerPtr_->preSolverRun(init_time, final_time, initial_state);
 }
 void TcpReferenceManager::subscribe(
     const rclcpp_lifecycle::LifecycleNode::SharedPtr &node) {
@@ -124,7 +136,8 @@ void TcpReferenceManager::subscribe(
           if (!std::isfinite(v))
             return;
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!target_session_.accepts(session) || motion_owned_ || generation != input_generation_.load())
+        if (!target_session_.accepts(session) || motion_owned_ || profile_change_pending_ ||
+            generation != input_generation_.load())
           return;
         target_ = sample(time_);
         twist_ = *p;
@@ -161,7 +174,8 @@ void TcpReferenceManager::acceptPose(const geometry_msgs::msg::PoseStamped &p,
   if (!transform(p, goal))
     return;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!target_session_.accepts(session) || motion_owned_ || generation != input_generation_.load())
+  if (!target_session_.accepts(session) || motion_owned_ || profile_change_pending_ ||
+      generation != input_generation_.load())
     return;
   twist_active_ = false;
   try {
@@ -190,7 +204,8 @@ void TcpReferenceManager::acceptRelative(
     if (!translation.allFinite() || !rotation.allFinite())
       throw std::invalid_argument("Invalid relative target");
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!target_session_.accepts(session) || motion_owned_ || generation != input_generation_.load())
+    if (!target_session_.accepts(session) || motion_owned_ || profile_change_pending_ ||
+        generation != input_generation_.load())
       return;
     vector_t goal = sample(time_);
     Eigen::Quaterniond frame = Eigen::Quaterniond::Identity();
@@ -231,7 +246,8 @@ void TcpReferenceManager::acceptPath(const nav_msgs::msg::Path &path) {
   if (!transformPath(path, goals))
     return;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!target_session_.accepts(session) || motion_owned_ || generation != input_generation_.load())
+  if (!target_session_.accepts(session) || motion_owned_ || profile_change_pending_ ||
+      generation != input_generation_.load())
     return;
   try {
     twist_active_ = false;
@@ -293,7 +309,7 @@ void TcpReferenceManager::plan(const std::vector<vector_t> &goals,
 
 bool TcpReferenceManager::claimMotion() {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (motion_owned_ || !target_session_.token()) return false;
+  if (motion_owned_ || profile_change_pending_ || !target_session_.token()) return false;
   motion_owned_ = true;
   motion_session_ = target_session_.token();
   ++input_generation_;
@@ -308,7 +324,28 @@ void TcpReferenceManager::releaseMotion() {
 }
 bool TcpReferenceManager::motionSessionValid() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return motion_owned_ && target_session_.accepts(motion_session_);
+  return motion_owned_ && !profile_change_pending_ && target_session_.accepts(motion_session_);
+}
+bool TcpReferenceManager::beginProfileChange(const vector_t& measured_pose) {
+  if (measured_pose.size() != 7 || !measured_pose.allFinite() ||
+      !std::isfinite(measured_pose.tail<4>().norm()) || measured_pose.tail<4>().norm() < 1e-9)
+    return false;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (motion_owned_) return false;
+  profile_change_pending_ = true;
+  ++input_generation_;
+  twist_active_ = false;
+  target_ = measured_pose;
+  target_.tail<4>().normalize();
+  time_ = last_time_ = observation_time_.load(std::memory_order_acquire);
+  commitImmediate();
+  publish();
+  return true;
+}
+void TcpReferenceManager::endProfileChange() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  profile_change_pending_ = false;
+  ++input_generation_;
 }
 bool TcpReferenceManager::startMotion(
     const zephyr_msgs::action::ExecuteCartesianMotion::Goal& request,
@@ -317,7 +354,7 @@ bool TcpReferenceManager::startMotion(
   using Goal = zephyr_msgs::action::ExecuteCartesianMotion::Goal;
   std::lock_guard<std::mutex> lock(mutex_);
   try {
-    if (!motion_owned_ || !target_session_.accepts(motion_session_))
+    if (!motion_owned_ || profile_change_pending_ || !target_session_.accepts(motion_session_))
       throw std::runtime_error("Controller no longer ready for this motion");
     vector_array_t goals;
     if (request.mode == Goal::RELATIVE) {
@@ -414,7 +451,7 @@ void TcpReferenceManager::updateReference() {
   const double dt = now - last_time_;
   time_ = now;
   last_time_ = time_;
-  if (!target_session_.token()) {
+  if (!target_session_.token() || profile_change_pending_) {
     twist_active_ = false;
     return;
   }

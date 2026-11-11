@@ -412,6 +412,45 @@ colcon test-result --verbose
 当前 `mpc.timeHorizon` 是滚动预测时域，不是完成期限。
 删除分阶段策略不会自动启用碰撞检查；原有 commissioning 配置的避障限制仍然有效。
 
+## 运行时运动配置与底盘固定
+
+`~/set_motion_profile`（`zephyr_msgs/srv/SetMotionProfile`）用于空闲时切换同一
+MPC 控制器的运动约束。当前支持：
+
+| 字段 | 取值 | 含义 |
+| --- | --- | --- |
+| `base_mode` | `COORDINATED`（0，默认） | 底盘和机械臂联合优化；Ranger 保留 `vy=0` |
+| `base_mode` | `LOCKED`（1） | MPC 求解约束 `vx=vy=wz=0`，MPC 底盘输出为零速 |
+| `tcp_cost_scale` | 默认 `1.0` | `.info` 中末端中间/终端代价的倍率，范围 0.1～10 |
+| `input_cost_scale` | 默认 `1.0` | `.info` 中输入代价的倍率，范围 0.1～10 |
+
+这些倍率不是速度或加速度限制。有限运动仍使用 Action 的 `speed_scale`；
+机器人模型、维度、硬件接口和求解器结构仍在初始化时读取。
+默认配置保留原来的权重和联合运动行为，固定机械臂模型不会把前三个臂关节误当底盘锁定。
+
+控制器需已激活、反馈有效且无正在执行的 Action。配置请求会清除旧目标并保持输出，
+以实测 TCP 建立保持目标，再把新配置交给求解线程。参考与配置在一次求解内保持一致，
+MRT 策略携带对应配置版本；控制线程只有取得匹配版本的策略且反馈有效后才放行。
+
+```bash
+ros2 service call /mpc_controller/set_motion_profile zephyr_msgs/srv/SetMotionProfile \
+  '{profile: {base_mode: 1, tcp_cost_scale: 1.0, input_cost_scale: 1.0}}'
+ros2 topic echo /mpc_controller/motion_profile_status
+```
+
+服务返回 `accepted=true` 只表示接收请求。任务层必须等待
+`motion_profile_status.applied=true`，并确认 `active_revision` 等于服务返回的
+`revision`，才发送新的 `execute_motion` 或连续目标。切换期间普通目标和新 Action 均被拒绝。
+恢复联合运动使用同一服务，设置 `base_mode: 0`。切换不会恢复旧的 MPC 目标，
+需发送新目标；已选择配置后停用并重新激活 MPC，也需重新确认配置。
+
+`applied` 仅确认 MPC 配置及对应策略已生效，不代表底盘实际停稳或底盘控制权已独占。
+这一版不修改底盘驱动，也不引入底盘指令仲裁；`LOCKED` 只约束 MPC 的预测和输出，
+其他节点仍可向底盘发送速度。任务层需要协调其他速度源，并通过实际反馈判断停稳。
+
+这一阶段尚未增加连续视觉目标的任务会话、定时底盘目标或巡航约束，
+也不改变 `.info` 中的碰撞开关。任务语义与抓放阶段仍由 BT/任务节点负责。
+
 ## 预测轨迹与分身的时间对齐
 
 求解工作线程在一次 MPC 求解结束后，通过 OCS2 公共 `getPrimalSolution(getFinalTime(), ...)`
@@ -552,5 +591,6 @@ ros2 action send_goal /mpc_controller/execute_motion \
 ros2 topic echo /mpc_controller/motion_status
 ```
 
-第一阶段未增加底盘锁定、关节姿态代价、MoveIt 场景检查、动态 `.info` 切换或连续视觉目标。
+底盘固定通过前述 `~/set_motion_profile` 在动作开始前配置。关节姿态代价、MoveIt 场景检查、
+动态 `.info` 切换和连续视觉目标任务会话留待后续实现。
 `ArmTapBT` 在任务层组合接近/按压/退回；控制器中没有按钮专用阶段和业务判断。

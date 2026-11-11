@@ -5,7 +5,6 @@
 //
 
 #include "mpc_controller/control/CtrlComponent.h"
-#include "mpc_controller/control/BaseKinematics.h"
 
 #include <mpc_controller/runtime/ThreadScheduling.h>
 #include <ocs2_core/thread_support/ThreadPool.h>
@@ -85,8 +84,9 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
     }
 
     CtrlComponent::CtrlComponent(const std::shared_ptr<rclcpp_lifecycle::LifecycleNode>& node,
-                                 CtrlInterfaces& ctrl_interfaces)
-        : node_(node), ctrl_interfaces_(ctrl_interfaces)
+                                 CtrlInterfaces& ctrl_interfaces,
+                                 std::shared_ptr<MotionRuntime> motion_runtime)
+        : node_(node), ctrl_interfaces_(ctrl_interfaces), motion_runtime_(std::move(motion_runtime))
     {
         // Match ControllerInterface::auto_declare, including predeclared overrides.
         const auto auto_declare = [this](const std::string& name, const auto& value) {
@@ -318,14 +318,12 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             interface_->getManipulatorModelInfo().eeFrame,
             interface_->getManipulatorModelInfo().inputDim);
         pose_reference_manager_->subscribe(node_);
+        runtime_profile_ = std::make_shared<RuntimeMotionProfile>();
+        pose_reference_manager_->setRuntimeProfile(runtime_profile_);
         // Extend a copy of the upstream problem through public APIs only.
         auto problem = interface_->getOptimalControlProblem();
-        if (mobile_base_enabled_ && base_command_profile_ == "ranger")
-        {
-            const auto& model_info = interface_->getManipulatorModelInfo();
-            problem.equalityConstraintPtr->add("baseNoLateralVelocity",
-                makeNoLateralVelocityConstraint(model_info.stateDim, model_info.inputDim));
-        }
+        decorateProblem(problem, runtime_profile_, mobile_base_enabled_,
+                        base_command_profile_ == "ranger", info.stateDim, info.inputDim);
         prepareThreadIsolation();
         mpc_ = std::make_unique<GaussNewtonDDP_MPC>(
             interface_->mpcSettings(),
@@ -336,8 +334,10 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         ocs2::ThreadPool::setLaunchWorkerCpuAffinity({});
 
         mpc_mrt_interface_ = std::make_unique<MPC_MRT_Interface>(*mpc_);
+        mpc_mrt_interface_->addMrtObserver(runtime_profile_);
 
         mpc_->getSolverPtr()->setReferenceManager(pose_reference_manager_);
+        mpc_->getSolverPtr()->addSynchronizedModule(runtime_profile_);
 
         observation_.state = interface_->getInitialState();
         observation_.input = vector_t::Zero(interface_->getManipulatorModelInfo().inputDim);
@@ -620,6 +620,14 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         return true;
     }
 
+    bool CtrlComponent::profileOutputReady() const
+    {
+        const bool current_revision =
+            runtime_profile_->activeConfig().revision == runtime_profile_->requestedRevision();
+        if (!motion_runtime_) return current_revision;
+        return current_revision && motion_runtime_->profile_output_allowed.load(std::memory_order_acquire);
+    }
+
     bool CtrlComponent::evaluatePolicy(const rclcpp::Time& time)
     {
         auto eval_scope = rt_timing_.scope(&rt_timing_.eval_us);
@@ -650,7 +658,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         // Always feed real feedback back into MPC, including while holding for
         // a policy handoff. Commands are never substituted as observations.
         mpc_mrt_interface_->setCurrentObservation(measured_observation_);
-        if (!policy_active_)
+        if (!policy_active_ || !profileOutputReady())
         {
             holdLastSentPositions();
             return true;
@@ -719,10 +727,18 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                 return false;
             }
         }
+        // Recheck immediately before writes: a profile request may have arrived
+        // since updatePolicy() and torque validation.
+        if (!profileOutputReady())
+        {
+            holdLastSentPositions();
+            return true;
+        }
         if (mobile_base_enabled_ && base_command_publisher_)
         {
             geometry_msgs::msg::Twist command;
-            if (base_odometry_received_.load(std::memory_order_acquire) && future_input.size() >= 3)
+            if (runtime_profile_->activeConfig().base_mode != RuntimeProfileConfig::LOCKED &&
+                base_odometry_received_.load(std::memory_order_acquire) && future_input.size() >= 3)
             {
                 command.linear.x = future_input(0);
                 command.linear.y = future_input(1);

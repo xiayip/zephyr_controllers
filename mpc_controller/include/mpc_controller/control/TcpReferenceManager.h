@@ -27,6 +27,7 @@
 #include <zephyr_msgs/action/execute_cartesian_motion.hpp>
 
 namespace zephyr::mpc {
+class RuntimeMotionProfile;
 /** One real TCP, with no arm selector or ROS name translation. */
 class TcpReferenceManager final : public ocs2::ReferenceManagerDecorator {
 public:
@@ -34,6 +35,10 @@ public:
                       std::string base_frame, std::string tcp_frame,
                       size_t input_dim);
   void subscribe(const rclcpp_lifecycle::LifecycleNode::SharedPtr &node);
+  /** Set once during controller initialization, before solver threads start. */
+  void setRuntimeProfile(std::shared_ptr<RuntimeMotionProfile> profile);
+  void preSolverRun(ocs2::scalar_t init_time, ocs2::scalar_t final_time,
+                    const ocs2::vector_t& initial_state) override;
   void setAcceptingTargets(bool accept);
   void setCurrentObservation(const ocs2::SystemObservation &observation);
   /** Nonblocking request; caller retries while the mailbox is busy. */
@@ -43,6 +48,10 @@ public:
   bool claimMotion();
   bool motionSessionValid() const;
   void releaseMotion();
+  /** Non-RT profile handoff: reserve all target inputs and replace the reference
+   * with measured hold. Finite motion ownership must already be released. */
+  bool beginProfileChange(const ocs2::vector_t& measured_pose);
+  void endProfileChange();
   bool startMotion(const zephyr_msgs::action::ExecuteCartesianMotion::Goal& goal,
                    const ocs2::vector_t& measured_pose,
                    geometry_msgs::msg::PoseStamped& target, double& end_time,
@@ -81,6 +90,8 @@ private:
   mutable std::mutex mutex_;
   TargetSession target_session_;
   bool motion_owned_{false};  // Protected by mutex_, including topic commits.
+  bool profile_change_pending_{false}; // Independent of the lifecycle/session gate.
+  std::shared_ptr<RuntimeMotionProfile> runtime_profile_;
   uint64_t motion_session_{0};
   std::atomic<uint64_t> input_generation_{0};
   std::string base_frame_, tcp_frame_;
