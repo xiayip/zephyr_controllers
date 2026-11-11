@@ -46,9 +46,15 @@ ROS 包、C++ 头文件路径、插件 XML、共享库和 RViz 插件均已使�
 从旧包切换时请在新终端加载新的安装环境，避免旧安装残留干扰插件发现。
 
 固定底座模型任务在 `zephyr_arm_description/config/ocs2/task.info`，控制器参数在
-`zephyr_arm_bringup/config/mpc_mock_controllers.yaml`。本次没有改 Z2 启动链；
-当前工作区未提供可直接启动本控制器的 Z2 MPC launch，下文底盘部分说明的是代码能力，
-不代表已经完成整机接线或验证。
+`zephyr_arm_bringup/config/mpc_mock_controllers.yaml`。Z2 的整机配置位于
+`z2_bringup/config/ocs2/mpc_real.info`，通过 Z2 bringup 默认加载为 inactive。
+
+任务文件路径为 `<task_config_package 的 share 目录>/config/ocs2/<info_file_name>.info`。
+`task_config_package` 默认是 `<robot_name>_description`，Z2 显式设为 `z2_bringup`；
+`info_file_name` 默认是 `task`，不包含 `.info` 扩展名。机器人模型仍由
+`planning_urdf_path` 或机器人描述包提供，与任务配置包独立。
+这两个参数只在控制器初始化时读取，切换配置需要卸载/重新加载控制器，或重启 bringup；
+仅停用/激活不会重新读取文件，也不支持运行中通过 `ros2 param set` 热切换。
 
 ## 编译
 

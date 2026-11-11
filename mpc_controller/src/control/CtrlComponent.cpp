@@ -193,9 +193,11 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         const std::string info_file_name = auto_declare("info_file_name", std::string("task"));
         joint_names_ = node_->get_parameter("joints").as_string_array();
         const std::string robot_pkg = robot_name_ + "_description";
-        const std::string config_path = ament_index_cpp::get_package_share_directory(robot_pkg);
+        const std::string task_config_package = auto_declare("task_config_package", robot_pkg);
+        const std::string config_path = ament_index_cpp::get_package_share_directory(task_config_package);
 
         const std::string task_file = config_path + "/config/ocs2/" + info_file_name + ".info";
+        RCLCPP_INFO(node_->get_logger(), "Loading MPC task configuration: %s", task_file.c_str());
         const std::string lib_folder =
             auto_declare("ocs2_library_folder", defaultOcs2LibraryFolder(robot_pkg));
         const std::string urdf_file = resolvePlanningUrdfPath();
@@ -371,7 +373,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                  "base_linear_stop_threshold", "base_angular_start_threshold",
                  "base_angular_stop_threshold", "base_command_profile", "base_max_linear_speed",
                  "base_max_angular_speed", "planning_urdf_path",
-                 "future_time_offset", "info_file_name", "ocs2_library_folder", "base_frame",
+                 "future_time_offset", "task_config_package", "info_file_name", "ocs2_library_folder", "base_frame",
                  "tcp_ee_frame", "mock_debug_enabled", "prediction_visualization_enabled", "prediction_publish_hz",
                  "prediction_ghost_interval", "prediction_ghost_count", "prediction_max_age",
                  "movel_duration", "movel_sample_interval", "movel_max_linear_velocity",
