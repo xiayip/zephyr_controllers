@@ -131,27 +131,40 @@ namespace zephyr::mpc
             auto scope = ctrl_comp_->rtScopeObs();
             valid = ctrl_comp_->updateObservation(time);
         }
-        if (execution_->consumeFailure()) pause_requested_ = true;
-        if (ctrl_comp_->pose_reference_manager_->consumeFailure()) pause_requested_ = true;
+        if (execution_->consumeFailure()) {
+            pause_requested_ = true;
+            motion_fault_ = MotionStatus::SOLVER_FAILED;
+        }
+        if (ctrl_comp_->pose_reference_manager_->consumeFailure()) {
+            pause_requested_ = true;
+            motion_fault_ = MotionStatus::REFERENCE_FAILED;
+        }
         const auto collision = ctrl_comp_->collisionStatus();
         if (valid && !pause_requested_.load(std::memory_order_acquire) &&
             collision != CollisionStatus::Safe && collision != CollisionStatus::Pending)
         {
             pause_requested_ = true;
+            motion_fault_ = MotionStatus::COLLISION_BLOCKED;
             const char* reason = collision == CollisionStatus::Collision ? "collision" :
                 collision == CollisionStatus::Invalid ? "collision check failed" : "collision check stale";
             RCLCPP_ERROR(get_node()->get_logger(), "MPC paused: %s; resolve before explicit ~/pause resume", reason);
         }
-        if (!valid || collision == CollisionStatus::Pending || pause_requested_.load(std::memory_order_acquire))
+        const auto stop_token = motion_runtime_->stop_request.load();
+        const bool action_stop = stop_token != motion_runtime_->stop_release.load();
+        bool held = false;
+        if (!valid || collision == CollisionStatus::Pending || pause_requested_.load(std::memory_order_acquire) || action_stop)
         {
-            execution_->pause();
+            held = execution_->pause();
             publishTrackingStatus(false);
         }
         else
         {
             const bool tracking = execution_->tick(time);
             // Output validation faults hold immediately and latch in this cycle.
-            if (execution_->consumeFailure()) pause_requested_ = true;
+            if (execution_->consumeFailure()) {
+                pause_requested_ = true;
+                motion_fault_ = MotionStatus::POLICY_FAILED;
+            }
             publishTrackingStatus(tracking && !pause_requested_.load(std::memory_order_acquire));
         }
         if (valid)
@@ -159,6 +172,24 @@ namespace zephyr::mpc
             auto scope = ctrl_comp_->rtScopeViz();
             ctrl_comp_->maybeRequestVisualizationUpdate();
         }
+        MotionSample sample;
+        sample.pose = ctrl_comp_->measuredTcpPose();
+        sample.stamp_ns = time.nanoseconds();
+        sample.reference_time = time.seconds();
+        sample.received_ns = motionSteadyNs();
+        sample.valid = valid;
+        sample.stop_ack = action_stop && held ? stop_token : 0;
+        sample.reason = motion_fault_.load();
+        if (action_stop) sample.state = MotionStatus::STOPPING;
+        else if (!valid) {
+            sample.state = MotionStatus::FAULT;
+            sample.reason = MotionStatus::FEEDBACK_UNAVAILABLE;
+        } else if (sample.reason != MotionStatus::NONE) sample.state = MotionStatus::FAULT;
+        else if (pause_requested_) {
+            sample.state = MotionStatus::PAUSED;
+            sample.reason = MotionStatus::PAUSE_REQUESTED;
+        } else sample.state = tracking_active_ && ctrl_comp_->policy_active_ ? MotionStatus::IDLE : MotionStatus::INITIALIZING;
+        motion_runtime_->samples.tryWrite(sample);
         ctrl_comp_->endRtCycle(tracking_active_ ? "ocs2" : "paused");
         return controller_interface::return_type::OK;
     }
@@ -200,6 +231,8 @@ namespace zephyr::mpc
 
     controller_interface::CallbackReturn mpc_controller::on_configure(const rclcpp_lifecycle::State&)
     {
+        if (!motion_server_) motion_server_ = std::make_unique<MotionActionServer>(
+            get_node(), ctrl_comp_->pose_reference_manager_, motion_runtime_);
         tracking_status_publisher_ = get_node()->create_publisher<std_msgs::msg::Int32>(
             "/fsm_state", rclcpp::QoS(1).transient_local());
         // Periodic status also supports clients using volatile QoS.
@@ -209,6 +242,7 @@ namespace zephyr::mpc
             [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
                    const std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
                 pause_requested_.store(request->data, std::memory_order_release);
+                if (!request->data) motion_fault_ = MotionStatus::NONE;
                 response->success = true;
                 response->message = request->data ? "Pause requested" : "Resume requested";
             });
@@ -307,8 +341,10 @@ namespace zephyr::mpc
                 std::ignore = interface.get().set_value(ctrl_interfaces_.pd_gains_[1]);
         }
         pause_requested_ = false;
+        motion_fault_ = MotionStatus::NONE;
         tracking_active_ = false;
         execution_->start();
+        motion_runtime_->activate();
         publishStatusMessage();
         RCLCPP_INFO(get_node()->get_logger(), "OCS2 starts automatically once feedback and the first policy are ready");
         return CallbackReturn::SUCCESS;
@@ -316,6 +352,7 @@ namespace zephyr::mpc
 
     void mpc_controller::stopExecution()
     {
+        const auto activation_epoch = motion_runtime_->activation_epoch.load();
         pause_requested_ = true;
         if (ctrl_comp_)
         {
@@ -327,9 +364,14 @@ namespace zephyr::mpc
         {
             ctrl_comp_->stopVisualizationThread();
             ctrl_comp_->pose_reference_manager_->setAcceptingTargets(false);
-            ctrl_comp_->stopMobileBase();
+            if (ctrl_comp_->holdForDeactivation())
+                motion_runtime_->stopped_epoch.store(activation_epoch);
+            else if (activation_epoch != 0 && motion_runtime_->stopped_epoch.load() != activation_epoch)
+                RCLCPP_ERROR(get_node()->get_logger(),
+                    "Lifecycle hold was not confirmed; pending motion ownership remains locked");
         }
         tracking_active_ = false;
+        motion_runtime_->active = false;
     }
     controller_interface::CallbackReturn mpc_controller::on_deactivate(const rclcpp_lifecycle::State&)
     {
@@ -408,14 +450,14 @@ void MpcExecution::stop()
     job_ = Job::Idle;
     initialized_ = false;
 }
-void MpcExecution::pause()
+bool MpcExecution::pause()
 {
     auto expected = Job::Requested;
     job_.compare_exchange_strong(expected, Job::Idle, std::memory_order_acq_rel);
     if (initialized_) component_->clearTrajectoryVisualization();
     initialized_ = false;
     reference_reset_requested_ = false;
-    component_->holdLastSentPositions();
+    return component_->holdLastSentPositions();
 }
 bool MpcExecution::requestSolve()
 {

@@ -507,23 +507,25 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         base_odometry_buffer_.writeFromNonRT(state);
     }
 
-    void CtrlComponent::stopMobileBase() const
+    bool CtrlComponent::stopMobileBase() const
     {
         if (mobile_base_enabled_ && base_command_publisher_)
         {
             geometry_msgs::msg::Twist command;
-            publishMobileBaseCommand(command);
+            return publishMobileBaseCommand(command);
         }
+        return !mobile_base_enabled_;
     }
 
-    void CtrlComponent::publishMobileBaseCommand(const geometry_msgs::msg::Twist& command) const
+    bool CtrlComponent::publishMobileBaseCommand(const geometry_msgs::msg::Twist& command) const
     {
         if (!realtime_base_command_publisher_ || !realtime_base_command_publisher_->trylock())
         {
-            return;
+            return false;
         }
         realtime_base_command_publisher_->msg_ = command;
         realtime_base_command_publisher_->unlockAndPublish();
+        return true;
     }
 
     void CtrlComponent::applyBaseCommandDeadband(geometry_msgs::msg::Twist& command)
@@ -611,6 +613,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                 auto fk_scope = rt_timing_.scope(&rt_timing_.ee_fk_us);
                 tcp_pose = visualizer_->computeEndEffectorPose(observation_.state);
             }
+            std::copy_n(tcp_pose.data(), 7, measured_tcp_pose_.begin());
             auto pub_scope = rt_timing_.scope(&rt_timing_.ee_pub_us);
             visualizer_->publishTcpPose(time, tcp_pose);
         }
@@ -783,17 +786,60 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         return mpc_mrt_interface_ && mpc_mrt_interface_->initialPolicyReceived();
     }
 
-    void CtrlComponent::holdLastSentPositions() const
+    bool CtrlComponent::holdLastSentPositions() const
     {
-        stopMobileBase();
+        const bool base_held = stopMobileBase();
+        return holdJointPositions() && base_held;
+    }
+
+    bool CtrlComponent::holdForDeactivation() const
+    {
+        const bool joints_held = holdJointPositions();
+        if (!mobile_base_enabled_) return joints_held;
+        if (!base_command_publisher_ || !realtime_base_command_publisher_) return false;
+        // Acquiring the REALTIME turn means any previous asynchronous publish
+        // finished. Keep its lock until the final zero is published so an old
+        // queued nonzero cannot overtake it. Never call this from update().
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+        while (!realtime_base_command_publisher_->trylock())
+        {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        bool base_held = false;
+        try
+        {
+            auto lifecycle_publisher = std::dynamic_pointer_cast<
+                rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::Twist>>(base_command_publisher_);
+            if (!lifecycle_publisher || lifecycle_publisher->is_activated())
+            {
+                base_command_publisher_->publish(geometry_msgs::msg::Twist{});
+                base_held = true;
+            }
+        }
+        catch (const std::exception& error)
+        {
+            RCLCPP_ERROR(node_->get_logger(), "Lifecycle base stop publication failed: %s", error.what());
+        }
+        realtime_base_command_publisher_->unlock();
+        return joints_held && base_held;
+    }
+
+    bool CtrlComponent::holdJointPositions() const
+    {
+        bool held = ctrl_interfaces_.last_sent_joint_positions_.size() == joint_names_.size() &&
+            ctrl_interfaces_.joint_position_command_interface_.size() == joint_names_.size();
         for (size_t i = 0; i < joint_names_.size() && i < ctrl_interfaces_.last_sent_joint_positions_.size(); ++i)
         {
-            ctrl_interfaces_.setJointPositionCommand(i, ctrl_interfaces_.last_sent_joint_positions_[i]);
+            if (i >= ctrl_interfaces_.joint_position_command_interface_.size()) return false;
+            held = ctrl_interfaces_.joint_position_command_interface_[i].get().set_value(
+                ctrl_interfaces_.last_sent_joint_positions_[i]) && held;
         }
         for (auto& interface : ctrl_interfaces_.joint_velocity_command_interface_)
         {
-            std::ignore = interface.get().set_value(0.0);
+            held = interface.get().set_value(0.0) && held;
         }
+        return held;
     }
 
     void CtrlComponent::setMpcPeriodSec(double period_sec)

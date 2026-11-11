@@ -18,7 +18,7 @@ find_package(pinocchio REQUIRED)
 find_package(Boost CONFIG REQUIRED)
 set(controller_dependencies
   pluginlib controller_interface hardware_interface ament_index_cpp
-  rclcpp rclcpp_lifecycle rcl_interfaces
+  rclcpp rclcpp_lifecycle rclcpp_action rcl_interfaces zephyr_msgs
   geometry_msgs nav_msgs sensor_msgs std_msgs std_srvs visualization_msgs realtime_tools
   tf2 tf2_ros tf2_geometry_msgs moveit_msgs
   ocs2_core ocs2_oc ocs2_mpc ocs2_ddp ocs2_msgs ocs2_mobile_manipulator
@@ -34,6 +34,7 @@ add_library(${controller_target} SHARED
   src/control/CtrlComponent.cpp
   src/control/TcpKinematics.cpp
   src/control/TcpReferenceManager.cpp
+  src/control/MotionActionServer.cpp
   src/control/TcpTrajectoryRecorder.cpp
   src/visualization/mpc_visualizer.cpp)
 set_target_properties(${controller_target} PROPERTIES OUTPUT_NAME ${PROJECT_NAME})
@@ -90,6 +91,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_control_safety Eigen3::Eigen Threads::Threads)
   ament_add_gtest(test_reference_handoff test/test_reference_handoff.cpp)
   target_link_libraries(test_reference_handoff ${controller_target} Threads::Threads)
+  ament_add_gtest(test_motion_action test/test_motion_action.cpp)
+  target_link_libraries(test_motion_action ${controller_target} Threads::Threads)
   ament_add_gtest(test_tcp_visualizer test/test_tcp_visualizer.cpp)
   target_link_libraries(test_tcp_visualizer ${controller_target} Threads::Threads)
   ament_add_gtest(test_tcp_trajectory_recorder

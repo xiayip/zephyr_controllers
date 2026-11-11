@@ -12,6 +12,8 @@
   <depend>ament_index_cpp</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
+  <depend>rclcpp_action</depend>
+  <depend>zephyr_msgs</depend>
   <depend>rcl_interfaces</depend>
   <depend>eigen</depend>
   <depend>pinocchio</depend>

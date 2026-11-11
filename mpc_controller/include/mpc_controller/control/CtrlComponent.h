@@ -59,10 +59,11 @@ namespace zephyr::mpc {
 
         /** Commit only complete, finite feedback. False means hold outputs this cycle. */
         bool updateObservation(const rclcpp::Time& time);
+        const std::array<double, 7>& measuredTcpPose() const { return measured_tcp_pose_; }
         /** False is a latched execution fault; outputs are already held. */
         bool evaluatePolicy(const rclcpp::Time& time);
         /** Command the mobile base. The default zero command is used outside OCS2 mode. */
-        void stopMobileBase() const;
+        bool stopMobileBase() const;
         /** Reset only after the solver is idle and the reference reset is acknowledged.
          * Does not wait for the first policy; this is not a hard-RT guarantee.
          */
@@ -74,7 +75,10 @@ namespace zephyr::mpc {
         /** MPC request period; used to warn only when a solve overruns that period. */
         void setMpcPeriodSec(double period_sec);
         /** Hold joints at last commanded positions (used while waiting for initial policy). */
-        void holdLastSentPositions() const;
+        bool holdLastSentPositions() const;
+        /** Lifecycle only, after update/solver output has stopped. Drains the base
+         * publisher with a bounded wait and confirms the final zero publication. */
+        bool holdForDeactivation() const;
 
         /**
          * Prediction, self-collision markers and recording on an independent periodic worker
@@ -123,8 +127,9 @@ namespace zephyr::mpc {
         SystemObservation observation_;
 
     private:
+        bool holdJointPositions() const;
         void receiveBaseOdometry(const nav_msgs::msg::Odometry& odometry);
-        void publishMobileBaseCommand(const geometry_msgs::msg::Twist& command) const;
+        bool publishMobileBaseCommand(const geometry_msgs::msg::Twist& command) const;
         void applyBaseCommandDeadband(geometry_msgs::msg::Twist& command);
 
         /** Requires a launch-injected, expanded planning URDF (planning_urdf_path). */
@@ -199,6 +204,7 @@ namespace zephyr::mpc {
         double prediction_max_age_{0.5};
         double visualization_period_sec_{0.05};
         SystemObservation measured_observation_; // RT only, never overwritten by command caching.
+        std::array<double, 7> measured_tcp_pose_{0, 0, 0, 0, 0, 0, 1};
         std::shared_ptr<const zephyr::mpc_visualization::TimedPrediction> solver_prediction_; // atomic worker -> RT
         std::shared_ptr<const zephyr::mpc_visualization::TimedPrediction> active_prediction_; // RT only
         double last_recorded_observation_time_{-1.0}; // viz worker only

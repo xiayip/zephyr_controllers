@@ -21,6 +21,7 @@
 
 #include <mpc_controller/control/JointInterfaces.h>
 #include "mpc_controller/control/TcpKinematics.h"
+#include "mpc_controller/control/MotionActionServer.h"
 namespace zephyr::mpc
 {
 /** Runs only OCS2. Solver work stays off the controller_manager update thread. */
@@ -31,7 +32,7 @@ public:
     ~MpcExecution();
     void start();
     void stop();
-    void pause();
+    bool pause();
     /** Starts from the current measured pose after activation or resume. */
     bool tick(const rclcpp::Time& time);
     bool consumeFailure() { return failed_.exchange(false, std::memory_order_acq_rel); }
@@ -107,6 +108,9 @@ private:
         rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr pause_service_;
         std::atomic_bool pause_requested_{false};
         std::atomic_bool tracking_active_{false};
+        std::atomic<uint16_t> motion_fault_{MotionStatus::NONE};
+        std::shared_ptr<MotionRuntime> motion_runtime_{std::make_shared<MotionRuntime>()};
+        std::unique_ptr<MotionActionServer> motion_server_;
         std::shared_ptr<CtrlComponent> ctrl_comp_;
         std::unique_ptr<MpcExecution> execution_;
 

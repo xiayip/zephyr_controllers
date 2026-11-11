@@ -24,6 +24,7 @@
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_listener.hpp>
+#include <zephyr_msgs/action/execute_cartesian_motion.hpp>
 
 namespace zephyr::mpc {
 /** One real TCP, with no arm selector or ROS name translation. */
@@ -38,6 +39,14 @@ public:
   /** Nonblocking request; caller retries while the mailbox is busy. */
   bool requestReset(const ocs2::vector_t &pose, double time);
   bool resetReady() const;
+  const std::string& referenceFrame() const { return base_frame_; }
+  bool claimMotion();
+  bool motionSessionValid() const;
+  void releaseMotion();
+  bool startMotion(const zephyr_msgs::action::ExecuteCartesianMotion::Goal& goal,
+                   const ocs2::vector_t& measured_pose,
+                   geometry_msgs::msg::PoseStamped& target, double& end_time,
+                   std::string& error);
   bool consumeFailure() {
     return failed_.exchange(false, std::memory_order_acq_rel);
   }
@@ -64,12 +73,16 @@ private:
                   bool interpolate);
   void acceptRelative(const geometry_msgs::msg::TwistStamped &delta);
   void acceptPath(const nav_msgs::msg::Path &path);
-  void plan(const std::vector<ocs2::vector_t> &poses, double duration);
+  void plan(const std::vector<ocs2::vector_t> &poses, double duration,
+            const ocs2::vector_t* start = nullptr, double speed_scale = 1.0);
   ocs2::vector_t sample(double time) const;
   void publish() const;
   void commitImmediate();
   mutable std::mutex mutex_;
   TargetSession target_session_;
+  bool motion_owned_{false};  // Protected by mutex_, including topic commits.
+  uint64_t motion_session_{0};
+  std::atomic<uint64_t> input_generation_{0};
   std::string base_frame_, tcp_frame_;
   size_t input_dim_;
   rclcpp_lifecycle::LifecycleNode::SharedPtr node_;

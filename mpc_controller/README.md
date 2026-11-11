@@ -502,3 +502,55 @@ ros2 service call /mpc_controller/pause std_srvs/srv/SetBool '{data: false}'
 `/fsm_state` 仅作为原版 RViz/目标管理器的兼容状态发布（3 运行、2 暂停），
 控制器不再接收 `/fsm_command`，也不再提供 HOME、MOVEJ、腰部或原状态机动作接口。
 本地交互坐标轴直接订阅该状态话题，以支持启动后拖动目标。
+
+## 通用有限运动接口
+
+`~/execute_motion` 使用 `zephyr_msgs/action/ExecuteCartesianMotion`，支持：
+
+- `POSE`（0）：`target` 指定配置 TCP 的目标位姿。
+- `RELATIVE`（1）：`relative` 指定相对实测 TCP 的平移和旋转向量；单位 m/rad。
+- `PATH`（2）：`waypoints` 指定位姿序列（1～1000 个）；逐段插值，不继承点的时间作为轨迹时序。
+
+每个动作提供 `speed_scale`、位置/旋转容差、`settle_time` 和 `timeout`。
+`speed_scale` 是配置参考速度、加速度、jerk 上限的比例，不改变底层关节硬限位，
+也不保证实测 TCP 速度严格等于参考速度。有限动作不沿用 `movel_duration` 的最短总时长，
+而是根据当前反馈、路径距离与参考限值计算时长。`.info` 和模型参数仍在初始化时读取。
+
+位姿非空 frame 按其时间戳转换，零时间戳表示最新 TF；空 frame 使用 MPC 参考系。
+移动底盘通常为 `odom`，固定底座为模型 base frame。相对动作的 TCP frame 表示
+实测工具轴；其他 frame 只用于表达平移/旋转向量。目标在接收时固定，
+不是持续视觉跟踪入口。超过采样预算、无效四元数或不可用 TF 会失败。
+
+单个 Action 独占参考：并发 Action 被拒绝，运行期间普通 Pose、PoseStamped、
+relative、twist 和 path topic 输入均忽略。成功后恢复原有 topic 输入；
+多阶段 BT 应避免阶段之间混入外部手动目标。既有 topic 的空闲行为保持兼容。
+
+成功要求参考轨迹结束，并且实测 TCP 连续满足位置/姿态容差达到 `settle_time`。
+输入可达性、避障和实际任务成功不由这一到位判据保证。超时、反馈失效、暂停、
+停用或求解错误使任务失败，不自动重试。暂停再恢复也不会继续之前的 Action。
+
+取消/失败先请求控制循环保持关节指令、底盘输出零速度，收到停止确认后才返回终态。
+该确认表示控制循环已执行保持，不表示已经由轮速/力传感器确认物理静止。
+如果控制循环不再响应，`STOP_UNCONFIRMED` 会出现在状态中，Action 保持 STOPPING
+并保留所有权；不能把取消请求的响应当成已停止。后续有效停止确认或控制器停用后
+才能释放。取消后控制器从当前实测状态重新准备，旧参考不会恢复。
+
+`~/motion_status` 使用 `zephyr_msgs/msg/ControllerMotionStatus`，含状态、原因、
+Action UUID、实测 TCP、反馈有效性及误差。状态区分 INACTIVE、INITIALIZING、IDLE、
+EXECUTING、SETTLING、STOPPING、PAUSED、FAULT；`/fsm_state` 继续保留给旧可视化客户端。
+反馈快照超过 200 ms 不用于任务完成判断。具体求解/碰撞异常细节仍可查控制器日志。
+
+动作协议处理、TF、插值和结果发布在 ROS executor；控制线程只写固定大小的反馈快照
+并处理停止请求，不执行 Action 回调或等待客户端。
+
+示例（明确选择移动模型后才执行；不会切换控制器或打开碰撞检查）：
+
+```bash
+ros2 action send_goal /mpc_controller/execute_motion \
+  zephyr_msgs/action/ExecuteCartesianMotion \
+  '{mode: 1, relative: {header: {frame_id: omni_picker_tcp}, twist: {linear: {z: 0.01}}}, speed_scale: 0.2, timeout: 15.0}' --feedback
+ros2 topic echo /mpc_controller/motion_status
+```
+
+第一阶段未增加底盘锁定、关节姿态代价、MoveIt 场景检查、动态 `.info` 切换或连续视觉目标。
+`ArmTapBT` 在任务层组合接近/按压/退回；控制器中没有按钮专用阶段和业务判断。

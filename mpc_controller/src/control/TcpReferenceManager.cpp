@@ -18,7 +18,7 @@ vector_t poseVector(const geometry_msgs::msg::Pose &p) {
   vector_t v(7);
   v << p.position.x, p.position.y, p.position.z, p.orientation.x,
       p.orientation.y, p.orientation.z, p.orientation.w;
-  if (!v.allFinite() || v.tail<4>().norm() < 1e-9)
+  if (!v.allFinite() || !std::isfinite(v.tail<4>().norm()) || v.tail<4>().norm() < 1e-9)
     throw std::invalid_argument("Invalid TCP pose");
   v.tail<4>().normalize();
   return v;
@@ -115,6 +115,7 @@ void TcpReferenceManager::subscribe(
       "tcp_target/twist", 1,
       [this](geometry_msgs::msg::Twist::ConstSharedPtr p) {
         const auto session = target_session_.token();
+        const auto generation = input_generation_.load();
         if (!session)
           return;
         const double values[] = {p->linear.x,  p->linear.y,  p->linear.z,
@@ -123,7 +124,7 @@ void TcpReferenceManager::subscribe(
           if (!std::isfinite(v))
             return;
         std::lock_guard<std::mutex> lock(mutex_);
-        if (!target_session_.accepts(session))
+        if (!target_session_.accepts(session) || motion_owned_ || generation != input_generation_.load())
           return;
         target_ = sample(time_);
         twist_ = *p;
@@ -142,7 +143,7 @@ bool TcpReferenceManager::transform(const geometry_msgs::msg::PoseStamped &p,
     if (!p.header.frame_id.empty() && p.header.frame_id != base_frame_)
       tf2::doTransform(p, converted,
                        tf_->lookupTransform(base_frame_, p.header.frame_id,
-                                            tf2::TimePointZero));
+                                            rclcpp::Time(p.header.stamp)));
     result = poseVector(converted.pose);
     return true;
   } catch (const std::exception &e) {
@@ -153,13 +154,14 @@ bool TcpReferenceManager::transform(const geometry_msgs::msg::PoseStamped &p,
 void TcpReferenceManager::acceptPose(const geometry_msgs::msg::PoseStamped &p,
                                      bool interpolate_target) {
   const auto session = target_session_.token();
+  const auto generation = input_generation_.load();
   if (!session)
     return;
   vector_t goal;
   if (!transform(p, goal))
     return;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!target_session_.accepts(session))
+  if (!target_session_.accepts(session) || motion_owned_ || generation != input_generation_.load())
     return;
   twist_active_ = false;
   try {
@@ -177,6 +179,7 @@ void TcpReferenceManager::acceptPose(const geometry_msgs::msg::PoseStamped &p,
 void TcpReferenceManager::acceptRelative(
     const geometry_msgs::msg::TwistStamped &delta) {
   const auto session = target_session_.token();
+  const auto generation = input_generation_.load();
   if (!session)
     return;
   try {
@@ -187,7 +190,7 @@ void TcpReferenceManager::acceptRelative(
     if (!translation.allFinite() || !rotation.allFinite())
       throw std::invalid_argument("Invalid relative target");
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!target_session_.accepts(session))
+    if (!target_session_.accepts(session) || motion_owned_ || generation != input_generation_.load())
       return;
     vector_t goal = sample(time_);
     Eigen::Quaterniond frame = Eigen::Quaterniond::Identity();
@@ -221,13 +224,14 @@ void TcpReferenceManager::acceptRelative(
 }
 void TcpReferenceManager::acceptPath(const nav_msgs::msg::Path &path) {
   const auto session = target_session_.token();
+  const auto generation = input_generation_.load();
   if (!session || path.poses.empty())
     return;
   vector_array_t goals;
   if (!transformPath(path, goals))
     return;
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!target_session_.accepts(session))
+  if (!target_session_.accepts(session) || motion_owned_ || generation != input_generation_.load())
     return;
   try {
     twist_active_ = false;
@@ -252,8 +256,9 @@ bool TcpReferenceManager::transformPath(const nav_msgs::msg::Path &path,
   return true;
 }
 void TcpReferenceManager::plan(const std::vector<vector_t> &goals,
-                               double requested_duration) {
-  vector_t start = sample(time_);
+                               double requested_duration, const vector_t* measured_start,
+                               double speed_scale) {
+  vector_t start = measured_start ? *measured_start : sample(time_);
   scalar_array_t times{time_};
   vector_array_t poses{start};
   double elapsed = 0.0;
@@ -262,10 +267,12 @@ void TcpReferenceManager::plan(const std::vector<vector_t> &goals,
     const double angle = quaternion(start).angularDistance(quaternion(goal));
     const double duration =
         std::max({interval_, requested_duration / goals.size(),
-                  minimumDuration(distance, max_linear_, max_linear_acc_,
-                                  max_linear_jerk_),
-                  minimumDuration(angle, max_angular_, max_angular_acc_,
-                                  max_angular_jerk_)});
+                  minimumDuration(distance, max_linear_ * speed_scale, max_linear_acc_ * speed_scale,
+                                  max_linear_jerk_ * speed_scale),
+                  minimumDuration(angle, max_angular_ * speed_scale, max_angular_acc_ * speed_scale,
+                                  max_angular_jerk_ * speed_scale)});
+    if (!std::isfinite(duration) || duration / interval_ > 100000)
+      throw std::invalid_argument("TCP path duration exceeds sampling budget");
     const size_t count = std::max<size_t>(1, std::ceil(duration / interval_));
     if (count > 100000 || poses.size() + count > 200000)
       throw std::invalid_argument("TCP path too long");
@@ -282,6 +289,77 @@ void TcpReferenceManager::plan(const std::vector<vector_t> &goals,
   times_ = std::move(times);
   poses_ = std::move(poses);
   target_ = goals.back();
+}
+
+bool TcpReferenceManager::claimMotion() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (motion_owned_ || !target_session_.token()) return false;
+  motion_owned_ = true;
+  motion_session_ = target_session_.token();
+  ++input_generation_;
+  twist_active_ = false;
+  return true;
+}
+void TcpReferenceManager::releaseMotion() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  motion_owned_ = false;
+  motion_session_ = 0;
+  ++input_generation_;
+}
+bool TcpReferenceManager::motionSessionValid() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return motion_owned_ && target_session_.accepts(motion_session_);
+}
+bool TcpReferenceManager::startMotion(
+    const zephyr_msgs::action::ExecuteCartesianMotion::Goal& request,
+    const vector_t& measured_pose, geometry_msgs::msg::PoseStamped& target,
+    double& end_time, std::string& error) {
+  using Goal = zephyr_msgs::action::ExecuteCartesianMotion::Goal;
+  std::lock_guard<std::mutex> lock(mutex_);
+  try {
+    if (!motion_owned_ || !target_session_.accepts(motion_session_))
+      throw std::runtime_error("Controller no longer ready for this motion");
+    vector_array_t goals;
+    if (request.mode == Goal::RELATIVE) {
+      vector_t p = measured_pose;
+      const auto& d = request.relative;
+      Eigen::Vector3d translation(d.twist.linear.x, d.twist.linear.y, d.twist.linear.z);
+      Eigen::Vector3d rotation(d.twist.angular.x, d.twist.angular.y, d.twist.angular.z);
+      Eigen::Quaterniond frame = Eigen::Quaterniond::Identity();
+      if (d.header.frame_id == tcp_frame_) frame = quaternion(p);
+      else if (!d.header.frame_id.empty() && d.header.frame_id != base_frame_) {
+        const auto tf = tf_->lookupTransform(base_frame_, d.header.frame_id, rclcpp::Time(d.header.stamp));
+        frame = Eigen::Quaterniond(tf.transform.rotation.w, tf.transform.rotation.x,
+                                  tf.transform.rotation.y, tf.transform.rotation.z).normalized();
+      }
+      p.head<3>() += frame * translation;
+      if (rotation.norm() > 1e-12)
+        p.tail<4>() = (frame * Eigen::Quaterniond(Eigen::AngleAxisd(rotation.norm(), rotation.normalized())) *
+                       frame.conjugate() * quaternion(p)).normalized().coeffs();
+      if (!p.allFinite()) throw std::invalid_argument("Relative motion overflow");
+      goals.push_back(std::move(p));
+    } else {
+      const auto poses = request.mode == Goal::POSE ?
+          std::vector<geometry_msgs::msg::PoseStamped>{request.target} : request.waypoints;
+      for (const auto& p : poses) {
+        vector_t converted;
+        if (!transform(p, converted)) throw std::invalid_argument("Invalid pose or unavailable timestamped TF");
+        goals.push_back(std::move(converted));
+      }
+    }
+    if (goals.empty()) throw std::invalid_argument("Empty motion");
+    time_ = observation_time_.load(std::memory_order_acquire);
+    plan(goals, 0.0, &measured_pose, request.speed_scale);
+    end_time = times_.back();
+    target.header.frame_id = base_frame_;
+    target.header.stamp = node_->now();
+    target.pose = rosPose(target_);
+    publish();
+    return true;
+  } catch (const std::exception& e) {
+    error = e.what();
+    return false;
+  }
 }
 vector_t TcpReferenceManager::sample(double time) const {
   if (times_.empty() || time >= times_.back())
