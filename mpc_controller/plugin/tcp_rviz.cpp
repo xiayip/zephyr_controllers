@@ -4,6 +4,7 @@
 #include "tcp_rviz.hpp"
 #include "error_dashboard.hpp"
 #include "command_status.hpp"
+#include "controller_switcher.hpp"
 #include <algorithm>
 #include <unordered_map>
 #include <interactive_markers/interactive_marker_server.hpp>
@@ -20,6 +21,7 @@
 #include <QString>
 #include <QVBoxLayout>
 #include <QTimer>
+#include <QMessageBox>
 #include <pluginlib/class_list_macros.hpp>
 #include <rviz_rendering/render_system.hpp>
 
@@ -40,12 +42,17 @@ public:
         manager->initialize(); managers[node.get()]=manager;
         return manager;
     }
-    CommandStatus::View commandStatus() const { return status_.view(); }
+    CommandStatus::View commandStatus() const {
+        if (switcher_->busy()) return {false, "正在切换控制器；暂不发送目标"};
+        return status_.view();
+    }
+    std::shared_ptr<ControllerSwitcher> controllerSwitcher() const { return switcher_; }
 private:
     explicit TcpTargetManager(rclcpp::Node::SharedPtr node)
         : node_(std::move(node)), tf_(node_->get_clock()), listener_(tf_,node_,false) {
         frame_=node_->has_parameter("marker_fixed_frame") ? node_->get_parameter("marker_fixed_frame").as_string() : "";
         tcp_=node_->has_parameter("tcp_ee_frame") ? node_->get_parameter("tcp_ee_frame").as_string() : "omni_picker_tcp";
+        switcher_=std::make_shared<ControllerSwitcher>(node_);
         server_=std::make_unique<interactive_markers::InteractiveMarkerServer>("tcp_target_manager",node_);
         immediate_=node_->create_publisher<geometry_msgs::msg::Pose>("tcp_target",1);
         stamped_=node_->create_publisher<geometry_msgs::msg::PoseStamped>("tcp_target/stamped",1);
@@ -135,7 +142,7 @@ private:
         menu_.apply(*server_,tcp_); server_->applyChanges();
     }
     void send(bool interpolate) {
-        if(!status_.view().ready||!initialized_) return;
+        if(!commandStatus().ready||!initialized_) return;
         geometry_msgs::msg::PoseStamped pose; pose.header.frame_id=frame_; pose.header.stamp=node_->now(); pose.pose=pose_;
         if(interpolate) stamped_->publish(pose);
         else {
@@ -160,6 +167,7 @@ private:
     bool initialized_{false},dragging_{false},continuous_{true},preview_dirty_{false};
     geometry_msgs::msg::Pose pose_;
     CommandStatus status_;
+    std::shared_ptr<ControllerSwitcher> switcher_;
     std::chrono::steady_clock::time_point last_command_{};
     tf2_ros::Buffer tf_; tf2_ros::TransformListener listener_;
     std::unique_ptr<interactive_markers::InteractiveMarkerServer> server_;
@@ -175,6 +183,15 @@ target_coordinate_panel::target_coordinate_panel(QWidget* parent)
   : Panel(parent)
 {
   auto* layout = new QVBoxLayout(this);
+  auto* control_group = new QGroupBox(QStringLiteral("控制器切换"), this);
+  auto* control_layout = new QVBoxLayout(control_group);
+  controller_label_ = new QLabel(QStringLiteral("等待 controller_manager…"), control_group);
+  controller_label_->setWordWrap(true);
+  switch_button_ = new QPushButton(QStringLiteral("切换控制器"), control_group);
+  switch_button_->setEnabled(false);
+  control_layout->addWidget(controller_label_);
+  control_layout->addWidget(switch_button_);
+  layout->addWidget(control_group);
   auto* current_group = new QGroupBox(QStringLiteral("当前交互目标"), this);
   auto* current_layout = new QVBoxLayout(current_group);
   frame_label_ = new QLabel(QStringLiteral("坐标系：等待目标话题…"), current_group);
@@ -213,6 +230,20 @@ void target_coordinate_panel::onInitialize()
 {
   node_ = getDisplayContext()->getRosNodeAbstraction().lock()->get_raw_node();
   marker_manager_ = TcpTargetManager::acquire(node_);
+  connect(switch_button_, &QPushButton::clicked, this, [this] {
+    auto switcher = marker_manager_->controllerSwitcher();
+    const auto selected = switcher->view();
+    if (!selected.enabled) return;
+    const auto answer = QMessageBox::question(this, QStringLiteral("确认切换控制器"),
+        QStringLiteral("切换到 %1？\n\n请先停止 BT/Servo/其他目标发送器，确认机械臂已停稳且周围安全。"
+                       "\n切换会中断当前运动，不会执行 ready/home 动作；Position Adapter、MIT 和夹爪保持不变。"
+                       "\n这不是急停，也不会自动清故障。")
+            .arg(QString::fromStdString(selected.target)), QMessageBox::Yes | QMessageBox::Cancel,
+        QMessageBox::Cancel);
+    if (answer == QMessageBox::Yes && !switcher->request(selected.target)) {
+      controller_label_->setText(QStringLiteral("状态已变化或服务不可用，未发送切换请求，请重新确认。"));
+    }
+  });
   // Public single-TCP interface.
   target_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
       "/tcp_current_target", rclcpp::QoS(1).transient_local(),
@@ -224,6 +255,13 @@ void target_coordinate_panel::onInitialize()
       "/tcp_target/stamped", rclcpp::QoS(10));
   auto* timer = new QTimer(this);
   connect(timer, &QTimer::timeout, this, [this] {
+    auto switcher = marker_manager_->controllerSwitcher();
+    switcher->poll();
+    const auto controllers = switcher->view();
+    switch_button_->setEnabled(controllers.enabled);
+    switch_button_->setText(QString::fromStdString(controllers.button_label));
+    switch_button_->setToolTip(QString::fromStdString(controllers.target));
+    controller_label_->setText(QString::fromStdString(controllers.states + "\n" + controllers.message));
     const auto state = marker_manager_->commandStatus();
     send_button_->setEnabled(have_target_ && state.ready);
     status_label_->setText(QString::fromStdString(state.message) +

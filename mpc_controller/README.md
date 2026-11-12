@@ -571,6 +571,32 @@ RViz 统一订阅 `/mpc_controller/motion_status`（可用 `motion_status_topic`
 状态超过 1 秒未更新会禁用发送，恢复状态不会自动发送预览目标。
 这只是客户端防误操作，不替代控制器校验，也不是遥控断链急停。
 
+### RViz 一键切换 JTC / MPC
+
+`MPC target` 面板顶部显示 controller_manager 中的实际生命周期状态，并提供
+“切换到 MPC / 切回 JTC”按钮。确认弹窗后，
+以 STRICT、5 秒切换超时调用 `switch_controller`：只激活目标控制器、停用当前
+active 的另一个控制器；Position Adapter、MIT、底盘驱动和夹爪不变。
+返回 JTC 使用 MPC 的生命周期退出保持流程，不另加内部 enable/FSM。
+
+先停止 BT/Servo/其他目标发送器，确认机械臂已停稳、周围安全后再点击。
+按钮不发送 ready/home 姿态，不自动加载或配置控制器，不抢占其他控制器的接口，
+也不自动重试、回滚或清故障。切换期间本 RViz 禁止发送目标，服务返回后再次读取
+实际状态；MPC 激活后仍需等新策略就绪。网络超时不代表机器人未执行切换。
+该按钮不是物理急停或底盘控制仲裁，真机保持与平滑交接仍需实机验收。
+
+RViz 节点可配置以下参数（不改变机器人端配置）：
+
+| 参数 | 默认值 |
+| --- | --- |
+| `controller_manager_name` | `/controller_manager` |
+| `mpc_controller_name` | `mpc_controller` |
+| `trajectory_controller_name` | `zephyr_arm_trajectory_controller` |
+
+自定义 MPC 名称时也应设置对应的 `motion_status_topic`。独立单臂 `mpc_mock.launch.py`
+默认只加载 MPC、不加载 JTC，因此切换按钮禁用并提示缺少控制器；Z2 普通 bringup
+已加载这两个控制器，可直接使用。不需要为此改动 MPC 控制算法。
+
 ## 通用有限运动接口
 
 `~/execute_motion` 使用 `zephyr_msgs/action/ExecuteCartesianMotion`，支持：

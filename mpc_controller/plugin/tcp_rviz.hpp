@@ -46,6 +46,8 @@ private:
   QLabel* status_label_{nullptr};
   std::array<QDoubleSpinBox*, 3> xyz_inputs_{};
   QPushButton* send_button_{nullptr};
+  QPushButton* switch_button_{nullptr};
+  QLabel* controller_label_{nullptr};
 };
 
 class tcp_pose_panel final : public rviz_common::Panel {
