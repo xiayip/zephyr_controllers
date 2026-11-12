@@ -19,6 +19,7 @@ struct MotionSample {
   int64_t stamp_ns{0}, received_ns{0};
   double reference_time{0};
   uint64_t stop_ack{0};
+  uint64_t activation_epoch{0};
   uint64_t profile_revision{0};
   uint8_t profile_base_mode{0};
   double profile_tcp_cost_scale{1.0}, profile_input_cost_scale{1.0};

@@ -64,7 +64,7 @@ find_package(rviz_rendering REQUIRED)
 find_package(rviz_ogre_vendor REQUIRED)
 find_package(interactive_markers REQUIRED)
 ament_target_dependencies(mpc_rviz_panel PUBLIC
-  geometry_msgs std_msgs visualization_msgs interactive_markers
+  geometry_msgs zephyr_msgs visualization_msgs interactive_markers
   tf2 tf2_ros tf2_geometry_msgs)
 target_link_libraries(mpc_rviz_panel PUBLIC
   Qt${QT_VERSION_MAJOR}::Widgets rviz_common::rviz_common
@@ -91,6 +91,9 @@ if(BUILD_TESTING)
   target_include_directories(test_control_safety PRIVATE include)
   target_compile_features(test_control_safety PRIVATE cxx_std_17)
   target_link_libraries(test_control_safety Eigen3::Eigen Threads::Threads)
+  ament_add_gtest(test_command_status test/test_command_status.cpp)
+  target_compile_features(test_command_status PRIVATE cxx_std_17)
+  ament_target_dependencies(test_command_status zephyr_msgs)
   ament_add_gtest(test_reference_handoff test/test_reference_handoff.cpp)
   target_link_libraries(test_reference_handoff ${controller_target} Threads::Threads)
   ament_add_gtest(test_motion_action test/test_motion_action.cpp)

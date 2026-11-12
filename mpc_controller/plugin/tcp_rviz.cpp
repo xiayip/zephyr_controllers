@@ -3,11 +3,11 @@
 
 #include "tcp_rviz.hpp"
 #include "error_dashboard.hpp"
+#include "command_status.hpp"
 #include <algorithm>
 #include <unordered_map>
 #include <interactive_markers/interactive_marker_server.hpp>
 #include <interactive_markers/menu_handler.hpp>
-#include <std_msgs/msg/int32.hpp>
 #include <tf2_ros/buffer.hpp>
 #include <tf2_ros/transform_listener.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -19,6 +19,7 @@
 #include <QMetaObject>
 #include <QString>
 #include <QVBoxLayout>
+#include <QTimer>
 #include <pluginlib/class_list_macros.hpp>
 #include <rviz_rendering/render_system.hpp>
 
@@ -39,6 +40,7 @@ public:
         manager->initialize(); managers[node.get()]=manager;
         return manager;
     }
+    CommandStatus::View commandStatus() const { return status_.view(); }
 private:
     explicit TcpTargetManager(rclcpp::Node::SharedPtr node)
         : node_(std::move(node)), tf_(node_->get_clock()), listener_(tf_,node_,false) {
@@ -56,26 +58,22 @@ private:
             [weak](geometry_msgs::msg::PoseStamped::ConstSharedPtr pose){
                 auto self=weak.lock(); if (!self) return;
                 self->reference_frame_=pose->header.frame_id;
-                self->latest_target_=*pose; self->have_target_=true;
-                if (self->dragging_ || std::chrono::duration<double>(std::chrono::steady_clock::now()-self->last_command_).count()<0.3) return;
+                if (self->dragging_ || self->preview_dirty_ || std::chrono::duration<double>(std::chrono::steady_clock::now()-self->last_command_).count()<0.3) return;
                 self->update(*pose);
             });
         current_sub_=node_->create_subscription<geometry_msgs::msg::PoseStamped>("tcp_current_pose",rclcpp::SensorDataQoS().keep_last(1),
             [weak](geometry_msgs::msg::PoseStamped::ConstSharedPtr pose){
                 auto self=weak.lock(); if (!self) return;
                 if(self->reference_frame_.empty()) self->reference_frame_=pose->header.frame_id;
-                if(!self->initialized_||!self->active_) self->update(*pose);
+                if(!self->initialized_ || (!self->status_.view().ready &&
+                    !self->dragging_ && !self->preview_dirty_)) self->update(*pose);
             });
-        status_sub_=node_->create_subscription<std_msgs::msg::Int32>("/fsm_state",rclcpp::QoS(1).transient_local(),
-            [weak](std_msgs::msg::Int32::ConstSharedPtr status){
-                auto self=weak.lock(); if (!self) return;
-                const bool enabled=status->data==3;
-                if(enabled==self->active_) return;
-                self->active_=enabled; self->dragging_=false;
-                // Topic delivery order is not guaranteed: an actual pose
-                // received before status must not replace the cached goal.
-                if(enabled&&self->have_target_) self->update(self->latest_target_);
-                if(self->initialized_) self->createMarker();
+        const auto status_topic=node_->has_parameter("motion_status_topic") ?
+            node_->get_parameter("motion_status_topic").as_string() : "/mpc_controller/motion_status";
+        // Periodic volatile status: do not enable from an old retained sample.
+        status_sub_=node_->create_subscription<CommandStatus::Message>(status_topic,1,
+            [weak](CommandStatus::Message::ConstSharedPtr status){
+                if (auto self=weak.lock()) self->status_.update(*status);
             });
         timer_=node_->create_wall_timer(std::chrono::milliseconds(500),[weak]{
             auto self=weak.lock(); if(!self||self->initialized_||self->frame_.empty()) return;
@@ -107,12 +105,14 @@ private:
         using Control=visualization_msgs::msg::InteractiveMarkerControl;
         visualization_msgs::msg::InteractiveMarker marker;
         marker.name=tcp_; marker.description="TCP target"; marker.header.frame_id=frame_; marker.pose=pose_; marker.scale=0.20;
-        Control center; center.always_visible=true; center.interaction_mode=active_?Control::MOVE_ROTATE_3D:Control::NONE;
+        // Preview remains draggable when unavailable; send() independently
+        // requires fresh readiness. Becoming ready never sends a preview.
+        Control center; center.always_visible=true; center.interaction_mode=Control::MOVE_ROTATE_3D;
         visualization_msgs::msg::Marker sphere; sphere.type=visualization_msgs::msg::Marker::SPHERE;
         sphere.pose.orientation.w=1; sphere.scale.x=sphere.scale.y=sphere.scale.z=0.035;
         sphere.color.r=0.2; sphere.color.g=0.6; sphere.color.b=1.0; sphere.color.a=0.8;
         center.markers.push_back(sphere); marker.controls.push_back(center);
-        if(active_) for(int axis=0;axis<3;++axis) {
+        for(int axis=0;axis<3;++axis) {
             Control control; control.orientation.w=std::sqrt(0.5);
             if(axis==0) control.orientation.x=std::sqrt(0.5);
             if(axis==1) control.orientation.z=std::sqrt(0.5);
@@ -122,11 +122,12 @@ private:
         }
         const std::weak_ptr<TcpTargetManager> weak=shared_from_this();
         server_->insert(marker,[weak](visualization_msgs::msg::InteractiveMarkerFeedback::ConstSharedPtr feedback){
-            auto self=weak.lock(); if(!self||!self->active_) return;
+            auto self=weak.lock(); if(!self) return;
             using Feedback=visualization_msgs::msg::InteractiveMarkerFeedback;
             if(feedback->event_type==Feedback::MOUSE_DOWN) self->dragging_=true;
             if(feedback->event_type==Feedback::POSE_UPDATE||feedback->event_type==Feedback::MOUSE_UP) {
                 self->pose_=feedback->pose;
+                self->preview_dirty_=true;
                 if(self->continuous_) self->send(false);
             }
             if(feedback->event_type==Feedback::MOUSE_UP) self->dragging_=false;
@@ -134,7 +135,7 @@ private:
         menu_.apply(*server_,tcp_); server_->applyChanges();
     }
     void send(bool interpolate) {
-        if(!active_||!initialized_) return;
+        if(!status_.view().ready||!initialized_) return;
         geometry_msgs::msg::PoseStamped pose; pose.header.frame_id=frame_; pose.header.stamp=node_->now(); pose.pose=pose_;
         if(interpolate) stamped_->publish(pose);
         else {
@@ -152,12 +153,13 @@ private:
             }
         }
         last_command_=std::chrono::steady_clock::now();
+        preview_dirty_=false;
     }
     rclcpp::Node::SharedPtr node_;
     std::string frame_,tcp_,reference_frame_;
-    bool initialized_{false},active_{false},dragging_{false},continuous_{true},have_target_{false};
+    bool initialized_{false},dragging_{false},continuous_{true},preview_dirty_{false};
     geometry_msgs::msg::Pose pose_;
-    geometry_msgs::msg::PoseStamped latest_target_;
+    CommandStatus status_;
     std::chrono::steady_clock::time_point last_command_{};
     tf2_ros::Buffer tf_; tf2_ros::TransformListener listener_;
     std::unique_ptr<interactive_markers::InteractiveMarkerServer> server_;
@@ -165,7 +167,7 @@ private:
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr immediate_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr stamped_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr target_sub_,current_sub_;
-    rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr status_sub_;
+    rclcpp::Subscription<CommandStatus::Message>::SharedPtr status_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
 };
 
@@ -220,6 +222,14 @@ void target_coordinate_panel::onInitialize()
       });
   command_pub_ = node_->create_publisher<geometry_msgs::msg::PoseStamped>(
       "/tcp_target/stamped", rclcpp::QoS(10));
+  auto* timer = new QTimer(this);
+  connect(timer, &QTimer::timeout, this, [this] {
+    const auto state = marker_manager_->commandStatus();
+    send_button_->setEnabled(have_target_ && state.ready);
+    status_label_->setText(QString::fromStdString(state.message) +
+        (state.ready ? QStringLiteral("；发送沿用当前末端姿态。") : QStringLiteral("；仅预览，不发送。")));
+  });
+  timer->start(200);
 }
 
 void target_coordinate_panel::onTargetReceived(
@@ -238,12 +248,11 @@ void target_coordinate_panel::onTargetReceived(
       .arg(msg->pose.position.x, 0, 'f', 4)
       .arg(msg->pose.position.y, 0, 'f', 4)
       .arg(msg->pose.position.z, 0, 'f', 4));
-  send_button_->setEnabled(true);
-  status_label_->setText(QStringLiteral("输入坐标将沿用当前目标的坐标系和末端姿态。"));
 }
 
 void target_coordinate_panel::onSendClicked()
 {
+  if (!marker_manager_ || !marker_manager_->commandStatus().ready) return;
   if (!node_ || !command_pub_ || !have_target_)
   {
     status_label_->setText(QStringLiteral("没有当前目标位姿，无法确定坐标系和末端姿态。"));
@@ -296,11 +305,20 @@ void tcp_pose_panel::onInitialize() {
                     for(size_t i=0;i<values_.size();++i) { values_[i]->setValue(v[i]); }
                     initialized_=true;
                 }
-                button_->setEnabled(true); status_->setText(QStringLiteral("坐标系：%1").arg(QString::fromStdString(frame_)));
             },Qt::QueuedConnection);
         });
+    auto* timer = new QTimer(this);
+    connect(timer, &QTimer::timeout, this, [this] {
+        const auto state=marker_manager_->commandStatus();
+        button_->setEnabled(!frame_.empty()&&state.ready);
+        status_->setText(QStringLiteral("坐标系：%1\n%2%3")
+            .arg(QString::fromStdString(frame_), QString::fromStdString(state.message),
+                 state.ready ? QStringLiteral("") : QStringLiteral("；仅预览，不发送。")));
+    });
+    timer->start(200);
 }
 void tcp_pose_panel::send() {
+    if (!marker_manager_ || !marker_manager_->commandStatus().ready) return;
     double qx=values_[3]->value(),qy=values_[4]->value(),qz=values_[5]->value(),qw=values_[6]->value();
     const double norm=std::sqrt(qx*qx+qy*qy+qz*qz+qw*qw);
     if(norm<1e-9||frame_.empty()) { status_->setText(QStringLiteral("目标四元数或坐标系无效")); return; }

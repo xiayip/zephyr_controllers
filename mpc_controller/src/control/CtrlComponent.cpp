@@ -234,8 +234,10 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                 [this](const nav_msgs::msg::Odometry::SharedPtr msg) {
                     if (msg) receiveBaseOdometry(*msg);
                 });
-            base_command_publisher_ = node_->create_publisher<geometry_msgs::msg::Twist>(
-                base_cmd_topic, rclcpp::SystemDefaultsQoS());
+            // The controller owns activation and must publish a final zero in
+            // on_deactivate(). Do not add a separate LifecyclePublisher gate.
+            base_command_publisher_ = rclcpp::create_publisher<geometry_msgs::msg::Twist>(
+                node_, base_cmd_topic, rclcpp::SystemDefaultsQoS());
             realtime_base_command_publisher_ =
                 std::make_shared<realtime_tools::RealtimePublisher<geometry_msgs::msg::Twist>>(
                     base_command_publisher_);
@@ -670,7 +672,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         if (!policy_valid_ || !usablePolicy(time.seconds(), future_time, policy.timeTrajectory_.front(),
                                            policy.timeTrajectory_.back(), policy_age, policy_max_age_))
         {
-            RCLCPP_ERROR(node_->get_logger(), "MPC policy invalid, expired, or outside its sampling horizon; explicit resume required");
+            RCLCPP_ERROR(node_->get_logger(), "MPC policy invalid, expired, or outside its sampling horizon; resolve before lifecycle reactivation");
             holdLastSentPositions();
             return false;
         }
@@ -813,6 +815,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         const bool joints_held = holdJointPositions();
         if (!mobile_base_enabled_) return joints_held;
         if (!base_command_publisher_ || !realtime_base_command_publisher_) return false;
+        if (!node_->get_node_base_interface()->get_context()->is_valid()) return false;
         // Acquiring the REALTIME turn means any previous asynchronous publish
         // finished. Keep its lock until the final zero is published so an old
         // queued nonzero cannot overtake it. Never call this from update().
@@ -825,13 +828,8 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         bool base_held = false;
         try
         {
-            auto lifecycle_publisher = std::dynamic_pointer_cast<
-                rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::Twist>>(base_command_publisher_);
-            if (!lifecycle_publisher || lifecycle_publisher->is_activated())
-            {
-                base_command_publisher_->publish(geometry_msgs::msg::Twist{});
-                base_held = true;
-            }
+            base_command_publisher_->publish(geometry_msgs::msg::Twist{});
+            base_held = true;
         }
         catch (const std::exception& error)
         {

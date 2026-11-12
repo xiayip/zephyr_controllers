@@ -64,6 +64,7 @@ class MotionProfileServerTest : public testing::Test {
     return Eigen::Map<const Eigen::Matrix<double, 7, 1>>(sample.pose.data());
   }
   void refresh() {
+    sample.activation_epoch = runtime->activation_epoch.load();
     sample.received_ns = motionSteadyNs();
     sample.stamp_ns = node->now().nanoseconds();
     runtime->samples.tryWrite(sample);
@@ -154,7 +155,7 @@ TEST_F(MotionProfileServerTest, OnlyActiveFreshIdleControllerAcceptsNewProfile) 
   runtime->active = true;
   sample.state = MotionStatus::INITIALIZING;
   EXPECT_FALSE(request()->accepted);
-  sample.state = MotionStatus::PAUSED;
+  sample.state = MotionStatus::STOPPING;
   EXPECT_FALSE(request()->accepted);
   sample.state = MotionStatus::FAULT;
   sample.reason = MotionStatus::SOLVER_FAILED;
@@ -167,6 +168,34 @@ TEST_F(MotionProfileServerTest, OnlyActiveFreshIdleControllerAcceptsNewProfile) 
   EXPECT_EQ(profile->requestedRevision(), 1U);
   emit_feedback = true;
   EXPECT_TRUE(request()->accepted);
+}
+
+TEST_F(MotionProfileServerTest, PriorActivationFeedbackCannotReleaseProfileGate) {
+  refresh();
+  emit_feedback = false;
+  runtime->active = false;
+  runtime->activate();
+  pump(60ms);
+  EXPECT_FALSE(latest_status.applied);
+  EXPECT_FALSE(runtime->profile_output_allowed);
+  EXPECT_FALSE(request()->accepted);
+  emit_feedback = true;
+  pump(60ms);
+  EXPECT_TRUE(latest_status.applied);
+}
+
+TEST_F(MotionProfileServerTest, StatusNeverClaimsAppliedWhileFaultedOrStopping) {
+  pump(100ms);
+  ASSERT_TRUE(latest_status.applied);
+  sample.state = MotionStatus::FAULT;
+  sample.reason = MotionStatus::POLICY_FAILED;
+  pump(100ms);
+  EXPECT_FALSE(latest_status.applied);
+  EXPECT_NE(latest_status.message, "MPC profile applied");
+  runtime->stop_request = 1;
+  pump(100ms);
+  EXPECT_FALSE(latest_status.applied);
+  EXPECT_EQ(latest_status.message, "waiting for stop confirmation");
 }
 
 TEST_F(MotionProfileServerTest, InvalidProfilesLeaveRevisionAndOwnershipUnchanged) {
@@ -242,7 +271,7 @@ TEST_F(MotionProfileServerTest, FaultAndPendingStopCannotApplyOrReleaseReference
   EXPECT_TRUE(runtime->profile_output_allowed);
 }
 
-TEST_F(MotionProfileServerTest, ActivationChangeInvalidatesPendingHandoverUntilExplicitRetry) {
+TEST_F(MotionProfileServerTest, ReactivationReappliesSelectedProfileOnlyAfterFreshPolicy) {
   const auto response = request();
   ASSERT_TRUE(response->accepted);
   runtime->active = false;
@@ -250,18 +279,18 @@ TEST_F(MotionProfileServerTest, ActivationChangeInvalidatesPendingHandoverUntilE
   EXPECT_FALSE(runtime->profile_output_allowed);
   runtime->activate();
   sample.state = MotionStatus::INITIALIZING;
-  matchingPolicy(response->revision);
+  matchingPolicy(0);  // No policy has been activated in this new lifecycle.
   pump(100ms);
   EXPECT_FALSE(runtime->profile_output_allowed);
   EXPECT_FALSE(latest_status.applied);
   EXPECT_TRUE(latest_status.transition_pending);
   EXPECT_FALSE(reference->claimMotion());
-  const auto retry = request();
-  ASSERT_TRUE(retry->accepted) << retry->message;
-  EXPECT_EQ(retry->revision, 3U);
-  matchingPolicy(retry->revision);
+  matchingPolicy(response->revision);
   pump(100ms);
   EXPECT_TRUE(runtime->profile_output_allowed);
+  EXPECT_TRUE(latest_status.applied);
+  EXPECT_FALSE(latest_status.transition_pending);
+  EXPECT_EQ(latest_status.requested_revision, response->revision);
 }
 
 TEST_F(MotionProfileServerTest, MatchingRevisionCannotApplyUsingStaleControlFeedback) {

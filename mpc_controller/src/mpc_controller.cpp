@@ -132,41 +132,42 @@ namespace zephyr::mpc
             valid = ctrl_comp_->updateObservation(time);
         }
         if (execution_->consumeFailure()) {
-            pause_requested_ = true;
             motion_fault_ = MotionStatus::SOLVER_FAILED;
         }
         if (ctrl_comp_->pose_reference_manager_->consumeFailure()) {
-            pause_requested_ = true;
             motion_fault_ = MotionStatus::REFERENCE_FAILED;
         }
         const auto collision = ctrl_comp_->collisionStatus();
-        if (valid && !pause_requested_.load(std::memory_order_acquire) &&
+        if (valid && motion_fault_ == MotionStatus::NONE &&
             collision != CollisionStatus::Safe && collision != CollisionStatus::Pending)
         {
-            pause_requested_ = true;
             motion_fault_ = MotionStatus::COLLISION_BLOCKED;
             const char* reason = collision == CollisionStatus::Collision ? "collision" :
                 collision == CollisionStatus::Invalid ? "collision check failed" : "collision check stale";
-            RCLCPP_ERROR(get_node()->get_logger(), "MPC paused: %s; resolve before explicit ~/pause resume", reason);
+            RCLCPP_ERROR(get_node()->get_logger(), "MPC fault: %s; resolve before lifecycle reactivation", reason);
         }
         const auto stop_token = motion_runtime_->stop_request.load();
         const bool action_stop = stop_token != motion_runtime_->stop_release.load();
         bool held = false;
-        if (!valid || collision == CollisionStatus::Pending || pause_requested_.load(std::memory_order_acquire) || action_stop)
+        bool ready = false;
+        if (!valid || collision == CollisionStatus::Pending || motion_fault_ != MotionStatus::NONE || action_stop)
         {
-            held = execution_->pause();
-            publishTrackingStatus(false);
+            held = execution_->hold();
         }
         else
         {
             const bool tracking = execution_->tick(time);
             // Output validation faults hold immediately and latch in this cycle.
             if (execution_->consumeFailure()) {
-                pause_requested_ = true;
                 motion_fault_ = MotionStatus::POLICY_FAILED;
             }
-            publishTrackingStatus(tracking && !pause_requested_.load(std::memory_order_acquire));
+            ready = tracking && motion_fault_ == MotionStatus::NONE &&
+                ctrl_comp_->policy_active_ && ctrl_comp_->profileOutputReady();
         }
+        // One readiness calculation serves both input admission and status.
+        // Do not reopen inputs if a stop arrived during this update cycle.
+        ready = ready && !motion_runtime_->stopRequested();
+        ctrl_comp_->pose_reference_manager_->setAcceptingTargets(ready);
         if (valid)
         {
             auto scope = ctrl_comp_->rtScopeViz();
@@ -179,6 +180,7 @@ namespace zephyr::mpc
         sample.received_ns = motionSteadyNs();
         sample.valid = valid;
         sample.stop_ack = action_stop && held ? stop_token : 0;
+        sample.activation_epoch = motion_runtime_->activation_epoch.load();
         const auto& profile = ctrl_comp_->runtime_profile_->activeConfig();
         // MRT observers retain their last slot across reset; do not advertise
         // that retired revision while waiting for the first replacement policy.
@@ -192,13 +194,10 @@ namespace zephyr::mpc
             sample.state = MotionStatus::FAULT;
             sample.reason = MotionStatus::FEEDBACK_UNAVAILABLE;
         } else if (sample.reason != MotionStatus::NONE) sample.state = MotionStatus::FAULT;
-        else if (pause_requested_) {
-            sample.state = MotionStatus::PAUSED;
-            sample.reason = MotionStatus::PAUSE_REQUESTED;
-        } else sample.state = tracking_active_ && ctrl_comp_->policy_active_ && ctrl_comp_->profileOutputReady() ?
+        else sample.state = ready ?
             MotionStatus::IDLE : MotionStatus::INITIALIZING;
         motion_runtime_->samples.tryWrite(sample);
-        ctrl_comp_->endRtCycle(tracking_active_ ? "ocs2" : "paused");
+        ctrl_comp_->endRtCycle(ready ? "ocs2" : "holding");
         return controller_interface::return_type::OK;
     }
 
@@ -244,19 +243,6 @@ namespace zephyr::mpc
         if (!profile_server_) profile_server_ = std::make_unique<MotionProfileServer>(
             get_node(), ctrl_comp_->pose_reference_manager_, ctrl_comp_->runtime_profile_,
             motion_runtime_);
-        tracking_status_publisher_ = get_node()->create_publisher<std_msgs::msg::Int32>(
-            "/fsm_state", rclcpp::QoS(1).transient_local());
-        // Periodic status also supports clients using volatile QoS.
-        tracking_status_timer_ = get_node()->create_wall_timer(std::chrono::seconds(1),
-            [this] { publishStatusMessage(); });
-        pause_service_ = get_node()->create_service<std_srvs::srv::SetBool>("~/pause",
-            [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
-                   const std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
-                pause_requested_.store(request->data, std::memory_order_release);
-                if (!request->data) motion_fault_ = MotionStatus::NONE;
-                response->success = true;
-                response->message = request->data ? "Pause requested" : "Resume requested";
-            });
         fk_service_ = get_node()->create_service<moveit_msgs::srv::GetPositionFK>("~/compute_fk",
             [this](moveit_msgs::srv::GetPositionFK::Request::SharedPtr request,
                    moveit_msgs::srv::GetPositionFK::Response::SharedPtr response) {
@@ -351,12 +337,10 @@ namespace zephyr::mpc
             for (auto& interface : ctrl_interfaces_.joint_kd_command_interface_)
                 std::ignore = interface.get().set_value(ctrl_interfaces_.pd_gains_[1]);
         }
-        pause_requested_ = false;
         motion_fault_ = MotionStatus::NONE;
-        tracking_active_ = false;
+        ctrl_comp_->policy_active_ = false;
         execution_->start();
         motion_runtime_->activate();
-        publishStatusMessage();
         RCLCPP_INFO(get_node()->get_logger(), "OCS2 starts automatically once feedback and the first policy are ready");
         return CallbackReturn::SUCCESS;
     }
@@ -364,7 +348,6 @@ namespace zephyr::mpc
     void mpc_controller::stopExecution()
     {
         const auto activation_epoch = motion_runtime_->activation_epoch.load();
-        pause_requested_ = true;
         if (ctrl_comp_)
         {
             ctrl_comp_->pose_reference_manager_->setAcceptingTargets(false);
@@ -381,14 +364,12 @@ namespace zephyr::mpc
                 RCLCPP_ERROR(get_node()->get_logger(),
                     "Lifecycle hold was not confirmed; pending motion ownership remains locked");
         }
-        tracking_active_ = false;
         motion_runtime_->active = false;
     }
     controller_interface::CallbackReturn mpc_controller::on_deactivate(const rclcpp_lifecycle::State&)
     {
         stopExecution();
         ctrl_comp_->holdLastSentPositions();
-        publishStatusMessage();
         release_interfaces();
         ctrl_interfaces_.clear();
         return CallbackReturn::SUCCESS;
@@ -396,8 +377,6 @@ namespace zephyr::mpc
     controller_interface::CallbackReturn mpc_controller::on_cleanup(const rclcpp_lifecycle::State&)
     {
         stopExecution();
-        tracking_status_timer_.reset();
-        pause_service_.reset();
         fk_service_.reset();
         ik_service_.reset();
         return CallbackReturn::SUCCESS;
@@ -411,23 +390,6 @@ namespace zephyr::mpc
     {
         stopExecution();
         return CallbackReturn::SUCCESS;
-    }
-
-    void mpc_controller::publishTrackingStatus(bool active)
-    {
-        const bool changed = tracking_active_.exchange(active, std::memory_order_acq_rel) != active;
-        if (changed)
-        {
-            ctrl_comp_->pose_reference_manager_->setAcceptingTargets(active);
-            publishStatusMessage();
-        }
-    }
-    void mpc_controller::publishStatusMessage()
-    {
-        if (!tracking_status_publisher_ || !get_node()->get_node_base_interface()->get_context()->is_valid()) return;
-        std_msgs::msg::Int32 status;
-        status.data = tracking_active_.load(std::memory_order_acquire) ? 3 : 2;
-        tracking_status_publisher_->publish(status);
     }
 
 // MPC worker scheduling belongs to this controller.
@@ -461,7 +423,7 @@ void MpcExecution::stop()
     job_ = Job::Idle;
     initialized_ = false;
 }
-bool MpcExecution::pause()
+bool MpcExecution::hold()
 {
     auto expected = Job::Requested;
     job_.compare_exchange_strong(expected, Job::Idle, std::memory_order_acq_rel);
@@ -513,7 +475,7 @@ bool MpcExecution::tick(const rclcpp::Time& time)
         last_request_time_ = time;
     if (!component_->evaluatePolicy(time))
     {
-        pause();
+        hold();
         failed_.store(true, std::memory_order_release);
         return false;
     }

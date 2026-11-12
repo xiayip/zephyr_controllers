@@ -44,7 +44,8 @@ void MotionProfileServer::request(const SetProfile::Request& req, SetProfile::Re
   next.input_cost_scale = req.profile.input_cost_scale;
   if (!validateRuntimeProfileConfig(next, res.message)) return;
   const auto sample = runtime_->samples.read();
-  if (!runtime_->active || runtime_->stopRequested() || !fresh(sample, motionSteadyNs())) {
+  if (!runtime_->active || runtime_->stopRequested() ||
+      sample.activation_epoch != runtime_->activation_epoch.load() || !fresh(sample, motionSteadyNs())) {
     res.message = "controller must be active with fresh feedback and no pending stop";
     return;
   }
@@ -64,7 +65,6 @@ void MotionProfileServer::request(const SetProfile::Request& req, SetProfile::Re
   }
   owns_reference_gate_ = true;
   runtime_->profile_output_allowed = false;
-  request_activation_epoch_ = runtime_->activation_epoch.load();
   transition_pending_ = true;
   profile_submitted_ = profile_->submit(next, res.message);
   handover_failed_ = !profile_submitted_;
@@ -81,14 +81,9 @@ void MotionProfileServer::request(const SetProfile::Request& req, SetProfile::Re
 
 void MotionProfileServer::tick() {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (request_activation_epoch_ &&
-      (!runtime_->active || runtime_->activation_epoch.load() != request_activation_epoch_)) {
-    handover_failed_ = true;
-    transition_pending_ = true;
-    detail_ = "controller activation changed; reapply profile after activation";
-  }
   const auto sample = runtime_->samples.read();
   const bool healthy = runtime_->active && !runtime_->stopRequested() &&
+      sample.activation_epoch == runtime_->activation_epoch.load() &&
       fresh(sample, motionSteadyNs()) && sample.reason == MotionStatus::NONE &&
       (sample.state == MotionStatus::IDLE || sample.state == MotionStatus::INITIALIZING);
   const bool ready = healthy && profile_submitted_ && !handover_failed_ &&
@@ -110,7 +105,13 @@ void MotionProfileServer::tick() {
   status.active_revision = runtime_->active ? sample.profile_revision : 0;
   status.applied = ready;
   status.transition_pending = transition_pending_;
-  status.message = !runtime_->active ? "controller inactive" : detail_;
+  // Do not leave a historical "applied" message visible after a stop/fault.
+  status.message = !runtime_->active ? "controller inactive" :
+      runtime_->stopRequested() ? "waiting for stop confirmation" :
+      !fresh(sample, motionSteadyNs()) || sample.activation_epoch != runtime_->activation_epoch.load() ?
+          "feedback unavailable or stale" :
+      sample.reason != MotionStatus::NONE ? "controller fault; inspect motion_status" :
+      !ready && !handover_failed_ ? "waiting for matching MPC policy" : detail_;
   publisher_->publish(status);
 }
 }  // namespace zephyr::mpc

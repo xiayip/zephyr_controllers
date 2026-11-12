@@ -17,7 +17,6 @@ bool validPose(const geometry_msgs::msg::Pose& p) {
 const char* reasonText(uint16_t reason) {
   switch (reason) {
     case MotionStatus::NONE: return "Ready";
-    case MotionStatus::PAUSE_REQUESTED: return "Controller paused";
     case MotionStatus::CONTROLLER_INACTIVE: return "Controller inactive";
     case MotionStatus::FEEDBACK_UNAVAILABLE: return "Measured feedback unavailable or stale";
     case MotionStatus::SOLVER_FAILED: return "MPC solve failed";
@@ -45,12 +44,24 @@ MotionActionServer::MotionActionServer(rclcpp_lifecycle::LifecycleNode::SharedPt
         return h == handle_ ? rclcpp_action::CancelResponse::ACCEPT : rclcpp_action::CancelResponse::REJECT;
       },
       [this](std::shared_ptr<Handle> h) { accepted(std::move(h)); });
+  stop_service_ = node_->create_service<std_srvs::srv::Trigger>("~/stop",
+      [this](std_srvs::srv::Trigger::Request::SharedPtr,
+             std_srvs::srv::Trigger::Response::SharedPtr response) {
+        if (!runtime_->active) {
+          response->message = "Controller inactive; no motion accepted";
+          return;
+        }
+        stop(MotionStatus::CANCELED, "Stopped by ~/stop");
+        response->success = true;
+        response->message = "Stop requested; wait for motion_status IDLE (or inspect FAULT), no resume needed";
+      });
   timer_ = node_->create_wall_timer(std::chrono::milliseconds(50), [this] { tick(); });
 }
 
 bool MotionActionServer::fresh(const MotionSample& sample) const {
   const auto age = motionSteadyNs() - sample.received_ns;
-  return sample.valid && sample.received_ns > 0 && age >= 0 && age <= 200000000;
+  return sample.valid && sample.activation_epoch == runtime_->activation_epoch.load() &&
+      sample.received_ns > 0 && age >= 0 && age <= 200000000;
 }
 geometry_msgs::msg::PoseStamped MotionActionServer::actual(const MotionSample& s) const {
   geometry_msgs::msg::PoseStamped p;
@@ -70,7 +81,7 @@ rclcpp_action::GoalResponse MotionActionServer::goal(
   if (reserved_ || handle_ || runtime_->stopRequested()) return reject("another motion owns the controller");
   const auto sample = runtime_->samples.read();
   if (!runtime_->active || sample.state != MotionStatus::IDLE || !fresh(sample))
-    return reject("controller is inactive, paused, initializing, faulted or has stale feedback");
+    return reject("controller is inactive, stopping, initializing, faulted or has stale feedback");
   const double values[] = {g->speed_scale, g->position_tolerance, g->orientation_tolerance,
                           g->settle_time, g->timeout};
   if (!std::all_of(std::begin(values), std::end(values), [](double x) { return std::isfinite(x) && x > 0; }) ||
@@ -114,11 +125,14 @@ void MotionActionServer::accepted(std::shared_ptr<Handle> handle) {
 }
 void MotionActionServer::stop(uint16_t reason, const std::string& message) {
   if (stopping_) return;
+  if (!handle_) activation_epoch_ = runtime_->activation_epoch.load();
   stopping_ = true;
   reason_ = reason;
   message_ = message;
   stopped_ns_ = motionSteadyNs();
   stop_token_ = runtime_->stop_request.fetch_add(1) + 1;
+  // The control loop is the sole TargetSession writer: it closes admission on
+  // its next cycle, holds output, then resets the reference before reopening.
   RCLCPP_INFO(node_->get_logger(), "Motion stopping: %s", message.c_str());
 }
 void MotionActionServer::finish(bool success, const MotionSample& sample) {
@@ -152,7 +166,8 @@ void MotionActionServer::tick() {
     status.state = MotionStatus::FAULT;
     status.reason = MotionStatus::FEEDBACK_UNAVAILABLE;
   }
-  status.message = reasonText(status.reason);
+  status.message = status.state == MotionStatus::INITIALIZING && status.reason == MotionStatus::NONE ?
+      "Initializing reference and waiting for a valid MPC policy" : reasonText(status.reason);
   if (handle_) {
     status.goal_id = uuidString(handle_->get_goal_id());
     const auto& g = *handle_->get_goal();
@@ -175,21 +190,7 @@ void MotionActionServer::tick() {
       orientation_error_ = Eigen::Quaterniond(sample.pose[6], sample.pose[3], sample.pose[4], sample.pose[5])
           .angularDistance(Eigen::Quaterniond(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z));
     }
-    if (stopping_) {
-      status.state = MotionStatus::STOPPING;
-      status.reason = reason_;
-      status.message = message_;
-      // Lifecycle inactivity does not guarantee successful output writes. An
-      // earlier activation's hold cannot acknowledge this activation's motion.
-      const bool lifecycle_stopped = activation_epoch_ != 0 &&
-          runtime_->stopped_epoch.load() == activation_epoch_;
-      if (lifecycle_stopped || (sample.stop_ack >= stop_token_ && sample.received_ns >= stopped_ns_)) {
-        finish(false, sample);
-      } else if (now - stopped_ns_ > 2000000000LL) {
-        status.reason = MotionStatus::STOP_UNCONFIRMED;
-        status.message = "Waiting for control-loop stop acknowledgement; ownership remains locked";
-      }
-    } else {
+    if (!stopping_) {
       const bool arrived = sample.reference_time >= end_time_ &&
           position_error_ <= g.position_tolerance && orientation_error_ <= g.orientation_tolerance;
       if (!arrived) settled_ns_ = 0;
@@ -198,18 +199,37 @@ void MotionActionServer::tick() {
       status.message = arrived ? "Waiting for stable measured arrival" : "Executing";
       if (settled_ns_ && (sample.received_ns - settled_ns_) * 1e-9 >= g.settle_time) finish(true, sample);
     }
+  }
+  // Shared stop confirmation for finite Actions AND continuous topic commands.
+  // A stop never clears a fault and never releases inputs before a hold write.
+  if (stopping_) {
+    status.state = MotionStatus::STOPPING;
+    status.reason = reason_;
+    status.message = message_;
+    const bool lifecycle_stopped = activation_epoch_ != 0 &&
+        runtime_->stopped_epoch.load() == activation_epoch_;
+    if (lifecycle_stopped || (sample.stop_ack >= stop_token_ && sample.received_ns >= stopped_ns_)) {
+      if (handle_) finish(false, sample);
+      else {
+        runtime_->stop_release.store(stop_token_);
+        stopping_ = false;
+      }
+    } else if (now - stopped_ns_ > 2000000000LL) {
+      status.reason = MotionStatus::STOP_UNCONFIRMED;
+      status.message = "Waiting for control-loop stop acknowledgement; inputs remain blocked";
+    }
+  }
+  if (handle_) {
     status.position_error = position_error_;
     status.orientation_error = orientation_error_;
-    if (handle_) {
-      auto feedback = std::make_shared<Action::Feedback>();
-      feedback->state = status.state;
-      feedback->actual = status.actual;
-      feedback->target = target_;
-      feedback->position_error = position_error_;
-      feedback->orientation_error = orientation_error_;
-      feedback->elapsed = (now - started_ns_) * 1e-9;
-      handle_->publish_feedback(feedback);
-    }
+    auto feedback = std::make_shared<Action::Feedback>();
+    feedback->state = status.state;
+    feedback->actual = status.actual;
+    feedback->target = target_;
+    feedback->position_error = position_error_;
+    feedback->orientation_error = orientation_error_;
+    feedback->elapsed = (now - started_ns_) * 1e-9;
+    handle_->publish_feedback(feedback);
   }
   status_pub_->publish(status);
 }

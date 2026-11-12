@@ -2,6 +2,7 @@
 #pragma once
 
 #include <rclcpp_action/rclcpp_action.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <zephyr_msgs/action/execute_cartesian_motion.hpp>
 #include <mpc_controller/control/MotionRuntime.h>
 #include <mpc_controller/control/TcpReferenceManager.h>
@@ -29,6 +30,7 @@ private:
   std::shared_ptr<TcpReferenceManager> reference_;
   std::shared_ptr<MotionRuntime> runtime_;
   rclcpp_action::Server<Action>::SharedPtr server_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_service_;
   rclcpp::Publisher<MotionStatus>::SharedPtr status_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   std::shared_ptr<Handle> handle_;

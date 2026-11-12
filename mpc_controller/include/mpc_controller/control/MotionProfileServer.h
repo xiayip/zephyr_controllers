@@ -34,7 +34,6 @@ class MotionProfileServer {
   bool profile_submitted_{true};
   bool transition_pending_{false}, owns_reference_gate_{false};
   bool handover_failed_{false};
-  uint64_t request_activation_epoch_{0};
   std::string detail_;
   rclcpp::Service<SetProfile>::SharedPtr service_;
   rclcpp::Publisher<ProfileStatus>::SharedPtr publisher_;

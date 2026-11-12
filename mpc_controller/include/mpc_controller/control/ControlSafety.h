@@ -64,8 +64,8 @@ private:
     T value_{};
 };
 
-/** Lifecycle/update are the sole writer. Old callbacks may not cross a pause
- * and resume, even if they were waiting for TF or the non-RT reference mutex.
+/** Lifecycle/update are the sole writer. Old callbacks may not cross a stop
+ * and reinitialization, even if waiting for TF or the non-RT reference mutex.
  */
 class TargetSession {
 public:

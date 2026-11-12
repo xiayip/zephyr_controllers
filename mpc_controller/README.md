@@ -130,19 +130,30 @@ ros2 launch zephyr_arm_bringup mpc_mock.launch.py show_rviz:=false
 ```bash
 ros2 control list_controllers
 ros2 topic echo /tcp_current_pose --once
-ros2 topic echo /fsm_state --once
+ros2 topic echo /mpc_controller/motion_status --once
 ```
 
 控制器类型应为 `mpc_controller/mpc_controller`；生命周期 `active` 不代表 MPC
-未暂停，需要同时查看 `/fsm_state` 和诊断日志。TCP 指令与暂停接口见下文。
+已就绪，需要同时查看 `~/motion_status`（IDLE、无故障且反馈有效）和诊断日志。
+激活后自动准备，无额外 enable/resume；TCP 指令与停止接口见下文。
 
-### 当前 mock 验证状态（2026-11-05）
+### 生命周期简化验证（2026-11-12）
+
+88 项 C++ 用例及画圆示例的 10 项 Python 用例通过。隔离 mock 验证了：
+激活自动就绪、Action 取消后接受新目标、连续目标 stop 后丢弃旧参考、
+运行配置跨重新激活自动恢复，以及 RViz 未就绪只预览、就绪后不自动发送旧预览。
+Z2 的底盘＋机械臂 mock 也验证了 stop 后底盘零速保持、无 resume 执行下一目标，
+以及停止后切回 JTC 的保持确认。底盘发送器不再另设 LifecyclePublisher 激活门槛，
+统一由 controller 管理；退出时仍需验证最终保持写入及零速发布。
+这些是控制链功能测试，不代表真机动力学、避障或物理急停验收。
+
+### 历史 mock 验证（2026-11-05）
 
 控制器核心与 RViz 插件重新编译通过，链接和导出的构建依赖不再包含 `zephyr_msgs`。
 65 项 C++ 测试及 19 项 bringup Python 测试通过，覆盖标准路径输入、无效位姿拒绝、
 暂停后忽略新目标、RViz 位姿流和非阻塞参考交接；不改求解器、控制增益及原保护逻辑。
 
-隔离 headless mock 中三个控制器 active、`/fsm_state=3`：
+当时隔离 headless mock 中三个控制器 active、MPC 正常跟踪（旧 `/fsm_state=3`）：
 - 标准 `/target_path` 执行 TCP +Z 1 cm 及返回，4 秒后末端位置误差分别约 0.051/0.054 mm。
 - 上层示例以 50 Hz 发布位姿目标，YZ 平面半径 2 cm、10 秒一圈；
   近时反馈位置误差 RMS 约 2.20 mm，回到起点并保持 3 秒后误差约 0.053 mm。
@@ -442,7 +453,8 @@ ros2 topic echo /mpc_controller/motion_profile_status
 `motion_profile_status.applied=true`，并确认 `active_revision` 等于服务返回的
 `revision`，才发送新的 `execute_motion` 或连续目标。切换期间普通目标和新 Action 均被拒绝。
 恢复联合运动使用同一服务，设置 `base_mode: 0`。切换不会恢复旧的 MPC 目标，
-需发送新目标；已选择配置后停用并重新激活 MPC，也需重新确认配置。
+需发送新目标；停用并重新激活 MPC 后保留已选配置，等待本次激活的新策略确认，
+不需要重复调用配置服务。旧策略/旧反馈不能跨激活用于放行输出。
 
 `applied` 仅确认 MPC 配置及对应策略已生效，不代表底盘实际停稳或底盘控制权已独占。
 这一版不修改底盘驱动，也不引入底盘指令仲裁；`LOCKED` 只约束 MPC 的预测和输出，
@@ -521,26 +533,43 @@ ros2 param set /mpc_controller traj_record_enabled false
 写入失败会报告错误并停止录制，不会让控制器进程退出；该次 CSV 可能缺失或不完整。
 
 
-## 自动运行与暂停
+## 生命周期、停止与故障
 
 `src/FSM` 和对应头文件已经删除，直接 OCS2 执行已合入 `src/mpc_controller.cpp`。
 激活时启动后台求解线程；完整观测及首个有效碰撞检查到达后，以实测 TCP 初始化目标。
 等待参考重置确认和第一条策略期间保持位置。
-暂停、无效观测、碰撞监控故障、策略失效、参考处理和求解异常均停止运动输出；
-除临时无效观测外，上述故障均锁存暂停，需显式恢复。
-暂停后恢复前先等待旧求解完成和非实时参考重置确认，再重置 MPC，避免并发 reset/solve。
+controller 生命周期是唯一启用入口，不再提供 `/fsm_state` 或 `~/pause`。
+`~/motion_status` 是从执行结果派生的状态反馈，不是第二个 enable 开关。
+无效观测、停止请求、碰撞监控故障、策略失效、参考处理和求解异常均停止运动输出。
+普通停止不锁存：有限 Action 使用 cancel；连续 Pose/Twist/Path 或任意当前运动使用 `~/stop`：
 
 ```bash
-ros2 service call /mpc_controller/pause std_srvs/srv/SetBool '{data: true}'
-ros2 service call /mpc_controller/pause std_srvs/srv/SetBool '{data: false}'
+ros2 service call /mpc_controller/stop std_srvs/srv/Trigger '{}'
+ros2 topic echo /mpc_controller/motion_status
 ```
 
-单机械臂使用相同的暂停/恢复服务路径。
+Trigger 的 `success=true` 仅表示受理，不表示已经物理停止。状态先进入 STOPPING，
+控制循环确认保持指令/底盘零速输出后，丢弃旧参考并重新准备至 IDLE。
+此后可发送新目标，无需 resume；停止服务会中止当前 Action，Action cancel 则返回 CANCELED。
+停止确认等待期间拒绝新输入；旧目标不会在恢复就绪或重连 RViz 后自动重发。
+停止参考重置前等待旧求解完成，避免并发 reset/solve。
+连续发送器应先停止发布，再调用 `~/stop`；否则重新 IDLE 后到达的新消息仍会被执行。
+该服务不持久禁用控制器，也不是急停或遥控断链保护。
+
+除临时无效观测外，求解/策略/参考/碰撞故障仍锁存为 FAULT；新目标和 `~/stop`
+不会清错。先排查原因，再通过 controller_manager 明确停用/重新激活 MPC；
+不得自动重试。真机必须先确认保持和控制链交接条件，不能把停用等同于安全失能。
 停用控制器时先发保持/底盘零速并停止接受目标，再 join 求解线程、显示线程，最后释放硬件接口；
 重新激活后自动启动。
-`/fsm_state` 仅作为原版 RViz/目标管理器的兼容状态发布（3 运行、2 暂停），
-控制器不再接收 `/fsm_command`，也不再提供 HOME、MOVEJ、腰部或原状态机动作接口。
-本地交互坐标轴直接订阅该状态话题，以支持启动后拖动目标。
+退出整个 launch 前，先停止上游输入、完成 `~/stop` 确认及控制器交接。
+直接 Ctrl+C 可能先使 ROS 通信上下文失效，导致底盘保持无法确认；
+此时保留告警，不将“进程已退出”当作物理停稳证明。
+
+RViz 统一订阅 `/mpc_controller/motion_status`（可用 `motion_status_topic` 参数改路径）。
+未就绪时小球仍可预览拖动，但不发送；面板显示不可用原因并禁用发送按钮。
+只有 IDLE、无故障、反馈有效且没有 Action 所有者时才允许发送。
+状态超过 1 秒未更新会禁用发送，恢复状态不会自动发送预览目标。
+这只是客户端防误操作，不替代控制器校验，也不是遥控断链急停。
 
 ## 通用有限运动接口
 
@@ -565,8 +594,8 @@ relative、twist 和 path topic 输入均忽略。成功后恢复原有 topic �
 多阶段 BT 应避免阶段之间混入外部手动目标。既有 topic 的空闲行为保持兼容。
 
 成功要求参考轨迹结束，并且实测 TCP 连续满足位置/姿态容差达到 `settle_time`。
-输入可达性、避障和实际任务成功不由这一到位判据保证。超时、反馈失效、暂停、
-停用或求解错误使任务失败，不自动重试。暂停再恢复也不会继续之前的 Action。
+输入可达性、避障和实际任务成功不由这一到位判据保证。超时、反馈失效、停止、
+停用或求解错误使任务失败，不自动重试，重新就绪也不会继续之前的 Action。
 
 取消/失败先请求控制循环保持关节指令、底盘输出零速度，收到停止确认后才返回终态。
 该确认表示控制循环已执行保持，不表示已经由轮速/力传感器确认物理静止。
@@ -576,7 +605,8 @@ relative、twist 和 path topic 输入均忽略。成功后恢复原有 topic �
 
 `~/motion_status` 使用 `zephyr_msgs/msg/ControllerMotionStatus`，含状态、原因、
 Action UUID、实测 TCP、反馈有效性及误差。状态区分 INACTIVE、INITIALIZING、IDLE、
-EXECUTING、SETTLING、STOPPING、PAUSED、FAULT；`/fsm_state` 继续保留给旧可视化客户端。
+EXECUTING、SETTLING、STOPPING、FAULT。消息中历史 PAUSED/PAUSE_REQUESTED 常量暂保留兼容，
+本控制器不再使用，不修改消息字段或枚举编号；旧 `/fsm_state` 客户端必须同步升级。
 反馈快照超过 200 ms 不用于任务完成判断。具体求解/碰撞异常细节仍可查控制器日志。
 
 动作协议处理、TF、插值和结果发布在 ROS executor；控制线程只写固定大小的反馈快照

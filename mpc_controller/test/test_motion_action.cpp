@@ -33,15 +33,20 @@ protected:
     node->configure(); node->activate();
     client = rclcpp_action::create_client<Action>(node, "/motion_test/controller/execute_motion");
     ASSERT_TRUE(client->wait_for_action_server(2s));
+    stop_client = node->create_client<std_srvs::srv::Trigger>("/motion_test/controller/stop");
+    status_sub = node->create_subscription<MotionStatus>("/motion_test/controller/motion_status", 1,
+        [this](const MotionStatus& status) { latest_status = status; });
+    ASSERT_TRUE(stop_client->wait_for_service(2s));
   }
   void TearDown() override {
     runtime->active = false;
     pump(100ms);
-    client.reset(); server.reset();
+    status_sub.reset(); stop_client.reset(); client.reset(); server.reset();
     executor.remove_node(node->get_node_base_interface());
     reference.reset(); node.reset();
   }
   void refresh() {
+    sample.activation_epoch = runtime->activation_epoch.load();
     sample.received_ns = motionSteadyNs(); sample.stamp_ns = node->now().nanoseconds();
     runtime->samples.tryWrite(sample);
     ocs2::SystemObservation observation; observation.time = sample.reference_time;
@@ -79,6 +84,11 @@ protected:
     sample.state = MotionStatus::STOPPING;
     reference->setAcceptingTargets(false);
   }
+  std_srvs::srv::Trigger::Response::SharedPtr requestStop() {
+    auto future = stop_client->async_send_request(std::make_shared<std_srvs::srv::Trigger::Request>());
+    if (!wait(future)) { ADD_FAILURE() << "No stop response"; return {}; }
+    return future.get();
+  }
   rclcpp_lifecycle::LifecycleNode::SharedPtr node;
   rclcpp::executors::SingleThreadedExecutor executor;
   std::shared_ptr<ocs2::ReferenceManager> wrapped;
@@ -86,6 +96,9 @@ protected:
   std::shared_ptr<MotionRuntime> runtime;
   std::unique_ptr<MotionActionServer> server;
   rclcpp_action::Client<Action>::SharedPtr client;
+  rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr stop_client;
+  rclcpp::Subscription<MotionStatus>::SharedPtr status_sub;
+  MotionStatus latest_status;
   MotionSample sample;
 };
 }
@@ -223,7 +236,7 @@ TEST_F(MotionActionTest, ControllerFaultHasStructuredReasonAndNeedsStopAck) {
   EXPECT_EQ(result.get().result->reason, MotionStatus::SOLVER_FAILED);
 }
 
-TEST_F(MotionActionTest, QuickPauseAndResumeCannotResumeOldTask) {
+TEST_F(MotionActionTest, InvalidatedReferenceSessionCannotResumeOldTask) {
   auto h = send(goal()); ASSERT_TRUE(h);
   auto result = client->async_get_result(h);
   reference->setAcceptingTargets(false);
@@ -232,6 +245,64 @@ TEST_F(MotionActionTest, QuickPauseAndResumeCannotResumeOldTask) {
   EXPECT_TRUE(runtime->stopRequested());
   stopAck(); ASSERT_TRUE(wait(result));
   EXPECT_EQ(result.get().result->reason, MotionStatus::REFERENCE_FAILED);
+}
+
+TEST_F(MotionActionTest, TopicStopIsAcknowledgedBeforeAcceptingFreshTargetsWithoutResume) {
+  auto pub = node->create_publisher<geometry_msgs::msg::Pose>("tcp_target", 1);
+  pub->on_activate(); pump(80ms);
+  auto target = goal().target.pose; target.position.z = 0.5;
+  pub->publish(target); pump(50ms); commit();
+  EXPECT_DOUBLE_EQ(wrapped->getTargetTrajectories().stateTrajectory.back()(2), 0.5);
+  auto response = requestStop(); ASSERT_TRUE(response); EXPECT_TRUE(response->success);
+  const auto token = runtime->stop_request.load();
+  response = requestStop(); ASSERT_TRUE(response); EXPECT_TRUE(response->success);
+  EXPECT_EQ(runtime->stop_request.load(), token);  // Repeated stop is idempotent.
+  reference->setAcceptingTargets(false);  // Next control cycle closes inputs before hold acknowledgement.
+  target.position.z = 0.9;
+  pub->publish(target); pump(100ms); commit();
+  EXPECT_DOUBLE_EQ(wrapped->getTargetTrajectories().stateTrajectory.back()(2), 0.5);
+  EXPECT_TRUE(runtime->stopRequested());
+  EXPECT_EQ(latest_status.state, MotionStatus::STOPPING);
+  EXPECT_FALSE(send(goal()));
+  stopAck(); pump(100ms);
+  EXPECT_FALSE(runtime->stopRequested());
+  // Simulate the normal RT reinitialization: measured hold and a fresh policy.
+  ASSERT_TRUE(reference->requestReset(Eigen::Map<const Eigen::Matrix<double, 7, 1>>(sample.pose.data()), 10));
+  pump(50ms); ASSERT_TRUE(reference->resetReady());
+  sample.state = MotionStatus::IDLE;
+  reference->setAcceptingTargets(true);
+  pub->publish(target); pump(80ms); commit();
+  EXPECT_DOUBLE_EQ(wrapped->getTargetTrajectories().stateTrajectory.back()(2), 0.9);
+  EXPECT_EQ(latest_status.state, MotionStatus::IDLE);
+  EXPECT_TRUE(send(goal()));
+}
+
+TEST_F(MotionActionTest, StopServiceAbortsOwnedActionAndDoesNotClearFault) {
+  auto h = send(goal()); ASSERT_TRUE(h);
+  auto result = client->async_get_result(h);
+  auto response = requestStop(); ASSERT_TRUE(response); EXPECT_TRUE(response->success);
+  pump(80ms); EXPECT_NE(result.wait_for(0ms), std::future_status::ready);
+  sample.reason = MotionStatus::SOLVER_FAILED;
+  stopAck(); ASSERT_TRUE(wait(result));
+  EXPECT_EQ(result.get().code, rclcpp_action::ResultCode::ABORTED);
+  sample.state = MotionStatus::FAULT; pump(100ms);
+  EXPECT_EQ(latest_status.reason, MotionStatus::SOLVER_FAILED);
+  EXPECT_FALSE(send(goal()));
+  runtime->active = false;
+  response = requestStop(); ASSERT_TRUE(response); EXPECT_FALSE(response->success);
+}
+
+TEST_F(MotionActionTest, PriorActivationFeedbackCannotAdmitNewMotion) {
+  refresh();
+  runtime->active = false;
+  runtime->activate();  // Recent timestamp, but feedback belongs to the old activation.
+  pump(60ms, false);
+  EXPECT_FALSE(latest_status.feedback_valid);
+  auto future = client->async_send_goal(goal());
+  pump(60ms, false);
+  ASSERT_EQ(future.wait_for(0ms), std::future_status::ready);
+  EXPECT_FALSE(future.get());
+  EXPECT_TRUE(send(goal()));  // Fresh current-activation feedback restores admission.
 }
 
 TEST_F(MotionActionTest, FullPathIsInterpolatedAndZeroDistanceStillRequiresFreshSettling) {

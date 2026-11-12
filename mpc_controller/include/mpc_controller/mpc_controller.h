@@ -14,8 +14,6 @@
 #include <controller_interface/controller_interface.hpp>
 #include <hardware_interface/loaned_command_interface.hpp>
 #include <hardware_interface/loaned_state_interface.hpp>
-#include <std_msgs/msg/int32.hpp>
-#include <std_srvs/srv/set_bool.hpp>
 
 #include "mpc_controller/control/CtrlComponent.h"
 
@@ -33,8 +31,8 @@ public:
     ~MpcExecution();
     void start();
     void stop();
-    bool pause();
-    /** Starts from the current measured pose after activation or resume. */
+    bool hold();
+    /** Starts from measured pose after activation or a completed stop. */
     bool tick(const rclcpp::Time& time);
     bool consumeFailure() { return failed_.exchange(false, std::memory_order_acq_rel); }
 private:
@@ -73,8 +71,6 @@ private:
         controller_interface::return_type update(const rclcpp::Time& time, const rclcpp::Duration& period) override;
 
     private:
-        void publishTrackingStatus(bool active);
-        void publishStatusMessage();
         void stopExecution();
 
         // Hardware parameters
@@ -103,12 +99,8 @@ private:
             {"effort", &ctrl_interfaces_.joint_force_state_interface_}
         };
 
-        // Numeric status is retained solely for unchanged upstream visualization clients.
-        rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr tracking_status_publisher_;
-        rclcpp::TimerBase::SharedPtr tracking_status_timer_;
-        rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr pause_service_;
-        std::atomic_bool pause_requested_{false};
-        std::atomic_bool tracking_active_{false};
+        // Faults are latched until explicit lifecycle reactivation. Ordinary
+        // stops only discard the old motion; there is no second enable switch.
         std::atomic<uint16_t> motion_fault_{MotionStatus::NONE};
         std::shared_ptr<MotionRuntime> motion_runtime_{std::make_shared<MotionRuntime>()};
         std::unique_ptr<MotionActionServer> motion_server_;
