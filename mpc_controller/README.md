@@ -13,6 +13,7 @@
 | `include/mpc_controller/runtime/` | 线程调度、执行周期计算和可选耗时统计 |
 | `src/control/CtrlComponent.cpp` | 模型加载、实测观测、求解结果执行、保护与工作线程协调 |
 | `src/control/TcpReferenceManager.cpp` | TCP 目标输入、坐标转换与 OCS2 参考轨迹生成 |
+| `src/control/ContinuousTcpPath.cpp` | 显式连续路径的几何插值、时间参数化与偏离检查，不依赖 ROS 或硬件 |
 | `src/control/TcpTrajectoryRecorder.cpp` | 实测/预测 TCP 的缓冲与 CSV 写出 |
 | `include/mpc_controller/control/BaseKinematics.h` | 旧底盘后端的横向速度约束；不安排底盘/机械臂动作顺序 |
 | `src/visualization/mpc_visualizer.cpp` | TCP 位姿、两色轨迹、分身及其时间对齐 |
@@ -27,7 +28,7 @@ TCP 接入 MPC 的主要链路为：
 
 MPC 求解器与优化模型使用未修改的 `ocs2_mobile_manipulator`、`ocs2_ddp`、`ocs2_mpc`。
 关节接口、调度/计时及单 TCP 误差 HUD 是本包内的少量辅助代码；不复制 MPC 算法。
-目标输入和服务均复用标准 ROS 类型，不依赖 `zephyr_msgs`。
+普通目标话题及 FK/IK 复用标准 ROS 类型；有限运动 Action 和运行配置接口依赖 `zephyr_msgs`。
 画圆等形状生成放在上层示例，不属于控制器的执行接口。
 代码来源、迁移基线和维护边界见 [UPSTREAM.md](UPSTREAM.md)。
 
@@ -207,6 +208,7 @@ Z2 的底盘＋机械臂 mock 也验证了 stop 后底盘零速保持、无 resu
 | 速度目标（Twist） | `/tcp_target/twist` |
 | 相对位移目标（TwistStamped） | `/tcp_target/relative` |
 | 分段位姿路径（Path） | `/target_path` |
+| 连续通过路径（Path，显式选择） | `/target_path/continuous` |
 
 `tcp_ee_frame` 是本包的末端配置参数，默认读取 task.info 的 eeFrame。
 当前两个 Zephyr 模型的真实 TF 末端仍为 `omni_picker_tcp`，本次仅统一控制接口命名，
@@ -234,25 +236,84 @@ Z2 的底盘＋机械臂 mock 也验证了 stop 后底盘零速保持、无 resu
 每段在途径点处减速到零；`movel_duration` 是整条路径的基础时长，速度、加速度和 jerk
 限制可以延长它。参数在初始化时读取，**Path 的时间戳不作为轨迹时间表**。
 
+### 连续通过参考帧
+
+有限运动优先使用 `/mpc_controller/execute_motion` 的 `CONTINUOUS_PATH=3` 模式；
+也可发送 `nav_msgs/msg/Path` 到 `/target_path/continuous`。旧 `PATH=2` 和
+`/target_path` 仍逐段起停，默认行为不变。此轮仅在 Action 中新增一个常量值，
+未新增字段；发送端和机器人端仍应同步更新 `zephyr_msgs`，重新编译控制器及使用该
+Action 的客户端（包括 BT/RViz）。
+旧服务端不支持模式 3，不能混用来验证新功能。
+
+新模式把整条路径作为一个有限运动：自然三次样条穿过中间位姿，整条路径共用
+一个五次时间律，首尾参考速度及加速度为零，中间点不再强制归零。
+它不保证恒速：曲率、反向和速度/加速度/jerk 约束仍会要求减速。
+重复位姿会合并，不表示停留。需要停稳、接触确认或严格保持折线时仍用旧 PATH
+或分成独立有限运动；本轮不实现阶段门槛、混合停止点或活动 Action 的在线续接。
+
+- 时间参数化使用现有 `movel_max_*`，Action 的 `speed_scale` 对这些限制同时缩放。
+  Action 时长由限制决定；topic 路径另以 `movel_duration` 为最短总时长。
+- `movel_continuous_max_deviation` 默认 **0.0（关闭折线偏离限制）**，支持稀疏、长距离
+  的参考帧。在初始化读取、禁止在线更改；设置有限正数（单位 m，例如 `0.005`）
+  可重新启用 Bezier 控制凸包的保守偏离检查，超限明确拒绝，不退化成其他模式。
+  该上界可能比曲线实际偏离更大；关闭后样条仍穿过各途经点，但点间可能明显弯曲或
+  过冲，不能将输入折线的空闲空间当成平滑路径的空闲空间。它不是碰撞检查。
+- 姿态在起点的局部旋转向量坐标中插值，再映射回单位四元数。起点相对转角和
+  整段控制凸包须小于 **3 rad**；跨分支/大转动路径会拒绝，请拆成停止路径。
+  `q` 与 `-q` 视为相同姿态，不支持多圈旋转意图。
+- 解析曲线采用保守导数上界确定总时长，默认 `movel_sample_interval=0.04 s` 采样，
+  并额外保留每个原始途经点。OCS2 上游仍对离散位置线性插值、姿态 SLERP；
+  因此不能将解析曲线的 C2 连续性或 jerk 上界视为实际关节输出的严格保证。
+- 有限 Action 从实测 TCP 起点建立参考，有接收/到位/取消反馈；topic 从当前参考起点
+  替换整条路径，无到位确认，也不保证移动中反复替换的速度连续性。不要用该 topic
+  冒充已经实现了滚动参考拼接。需要取消时使用 Action cancel 或 `~/stop`。
+- 平滑偏离检查不等于碰撞检查、可达性检查或全身安全认证。最终到位要求实测
+  TCP 误差及全身速度连续达标，见下文“有限运动的停稳判定”；中间点不触发该判定。
+- 仅 `mock_debug_enabled=true` 时发布 `/tcp_reference_path`（Path，transient-local），
+  显示或记录已提交的整条参考及其时间戳；这是非实时诊断，不是实际执行确认。
+  无路径的保持目标发布空 Path 清除旧显示。真机默认不创建该 publisher。
+
+OCS2 接入复用现有 `TargetTrajectories` 和 `ReferenceManager`：完整轨迹在非实时
+回调中生成并写入缓冲，下一次 `preSolverRun` 才统一生效。控制器的参考生成不修改
+模型、求解器、执行保护或上游源码；预测时域由各机器人 `.info` 配置选择。
+`ModeSchedule` 用于具有模式切换的动力学模型；
+当前运动学模型不因为任务进入“按压”就切换动力学，所以本轮不引入伪模式序列。
+后续任务阶段约束应与参考版本同步，不能在求解过程中直接改共享代价对象。
+
+仅用于已启动的**单臂 mock** 示例，以下坐标需改为当前 TCP 附近的可达坐标：
+
+```bash
+ros2 action send_goal /mpc_controller/execute_motion \
+  zephyr_msgs/action/ExecuteCartesianMotion \
+  "{mode: 3, waypoints: [
+    {header: {frame_id: base_link}, pose: {position: {x: 0.30, y: 0.00, z: 0.30}, orientation: {w: 1.0}}},
+    {header: {frame_id: base_link}, pose: {position: {x: 0.30, y: 0.01, z: 0.30}, orientation: {w: 1.0}}},
+    {header: {frame_id: base_link}, pose: {position: {x: 0.30, y: 0.02, z: 0.30}, orientation: {w: 1.0}}}
+  ], speed_scale: 0.3, timeout: 0.0}" --feedback
+```
+
+这不是按钮接触轨迹，也不应原样用于真机。可先用 `ros2 topic echo /tcp_current_pose --once`
+取得当前位置和四元数，用相同四元数构造小幅直线路径，再比较 `mode: 2` 与 `mode: 3`。
+
 连续遥操或圆轨迹使用 `/tcp_target`（`geometry_msgs/Pose`）位姿流，坐标必须是 MPC 基坐标系。
 该入口直接更新参考，不经过上述路径插值/限速；发送端负责连续性和目标速度，
 控制器原有关节约束及保护仍生效。不要同时运行多个目标发送器。
 配套 mock 画圆示例位于 `zephyr_arm_bringup/scripts/mpc_circle_demo.py`：
 
 ```bash
-# 已启动 mpc_mock.launch.py，FSM=3；期间不要拖动 RViz 小球。
+# 已启动 mpc_mock.launch.py，motion_status 为 IDLE；期间不要拖动 RViz 小球。
 ros2 run zephyr_arm_bringup mpc_circle_demo.py --plane yz --radius 0.02 --duration 10
 ```
 
 此示例只允许 GenericSystem，保持当前 TCP 姿态，绕一圈返回起点后保持 3 秒并退出。
-普通 topic 没有接收确认、到位反馈或目标取消语义；通过实际 TCP/FSM 判断跟踪情况。
-暂停时忽略新目标。停止发送只会保留最后目标，暂停跟踪请调用控制器的 `~/pause`。
+普通 topic 没有接收确认、到位反馈或目标取消语义；通过实际 TCP 和 motion_status 判断跟踪情况。
+停止发送只会保留最后目标；停止跟踪时先停止发布，再调用控制器的 `~/stop`。
 
 ### 服务迁移与 FK/IK 约束
 
 | 服务 | 当前类型 | 迁移要求 |
 | --- | --- | --- |
-| `~/pause` | `std_srvs/srv/SetBool` | 不变 |
+| `~/stop` | `std_srvs/srv/Trigger` | 替代旧 `~/pause`；重新就绪后可接收新目标，无 resume |
 | `~/compute_fk` | `moveit_msgs/srv/GetPositionFK` | 替代旧 `~/kinematics_service` 的 FK 分支 |
 | `~/compute_ik` | `moveit_msgs/srv/GetPositionIK` | 替代旧 `~/kinematics_service` 的 IK 分支 |
 
@@ -326,7 +387,8 @@ Kp/Kd、重力与摩擦前馈继续由下游 Position Adapter 管理。
 关节读取失败、NaN/Inf、里程计接收超时（500 ms）、无效四元数或
 `header.frame_id` 与 `base_odom_frame` 不一致时，保留上一组有效观测，
 暂停 MPC 执行，保持最近一次关节位置命令，并向底盘发送零速度。
-该超时依据本机接收时间；当前未额外判断消息源时间戳。首次激活时关节反馈无效会拒绝激活。
+该位置反馈保护依据本机接收时间；Action 停稳判定另检查里程计源时间戳与速度，见下文。
+首次激活时关节反馈无效会拒绝激活。
 正常反馈恢复后从当前实测 TCP 位姿重新开始 MPC。此处检查的是控制器使用的位置反馈，不代替硬件故障诊断。
 
 实时 TCP FK 使用 `rt_data_`；预测、轨迹记录使用显示工作线程自己的 `viz_data_`。
@@ -379,7 +441,7 @@ TCP 参考轨迹生成、Twist 积分和目标发布只在非实时回调执行�
   碰撞结果的年龄从观测采集时刻计算，重复检查旧快照不会刷新有效期。
   目前检查与显示共用工作线程（频率为 `prediction_publish_hz`），但关闭预测显示
   不关闭已配置的碰撞检查。慢 FCL/显示负载可能触发监控超时，不会被当作安全。
-- 求解、参考处理和上述策略/碰撞故障必须排查后显式调用 `~/pause {data: false}` 恢复。
+- 求解、参考处理和上述策略/碰撞故障必须排查后显式停用/重新激活控制器，`~/stop` 不清错。
   首条策略尚未到达时只保持，不会输出运动命令。
 - MIX 模式按 Pinocchio 关节名对应的 `idx_v` 选取重力力矩，跳过移动底盘自由度。
   初始化校验六轴顺序和模型维度，拒绝静默错位。保持状态不失能电机，也不清掉
@@ -474,6 +536,8 @@ ros2 topic echo /mpc_controller/motion_profile_status
 每个显示周期都以当前 ROS 时间重新采样：第 k 个分身对应 `现在 + k × prediction_ghost_interval`，
 过去的点不显示，超过优化时域末端的点不外推。
 单臂 mock 配置 1 秒时域、0.2 秒间隔和最多 5 个分身；实际数量受剩余预测时域限制。
+Z2 的 `z2_bringup/config/ocs2/mpc_{mock,real}.info` 配置 5 秒时域；
+Z2 mock 的分身间隔为 1 秒、最多 5 个，真机仍关闭预测显示。
 预测终点是当前有限时域末端，不保证已经到达远处目标。
 蓝色 TCP 路径从最新实测 TCP 连向剩余预测轨迹，橙色段表示下一控制周期的预测位置。
 路径最多做 64 次预测 FK，分身在相邻预测状态之间按绝对时间插值。
@@ -604,11 +668,30 @@ RViz 节点可配置以下参数（不改变机器人端配置）：
 - `POSE`（0）：`target` 指定配置 TCP 的目标位姿。
 - `RELATIVE`（1）：`relative` 指定相对实测 TCP 的平移和旋转向量；单位 m/rad。
 - `PATH`（2）：`waypoints` 指定位姿序列（1～1000 个）；逐段插值，不继承点的时间作为轨迹时序。
+- `CONTINUOUS_PATH`（3）：平滑穿过中间位姿，仅最终目标要求停稳，限制见“连续通过参考帧”。
 
 每个动作提供 `speed_scale`、位置/旋转容差、`settle_time` 和 `timeout`。
 `speed_scale` 是配置参考速度、加速度、jerk 上限的比例，不改变底层关节硬限位，
 也不保证实测 TCP 速度严格等于参考速度。有限动作不沿用 `movel_duration` 的最短总时长，
 而是根据当前反馈、路径距离与参考限值计算时长。`.info` 和模型参数仍在初始化时读取。
+
+`timeout` 默认 **0.0**：按已生成参考的时长 `T` 自动计算有限截止时间
+`T + settle_time + max(5 s, 0.25 × T)`，避免长路径被固定 30/40 秒误截断。
+这不是无限等待；不可达、长期受阻或未停稳仍会超时。显式正数仍是从 Action 受理开始
+计算的严格墙钟截止时间，**不会自动延长**。因此长距离命令请省略 timeout 或明确写
+`timeout: 0.0`；原命令里的 `timeout: 40.0` 仍会在 40 秒停止。
+负数、NaN 和 Inf 拒绝。日志显示参考时长、实际截止时间及 automatic/explicit。
+旧编译客户端可能仍使用原默认 30 秒，需重新构建或显式发送 0；没有增加消息字段。
+
+长路径不会自动提高移动速度，也不会关闭关节限位、速度/加速度/jerk、反馈新鲜度、
+求解故障和已配置的碰撞保护。仍保留 1000 个途经点、采样内存预算及旋转向量分支限制；
+超大任务需切成合适的参考段，当前尚未实现活动 Action 的在线拼接。
+
+2026-11-18 长路径 mock 回归：约 1.25 m、一个途经 pose 加一个终点 pose，保持
+原 0.05 m/s 参考速度上限，自动截止时间 59.08 s，参考时长 46.94 s，Action 成功。
+TCP 同时间参考误差 RMS 2.12 mm、最大 5.82 mm，途经点实测速度约 0.046 m/s；
+底盘移动约 1.13 m，并与机械臂同时运动。14 个测试程序、121 项当前用例通过。
+这些为 GenericSystem mock 数据，不代表真机精度或避障验收。
 
 位姿非空 frame 按其时间戳转换，零时间戳表示最新 TF；空 frame 使用 MPC 参考系。
 移动底盘通常为 `odom`，固定底座为模型 base frame。相对动作的 TCP frame 表示
@@ -619,7 +702,7 @@ RViz 节点可配置以下参数（不改变机器人端配置）：
 relative、twist 和 path topic 输入均忽略。成功后恢复原有 topic 输入；
 多阶段 BT 应避免阶段之间混入外部手动目标。既有 topic 的空闲行为保持兼容。
 
-成功要求参考轨迹结束，并且实测 TCP 连续满足位置/姿态容差达到 `settle_time`。
+成功要求参考轨迹结束，并且实测 TCP 位置/姿态误差及全身速度连续达标达到 `settle_time`。
 输入可达性、避障和实际任务成功不由这一到位判据保证。超时、反馈失效、停止、
 停用或求解错误使任务失败，不自动重试，重新就绪也不会继续之前的 Action。
 
@@ -650,3 +733,38 @@ ros2 topic echo /mpc_controller/motion_status
 底盘固定通过前述 `~/set_motion_profile` 在动作开始前配置。关节姿态代价、MoveIt 场景检查、
 动态 `.info` 切换和连续视觉目标任务会话留待后续实现。
 `ArmTapBT` 在任务层组合接近/按压/退回；控制器中没有按钮专用阶段和业务判断。
+
+### 有限运动的停稳判定
+
+以上四种有限 Action 共用此判据，不新增控制 FSM 或 enable 开关。TCP 到达但底盘、
+关节仍在运动时不会提前返回成功。仅在最终参考结束后检查，中间参考点不因此减速。
+`SETTLING` 表示几何误差已经达标、正在等待速度及持续时间；速度未达标或无效会清零
+持续时间计数，并在 `motion_status.message` 中给出速度和有效标志。
+
+| 初始化参数 | 默认值 | 含义 |
+| --- | --- | --- |
+| `settle_tcp_linear_velocity` | `0.005` m/s | 实测 TCP 平移速度上限 |
+| `settle_tcp_angular_velocity` | `0.03` rad/s | 实测 TCP 角速度上限 |
+| `settle_joint_velocity` | `0.03` rad/s | 机械臂关节运动速度上限 |
+| `settle_base_linear_velocity` | `0.01` m/s | 移动底盘平面速度上限 |
+| `settle_base_angular_velocity` | `0.03` rad/s | 移动底盘转向速度上限 |
+
+参数放在控制器 `ros__parameters` 下，必须为有限正数，修改需重新加载控制器；
+在线改值会拒绝。这些是**到位判定阈值，不是运动限速**，默认值尚未经真机噪声标定。
+
+速度来自实测关节位置、TCP FK 和底盘位置的约 50 ms 累计绝对运动量，不使用命令或
+预测速度；关节量累计每周期最大的关节位移，保守覆盖各关节，避免零空间运动漏判。
+来回运动不会因净位移为零而抵消。移动模型还取里程计 twist 与位置估计速度中较大者；
+里程计时间戳必须有效，与控制器 ROS 时钟相差不超过过去 200 ms / 未来 20 ms。
+零时间戳、过期或非有限速度均不能当作静止，直到有效反馈恢复才重新累计停稳时间。
+固定底座不要求里程计；激活、时钟跳变或无效观测会清空速度窗口，先等待新测量。
+
+这是有采样/窗口延迟的任务到位判据，不是安全认证的静止检测，也不要求底盘与机械臂
+在同一毫秒停止。取消/故障的“保持输出已确认”语义不变，不能将其等同于物理停稳。
+
+2026-11-18 完整 Z2 GenericSystem mock 验证：同一条 TCP +X 25 cm、+Z 6 cm 的
+六点连续路径，以参考峰值 0.025 / 0.05 m/s 各往返一次，4 次 Action 均成功。
+底盘与机械臂存在同时运动区间，底盘每程约移动 22 cm；TCP 同时间参考误差 RMS
+2.22～2.46 mm，最大 6.04 mm，内部途经点没有强制停顿。14 个测试程序、117 项当前用例通过。
+未改控制增益/底盘限速；碰撞检查沿用当前关闭配置。此结果不代表真机动力学精度、
+避障能力或底盘最终朝向已经满足按电梯任务要求。

@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <mpc_controller/control/MotionActionServer.h>
 #include <ocs2_oc/synchronized_module/ReferenceManager.h>
+#include <limits>
 #include <thread>
 
 using namespace zephyr::mpc;
@@ -22,6 +23,7 @@ protected:
     runtime = std::make_shared<MotionRuntime>();
     runtime->activate();
     sample.valid = true; sample.state = MotionStatus::IDLE; sample.reference_time = 10;
+    sample.speeds.valid = true; // Fixture explicitly supplies fresh measured standstill.
     sample.pose = {0.1, 0.2, 0.3, 0, 0, 0, 1};
     executor.add_node(node->get_node_base_interface());
     ocs2::vector_t p = Eigen::Map<const Eigen::Matrix<double, 7, 1>>(sample.pose.data());
@@ -127,11 +129,13 @@ TEST_F(MotionActionTest, MotionRejectsConcurrentGoalsAndAllLegacyTargetInputs) {
   auto relative_pub = node->create_publisher<geometry_msgs::msg::TwistStamped>("tcp_target/relative", 1); relative_pub->on_activate();
   auto twist_pub = node->create_publisher<geometry_msgs::msg::Twist>("tcp_target/twist", 1); twist_pub->on_activate();
   auto path_pub = node->create_publisher<nav_msgs::msg::Path>("target_path", 1); path_pub->on_activate();
+  auto continuous_pub = node->create_publisher<nav_msgs::msg::Path>("target_path/continuous", 1); continuous_pub->on_activate();
   pump(100ms);
   auto p = goal().target; p.pose.position.z = 0.9;
   geometry_msgs::msg::TwistStamped d; d.twist.linear.z = 0.9;
   nav_msgs::msg::Path path; path.poses = {p};
   pose_pub->publish(p.pose); stamped_pub->publish(p); relative_pub->publish(d); twist_pub->publish(d.twist); path_pub->publish(path);
+  continuous_pub->publish(path);
   pump(100ms); commit();
   EXPECT_EQ(wrapped->getTargetTrajectories().stateTrajectory.back(), endpoint);
 }
@@ -160,6 +164,32 @@ TEST_F(MotionActionTest, TimeoutStopsBeforeReturningFailure) {
   stopAck(); ASSERT_TRUE(wait(result));
   EXPECT_EQ(result.get().result->reason, MotionStatus::TIMED_OUT);
   EXPECT_EQ(result.get().code, rclcpp_action::ResultCode::ABORTED);
+}
+
+TEST_F(MotionActionTest, AutomaticDeadlineAcceptsLongReferenceAndStillRequiresActualArrival) {
+  auto g = goal(); g.timeout = 0;
+  g.mode = Action::Goal::CONTINUOUS_PATH;
+  auto p = g.target; p.pose.position.z = 3.0; g.waypoints.push_back(p);
+  p.pose.position.z = 10.0; g.waypoints.push_back(p);
+  auto h = send(g); ASSERT_TRUE(h); commit();
+  EXPECT_GT(wrapped->getTargetTrajectories().timeTrajectory.back() - 10.0, 40.0);
+  auto result = client->async_get_result(h);
+  pump(250ms);
+  EXPECT_FALSE(runtime->stopRequested());
+  EXPECT_NE(result.wait_for(0ms), std::future_status::ready);
+  sample.reference_time = 1000;
+  pump(200ms); EXPECT_NE(result.wait_for(0ms), std::future_status::ready);
+  sample.pose[2] = 10.0;
+  ASSERT_TRUE(wait(result)); EXPECT_TRUE(result.get().result->success);
+}
+
+TEST_F(MotionActionTest, AutomaticTimeoutDoesNotAcceptNegativeOrNonfiniteValues) {
+  for (double timeout : {-1.0, std::numeric_limits<double>::infinity(),
+                        std::numeric_limits<double>::quiet_NaN()}) {
+    auto g = goal(); g.timeout = timeout;
+    EXPECT_FALSE(send(g));
+  }
+  EXPECT_TRUE(send(goal()));
 }
 
 TEST_F(MotionActionTest, InactiveWithoutConfirmedLifecycleHoldKeepsOwnership) {
@@ -317,4 +347,73 @@ TEST_F(MotionActionTest, FullPathIsInterpolatedAndZeroDistanceStillRequiresFresh
   sample.pose[2] = 0.32; sample.reference_time = 100;
   ASSERT_TRUE(wait(result));
   EXPECT_TRUE(result.get().result->success);
+}
+
+TEST_F(MotionActionTest, ContinuousPathUsesBufferedReferenceAndPassesIntermediateFrames) {
+  commit();
+  const auto old = wrapped->getTargetTrajectories().stateTrajectory.back();
+  auto g = goal(); g.mode = Action::Goal::CONTINUOUS_PATH;
+  for (int i = 1; i <= 6; ++i) {
+    auto p = g.target; p.pose.position.z = 0.3 + 0.01 * i;
+    g.waypoints.push_back(p);
+  }
+  auto h = send(g); ASSERT_TRUE(h);
+  EXPECT_EQ(wrapped->getTargetTrajectories().stateTrajectory.back(), old);
+  commit();  // Only OCS2's iteration boundary activates the new complete path.
+  const auto& t = wrapped->getTargetTrajectories();
+  size_t middle = 0;
+  for (size_t i = 0; i < t.stateTrajectory.size(); ++i)
+    if (std::abs(t.stateTrajectory[i][2] - 0.33) < 1e-12) middle = i;
+  ASSERT_GT(middle, 0u); ASSERT_LT(middle + 1, t.stateTrajectory.size());
+  EXPECT_GT((t.stateTrajectory[middle + 1][2] - t.stateTrajectory[middle - 1][2]) /
+            (t.timeTrajectory[middle + 1] - t.timeTrajectory[middle - 1]), 0.01);
+  auto result = client->async_get_result(h);
+  sample.pose[2] = 0.36; sample.reference_time = 100;
+  ASSERT_TRUE(wait(result)); EXPECT_TRUE(result.get().result->success);
+}
+
+TEST_F(MotionActionTest, InvalidContinuousGeometryLeavesPreviousReferenceUnchanged) {
+  commit(); const auto old = wrapped->getTargetTrajectories().stateTrajectory.back();
+  auto g = goal(); g.mode = Action::Goal::CONTINUOUS_PATH;
+  auto p = g.target; p.pose.position.x += 0.2;
+  g.waypoints.push_back(p); p.pose.position.y += 0.2;
+  p.pose.orientation.z = 1; p.pose.orientation.w = 0; // Ambiguous >3 rad chart, even with no deviation bound.
+  g.waypoints.push_back(p);
+  auto h = send(g); ASSERT_TRUE(h);
+  auto result = client->async_get_result(h); ASSERT_TRUE(wait(result));
+  EXPECT_EQ(result.get().result->reason, MotionStatus::INVALID_GOAL);
+  commit(); EXPECT_EQ(wrapped->getTargetTrajectories().stateTrajectory.back(), old);
+  EXPECT_FALSE(runtime->stopRequested());
+  EXPECT_TRUE(send(goal()));
+}
+
+TEST_F(MotionActionTest, AtTargetStillWaitsForEveryMeasuredSpeedAndValidEstimate) {
+  auto g = goal(); g.settle_time = 0.2;
+  auto h = send(g); ASSERT_TRUE(h);
+  auto result = client->async_get_result(h);
+  sample.pose[2] = 0.31; sample.reference_time = 100;
+  for (size_t axis = 0; axis < MotionSpeeds::Count; ++axis) {
+    sample.speeds.values.fill(0); sample.speeds.values[axis] = 0.1;
+    pump(250ms);
+    EXPECT_NE(result.wait_for(0ms), std::future_status::ready);
+    EXPECT_EQ(latest_status.state, MotionStatus::SETTLING);
+  }
+  sample.speeds.values.fill(0); sample.speeds.valid = false;
+  pump(250ms); EXPECT_NE(result.wait_for(0ms), std::future_status::ready);
+  sample.speeds.valid = true;
+  sample.speeds.values[0] = std::numeric_limits<double>::quiet_NaN();
+  pump(250ms); EXPECT_NE(result.wait_for(0ms), std::future_status::ready);
+  sample.speeds.values.fill(0);
+  pump(110ms); EXPECT_NE(result.wait_for(0ms), std::future_status::ready);
+  // A new motion burst resets the entire settling dwell, not just one tick.
+  sample.speeds.values[MotionSpeeds::BaseAngular] = 0.1; pump(75ms);
+  sample.speeds.values.fill(0); pump(110ms);
+  EXPECT_NE(result.wait_for(0ms), std::future_status::ready);
+  ASSERT_TRUE(wait(result)); EXPECT_TRUE(result.get().result->success);
+}
+
+TEST_F(MotionActionTest, SettlingThresholdsCannotBeSilentlyChangedOnline) {
+  EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("settle_tcp_linear_velocity", 0.2)).successful);
+  EXPECT_FALSE(node->set_parameter(rclcpp::Parameter("settle_joint_velocity", "invalid")).successful);
+  EXPECT_DOUBLE_EQ(node->get_parameter("settle_tcp_linear_velocity").as_double(), 0.005);
 }

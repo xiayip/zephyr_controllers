@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mpc_controller/control/JointInterfaces.h"
 #include "mpc_controller/control/CtrlComponent.h"
+#include "mpc_controller/control/MotionRuntime.h"
 #include "mpc_controller/runtime/MpcExecutionParams.hpp"
 #include "mpc_controller/runtime/RtCycleTiming.h"
 #include <gtest/gtest.h>
 
 using namespace zephyr::mpc;
+
+TEST(RuntimeHelpers, AutomaticMotionDeadlineIsFiniteAndExplicitDeadlineIsNeverExtended) {
+  EXPECT_DOUBLE_EQ(motionTimeoutSeconds(40, 100, 0.4), 40);
+  EXPECT_DOUBLE_EQ(motionTimeoutSeconds(0, 100, 0.4), 125.4);
+  EXPECT_DOUBLE_EQ(motionTimeoutSeconds(0, 1, 0.4), 6.4);
+  EXPECT_GT(motionTimeoutSeconds(0, 100, 0.4), motionTimeoutSeconds(0, 50, 0.4));
+}
 
 TEST(JointInterfaces, PositionWritesAndClearDropsHandlesAndMode) {
   double value = 0.0;

@@ -2,9 +2,11 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mpc_controller/control/ControlSafety.h>
+#include <mpc_controller/control/MeasuredMotion.h>
 #include <zephyr_msgs/msg/controller_motion_status.hpp>
 
 namespace zephyr::mpc {
@@ -13,9 +15,16 @@ inline int64_t motionSteadyNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+// Inputs are validated at Action admission/reference generation. Zero means
+// automatic but finite; explicit positive deadlines retain their original meaning.
+inline double motionTimeoutSeconds(double requested, double reference_duration, double settle_time) {
+  return requested > 0 ? requested :
+      reference_duration + settle_time + std::max(5.0, 0.25 * reference_duration);
+}
 // One bounded snapshot from the control loop. No ROS publishing or Action work in RT.
 struct MotionSample {
   std::array<double, 7> pose{0, 0, 0, 0, 0, 0, 1};
+  MotionSpeeds speeds;
   int64_t stamp_ns{0}, received_ns{0};
   double reference_time{0};
   uint64_t stop_ack{0};

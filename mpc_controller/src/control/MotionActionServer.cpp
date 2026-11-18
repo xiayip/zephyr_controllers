@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <sstream>
+#include <stdexcept>
 
 namespace zephyr::mpc {
 namespace {
@@ -37,6 +39,27 @@ std::string uuidString(const rclcpp_action::GoalUUID& id) {
 MotionActionServer::MotionActionServer(rclcpp_lifecycle::LifecycleNode::SharedPtr node,
     std::shared_ptr<TcpReferenceManager> reference, std::shared_ptr<MotionRuntime> runtime)
     : node_(std::move(node)), reference_(std::move(reference)), runtime_(std::move(runtime)) {
+  const std::array<std::string, MotionSpeeds::Count> names{
+      "settle_tcp_linear_velocity", "settle_tcp_angular_velocity", "settle_joint_velocity",
+      "settle_base_linear_velocity", "settle_base_angular_velocity"};
+  for (size_t i = 0; i < names.size(); ++i) {
+    settle_limits_[i] = node_->has_parameter(names[i]) ? node_->get_parameter(names[i]).as_double() :
+        node_->declare_parameter(names[i], settle_limits_[i]);
+    if (!std::isfinite(settle_limits_[i]) || settle_limits_[i] <= 0)
+      throw std::invalid_argument(names[i] + " must be finite and positive");
+  }
+  settling_parameters_callback_ = node_->add_on_set_parameters_callback(
+      [names, limits = settle_limits_](const std::vector<rclcpp::Parameter>& parameters) {
+        rcl_interfaces::msg::SetParametersResult result; result.successful = true;
+        for (const auto& p : parameters)
+          for (size_t i = 0; i < names.size(); ++i)
+            if (p.get_name() == names[i] && (p.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE ||
+                                            p.as_double() != limits[i])) {
+              result.successful = false;
+              result.reason = names[i] + " is initialization-only; reload the controller";
+            }
+        return result;
+      });
   status_pub_ = node_->create_publisher<MotionStatus>("~/motion_status", rclcpp::QoS(1).transient_local());
   server_ = rclcpp_action::create_server<Action>(node_, "~/execute_motion",
       [this](const auto& id, auto request) { return goal(id, request); },
@@ -63,6 +86,13 @@ bool MotionActionServer::fresh(const MotionSample& sample) const {
   return sample.valid && sample.activation_epoch == runtime_->activation_epoch.load() &&
       sample.received_ns > 0 && age >= 0 && age <= 200000000;
 }
+bool MotionActionServer::stopped(const MotionSample& sample) const {
+  if (!sample.speeds.valid) return false;
+  for (size_t i = 0; i < settle_limits_.size(); ++i)
+    if (!std::isfinite(sample.speeds.values[i]) || sample.speeds.values[i] < 0 ||
+        sample.speeds.values[i] > settle_limits_[i]) return false;
+  return true;
+}
 geometry_msgs::msg::PoseStamped MotionActionServer::actual(const MotionSample& s) const {
   geometry_msgs::msg::PoseStamped p;
   p.header.frame_id = reference_->referenceFrame();
@@ -83,13 +113,15 @@ rclcpp_action::GoalResponse MotionActionServer::goal(
   if (!runtime_->active || sample.state != MotionStatus::IDLE || !fresh(sample))
     return reject("controller is inactive, stopping, initializing, faulted or has stale feedback");
   const double values[] = {g->speed_scale, g->position_tolerance, g->orientation_tolerance,
-                          g->settle_time, g->timeout};
+                          g->settle_time};
   if (!std::all_of(std::begin(values), std::end(values), [](double x) { return std::isfinite(x) && x > 0; }) ||
-      g->speed_scale > 1 || g->orientation_tolerance > M_PI || g->timeout <= g->settle_time)
+      g->speed_scale > 1 || g->orientation_tolerance > M_PI ||
+      !std::isfinite(g->timeout) || g->timeout < 0 ||
+      (g->timeout > 0 && g->timeout <= g->settle_time))
     return reject("invalid speed scale, tolerance, settle time or timeout");
   if (g->mode == Action::Goal::POSE) {
     if (!g->waypoints.empty() || !validPose(g->target.pose)) return reject("invalid pose goal");
-  } else if (g->mode == Action::Goal::PATH) {
+  } else if (g->mode == Action::Goal::PATH || g->mode == Action::Goal::CONTINUOUS_PATH) {
     if (g->waypoints.empty() || g->waypoints.size() > 1000) return reject("path must contain 1..1000 poses");
     for (const auto& p : g->waypoints) if (!validPose(p.pose)) return reject("invalid path pose");
   } else if (g->mode == Action::Goal::RELATIVE) {
@@ -121,7 +153,12 @@ void MotionActionServer::accepted(std::shared_ptr<Handle> handle) {
     finish(false, sample);  // No motion reference was committed.
     return;
   }
-  RCLCPP_INFO(node_->get_logger(), "Motion %s accepted", uuidString(handle_->get_goal_id()).c_str());
+  const auto& g = *handle_->get_goal();
+  const double reference_duration = std::max(0.0, end_time_ - sample.reference_time);
+  timeout_seconds_ = motionTimeoutSeconds(g.timeout, reference_duration, g.settle_time);
+  RCLCPP_INFO(node_->get_logger(), "Motion %s accepted: reference %.3f s, deadline %.3f s (%s)",
+              uuidString(handle_->get_goal_id()).c_str(), reference_duration, timeout_seconds_,
+              g.timeout == 0 ? "automatic" : "explicit");
 }
 void MotionActionServer::stop(uint16_t reason, const std::string& message) {
   if (stopping_) return;
@@ -181,7 +218,7 @@ void MotionActionServer::tick() {
     }
     else if (!stopping_ && !reference_->motionSessionValid())
       stop(MotionStatus::REFERENCE_FAILED, "Reference session changed; old motion cannot resume");
-    if ((now - started_ns_) * 1e-9 >= g.timeout) stop(MotionStatus::TIMED_OUT, "Motion deadline exceeded");
+    if ((now - started_ns_) * 1e-9 >= timeout_seconds_) stop(MotionStatus::TIMED_OUT, "Motion deadline exceeded");
 
     if (fresh(sample)) {
       const auto& p = target_.pose;
@@ -191,12 +228,20 @@ void MotionActionServer::tick() {
           .angularDistance(Eigen::Quaterniond(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z));
     }
     if (!stopping_) {
-      const bool arrived = sample.reference_time >= end_time_ &&
+      const bool at_target = sample.reference_time >= end_time_ &&
           position_error_ <= g.position_tolerance && orientation_error_ <= g.orientation_tolerance;
+      const bool arrived = at_target && stopped(sample);
       if (!arrived) settled_ns_ = 0;
       else if (!settled_ns_) settled_ns_ = sample.received_ns;
-      status.state = arrived ? MotionStatus::SETTLING : MotionStatus::EXECUTING;
-      status.message = arrived ? "Waiting for stable measured arrival" : "Executing";
+      status.state = at_target ? MotionStatus::SETTLING : MotionStatus::EXECUTING;
+      status.message = arrived ? "Waiting for stable measured arrival and low whole-body speed" : "Executing";
+      if (at_target && !arrived) {
+        std::ostringstream detail;
+        detail << "At target; waiting for valid low measured speeds [TCP m/s, TCP rad/s, joint rad/s, base m/s, base rad/s]:";
+        for (double speed : sample.speeds.values) detail << ' ' << speed;
+        detail << " valid=" << sample.speeds.valid;
+        status.message = detail.str();
+      }
       if (settled_ns_ && (sample.received_ns - settled_ns_) * 1e-9 >= g.settle_time) finish(true, sample);
     }
   }

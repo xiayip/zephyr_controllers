@@ -63,6 +63,8 @@ namespace zephyr::mpc {
         /** Commit only complete, finite feedback. False means hold outputs this cycle. */
         bool updateObservation(const rclcpp::Time& time);
         const std::array<double, 7>& measuredTcpPose() const { return measured_tcp_pose_; }
+        const MotionSpeeds& measuredMotionSpeeds() const { return measured_motion_speeds_; }
+        void resetMeasuredMotion() { measured_motion_.reset(); measured_motion_speeds_ = {}; }
         /** False is a latched execution fault; outputs are already held. */
         bool evaluatePolicy(const rclcpp::Time& time);
         /** RT-only: active policy and profile transition gate both match the request. */
@@ -158,6 +160,8 @@ namespace zephyr::mpc {
             double x{0.0};
             double y{0.0};
             double yaw{0.0};
+            double linear_speed{0.0}, angular_speed{0.0}, stamp{0.0};
+            bool velocity_valid{false};
             bool valid{false};
             std::chrono::steady_clock::time_point received_at{};
         };
@@ -166,6 +170,8 @@ namespace zephyr::mpc {
         std::atomic_bool base_odometry_received_{false};
         vector_t observation_candidate_;
         bool observation_valid_{false}; // RT thread only
+        MeasuredMotion measured_motion_; // RT writer only; configured outside RT.
+        MotionSpeeds measured_motion_speeds_;
         double base_linear_start_threshold_{0.03};
         double base_linear_stop_threshold_{0.015};
         double base_angular_start_threshold_{0.04};

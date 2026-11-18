@@ -175,6 +175,7 @@ namespace zephyr::mpc
         }
         MotionSample sample;
         sample.pose = ctrl_comp_->measuredTcpPose();
+        sample.speeds = ctrl_comp_->measuredMotionSpeeds();
         sample.stamp_ns = time.nanoseconds();
         sample.reference_time = time.seconds();
         sample.received_ns = motionSteadyNs();
@@ -338,6 +339,7 @@ namespace zephyr::mpc
                 std::ignore = interface.get().set_value(ctrl_interfaces_.pd_gains_[1]);
         }
         motion_fault_ = MotionStatus::NONE;
+        ctrl_comp_->resetMeasuredMotion();
         ctrl_comp_->policy_active_ = false;
         execution_->start();
         motion_runtime_->activate();

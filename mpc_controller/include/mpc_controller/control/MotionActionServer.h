@@ -26,6 +26,7 @@ private:
   void finish(bool success, const MotionSample& sample);
   geometry_msgs::msg::PoseStamped actual(const MotionSample&) const;
   bool fresh(const MotionSample&) const;
+  bool stopped(const MotionSample&) const;
   rclcpp_lifecycle::LifecycleNode::SharedPtr node_;
   std::shared_ptr<TcpReferenceManager> reference_;
   std::shared_ptr<MotionRuntime> runtime_;
@@ -33,10 +34,12 @@ private:
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_service_;
   rclcpp::Publisher<MotionStatus>::SharedPtr status_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+  std::array<double, MotionSpeeds::Count> settle_limits_{0.005, 0.03, 0.03, 0.01, 0.03};
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr settling_parameters_callback_;
   std::shared_ptr<Handle> handle_;
   geometry_msgs::msg::PoseStamped target_;
   bool reserved_{false}, stopping_{false};
-  double end_time_{0}, position_error_{0}, orientation_error_{0};
+  double end_time_{0}, timeout_seconds_{0}, position_error_{0}, orientation_error_{0};
   int64_t started_ns_{0}, settled_ns_{0}, stopped_ns_{0};
   uint64_t stop_token_{0}, activation_epoch_{0};
   uint16_t reason_{MotionStatus::NONE};

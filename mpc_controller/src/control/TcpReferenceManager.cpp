@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Zephyr adaptation of fiveages-sim/arms_ros2_control; see UPSTREAM.md.
 #include "mpc_controller/control/TcpReferenceManager.h"
+#include "mpc_controller/control/ContinuousTcpPath.h"
 #include "mpc_controller/control/RuntimeMotionProfile.h"
 
 #include <Eigen/Geometry>
@@ -74,12 +75,12 @@ void TcpReferenceManager::preSolverRun(scalar_t init_time, scalar_t final_time,
 void TcpReferenceManager::subscribe(
     const rclcpp_lifecycle::LifecycleNode::SharedPtr &node) {
   node_ = node;
-  const auto parameter = [&](const char *key, double fallback) {
+  const auto parameter = [&](const char *key, double fallback, bool allow_zero = false) {
     const double value = node->has_parameter(key)
                              ? node->get_parameter(key).as_double()
                              : node->declare_parameter(key, fallback);
-    if (!std::isfinite(value) || value <= 0.0)
-      throw std::invalid_argument(std::string(key) + " must be positive");
+    if (!std::isfinite(value) || value < 0.0 || (!allow_zero && value == 0.0))
+      throw std::invalid_argument(std::string(key) + (allow_zero ? " must be nonnegative" : " must be positive"));
     return value;
   };
   duration_ = parameter("movel_duration", 2.0);
@@ -90,10 +91,14 @@ void TcpReferenceManager::subscribe(
   max_angular_acc_ = parameter("movel_max_angular_acceleration", 2.0);
   max_linear_jerk_ = parameter("movel_max_linear_jerk", 2.0);
   max_angular_jerk_ = parameter("movel_max_angular_jerk", 4.0);
+  continuous_max_deviation_ = parameter("movel_continuous_max_deviation", 0.0, true);
   tf_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
   listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_);
   target_pub_ = node->create_publisher<geometry_msgs::msg::PoseStamped>(
       "tcp_current_target", rclcpp::QoS(1).transient_local());
+  if (node->has_parameter("mock_debug_enabled") && node->get_parameter("mock_debug_enabled").as_bool())
+    reference_path_pub_ = node->create_publisher<nav_msgs::msg::Path>(
+        "tcp_reference_path", rclcpp::QoS(1).transient_local());
   // All target integration, allocation and publishing runs on the executor.
   // The control loop supplies only an atomic clock and bounded reset requests.
   reference_timer_ =
@@ -148,6 +153,9 @@ void TcpReferenceManager::subscribe(
   path_sub_ = node->create_subscription<nav_msgs::msg::Path>(
       "target_path", 1,
       [this](nav_msgs::msg::Path::ConstSharedPtr p) { acceptPath(*p); });
+  continuous_path_sub_ = node->create_subscription<nav_msgs::msg::Path>(
+      "target_path/continuous", 1,
+      [this](nav_msgs::msg::Path::ConstSharedPtr p) { acceptPath(*p, true); });
 }
 bool TcpReferenceManager::transform(const geometry_msgs::msg::PoseStamped &p,
                                     vector_t &result) const {
@@ -237,10 +245,10 @@ void TcpReferenceManager::acceptRelative(
                 e.what());
   }
 }
-void TcpReferenceManager::acceptPath(const nav_msgs::msg::Path &path) {
+void TcpReferenceManager::acceptPath(const nav_msgs::msg::Path &path, bool continuous) {
   const auto session = target_session_.token();
   const auto generation = input_generation_.load();
-  if (!session || path.poses.empty())
+  if (!session || path.poses.empty() || path.poses.size() > 1000)
     return;
   vector_array_t goals;
   if (!transformPath(path, goals))
@@ -250,8 +258,8 @@ void TcpReferenceManager::acceptPath(const nav_msgs::msg::Path &path) {
       generation != input_generation_.load())
     return;
   try {
+    plan(goals, duration_, nullptr, 1.0, continuous);
     twist_active_ = false;
-    plan(goals, duration_);
     publish();
   } catch (const std::exception &e) {
     RCLCPP_WARN(node_->get_logger(), "TCP path rejected: %s", e.what());
@@ -273,8 +281,30 @@ bool TcpReferenceManager::transformPath(const nav_msgs::msg::Path &path,
 }
 void TcpReferenceManager::plan(const std::vector<vector_t> &goals,
                                double requested_duration, const vector_t* measured_start,
-                               double speed_scale) {
+                               double speed_scale, bool continuous) {
   vector_t start = measured_start ? *measured_start : sample(time_);
+  if (continuous) {
+    TcpPathLimits limits{max_linear_ * speed_scale, max_angular_ * speed_scale,
+        max_linear_acc_ * speed_scale, max_angular_acc_ * speed_scale,
+        max_linear_jerk_ * speed_scale, max_angular_jerk_ * speed_scale,
+        interval_, continuous_max_deviation_};
+    std::vector<vector_t> points{start};
+    points.insert(points.end(), goals.begin(), goals.end());
+    auto path = makeContinuousTcpPath(points, limits, requested_duration);
+    for (size_t i = 0; i < path.times.size(); ++i) {
+      path.times[i] += time_;
+      if (!std::isfinite(path.times[i]) || (i && path.times[i] <= path.times[i - 1]))
+        throw std::invalid_argument("Continuous path timestamps lose precision");
+    }
+    // Build fully on the executor; OCS2 swaps the buffered trajectory only in
+    // preSolverRun. No partial path is exposed and no work moves into RT update.
+    referenceManagerPtr_->setTargetTrajectories(TargetTrajectories(
+        path.times, path.poses, vector_array_t(path.times.size(), vector_t::Zero(input_dim_))));
+    times_ = std::move(path.times);
+    poses_ = std::move(path.poses);
+    target_ = poses_.back();
+    return;
+  }
   scalar_array_t times{time_};
   vector_array_t poses{start};
   double elapsed = 0.0;
@@ -386,7 +416,7 @@ bool TcpReferenceManager::startMotion(
     }
     if (goals.empty()) throw std::invalid_argument("Empty motion");
     time_ = observation_time_.load(std::memory_order_acquire);
-    plan(goals, 0.0, &measured_pose, request.speed_scale);
+    plan(goals, 0.0, &measured_pose, request.speed_scale, request.mode == Goal::CONTINUOUS_PATH);
     end_time = times_.back();
     target.header.frame_id = base_frame_;
     target.header.stamp = node_->now();
@@ -489,6 +519,18 @@ void TcpReferenceManager::publish() const {
   p.header.stamp = node_->now();
   p.pose = rosPose(target_);
   target_pub_->publish(p);
+  if (reference_path_pub_) {
+    nav_msgs::msg::Path path;
+    path.header = p.header;
+    for (size_t i = 0; i < times_.size(); ++i) {
+      geometry_msgs::msg::PoseStamped sample;
+      sample.header.frame_id = base_frame_;
+      sample.header.stamp = rclcpp::Time(static_cast<int64_t>(times_[i] * 1e9));
+      sample.pose = rosPose(poses_[i]);
+      path.poses.push_back(std::move(sample));
+    }
+    reference_path_pub_->publish(path);
+  }
 }
 
 } // namespace zephyr::mpc

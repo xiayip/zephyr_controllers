@@ -270,6 +270,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             arm_torque_indices_.push_back(joint.idx_v());
         }
         arm_torques_ = vector_t::Zero(joint_names_.size());
+        measured_motion_.configure(joint_names_.size(), mobile_base_enabled_);
         if (interface_->isSelfCollisionEnabled() && collision_check_timeout_ < 2.0 * visualization_period_sec_)
             throw std::runtime_error("collision_check_timeout must cover at least two collision worker periods (prediction_publish_hz)");
         if (interface_->isSelfCollisionEnabled() && !std::isfinite(interface_->getSelfCollisionMinimumDistance()))
@@ -313,6 +314,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         auto_declare("movel_max_angular_velocity", 1.0);
         auto_declare("movel_max_angular_acceleration", 2.0);
         auto_declare("movel_max_angular_jerk", 4.0);
+        auto_declare("movel_continuous_max_deviation", 0.0);
 
         pose_reference_manager_ = std::make_shared<TcpReferenceManager>(
             interface_->getReferenceManagerPtr(),
@@ -380,7 +382,8 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                  "prediction_ghost_interval", "prediction_ghost_count", "prediction_max_age",
                  "movel_duration", "movel_sample_interval", "movel_max_linear_velocity",
                  "movel_max_linear_acceleration", "movel_max_linear_jerk",
-                 "movel_max_angular_velocity", "movel_max_angular_acceleration", "movel_max_angular_jerk"})
+                 "movel_max_angular_velocity", "movel_max_angular_acceleration", "movel_max_angular_jerk",
+                 "movel_continuous_max_deviation"})
         {
             if (node_->has_parameter(name))
             {
@@ -487,6 +490,15 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         BaseOdometryState state;
         state.x = odometry.pose.pose.position.x;
         state.y = odometry.pose.pose.position.y;
+        const auto& v = odometry.twist.twist;
+        state.linear_speed = std::hypot(v.linear.x, v.linear.y);
+        state.angular_speed = std::abs(v.angular.z);
+        // Validate wire timestamps without throwing from a subscription callback.
+        const auto& stamp = odometry.header.stamp;
+        state.stamp = static_cast<double>(stamp.sec) + 1e-9 * stamp.nanosec;
+        state.velocity_valid = std::isfinite(state.linear_speed) &&
+            std::isfinite(state.angular_speed) && stamp.sec >= 0 &&
+            stamp.nanosec < 1000000000u && state.stamp > 0;
         const auto& q = odometry.pose.pose.orientation;
         const double norm = std::hypot(std::hypot(q.x, q.y), std::hypot(q.z, q.w));
         state.valid = odometry.header.frame_id == base_odom_frame_ &&
@@ -553,6 +565,15 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
     bool CtrlComponent::updateObservation(const rclcpp::Time& time)
     {
         observation_valid_ = false;
+        measured_motion_speeds_ = {};
+        // An invalid cycle breaks the velocity window, even if the next one is fresh.
+        struct ResetOnFailure {
+            MeasuredMotion& motion;
+            const bool& valid;
+            ~ResetOnFailure() { if (!valid) motion.reset(); }
+        } reset_on_failure{measured_motion_, observation_valid_};
+        bool base_velocity_valid = !mobile_base_enabled_;
+        double base_linear_speed = 0, base_angular_speed = 0;
         if (!mpc_mrt_interface_)
         {
             return false;
@@ -569,6 +590,10 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                 observation_candidate_(0) = base->x;
                 observation_candidate_(1) = base->y;
                 observation_candidate_(2) = base->yaw;
+                const double age = time.seconds() - base->stamp;
+                base_velocity_valid = base->velocity_valid && age >= -0.02 && age <= 0.2;
+                base_linear_speed = base->linear_speed;
+                base_angular_speed = base->angular_speed;
             }
             else
             {
@@ -616,6 +641,15 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                 tcp_pose = visualizer_->computeEndEffectorPose(observation_.state);
             }
             std::copy_n(tcp_pose.data(), 7, measured_tcp_pose_.begin());
+            measured_motion_.update(time.seconds(), observation_.state, measured_tcp_pose_);
+            measured_motion_speeds_ = measured_motion_.speeds();
+            measured_motion_speeds_.valid = measured_motion_speeds_.valid && base_velocity_valid;
+            if (base_velocity_valid && mobile_base_enabled_) {
+                // A quiet pose window must not override live odometry reporting motion.
+                auto& speeds = measured_motion_speeds_.values;
+                speeds[MotionSpeeds::BaseLinear] = std::max(speeds[MotionSpeeds::BaseLinear], base_linear_speed);
+                speeds[MotionSpeeds::BaseAngular] = std::max(speeds[MotionSpeeds::BaseAngular], base_angular_speed);
+            }
             auto pub_scope = rt_timing_.scope(&rt_timing_.ee_pub_us);
             visualizer_->publishTcpPose(time, tcp_pose);
         }

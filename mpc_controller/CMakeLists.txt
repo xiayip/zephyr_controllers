@@ -35,6 +35,7 @@ add_library(${controller_target} SHARED
   src/control/CtrlComponent.cpp
   src/control/TcpKinematics.cpp
   src/control/TcpReferenceManager.cpp
+  src/control/ContinuousTcpPath.cpp
   src/control/MotionActionServer.cpp
   src/control/RuntimeMotionProfile.cpp
   src/control/MotionProfileServer.cpp
@@ -100,8 +101,16 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_controller_switcher rclcpp controller_manager_msgs)
   ament_add_gtest(test_reference_handoff test/test_reference_handoff.cpp)
   target_link_libraries(test_reference_handoff ${controller_target} Threads::Threads)
+  ament_add_gtest(test_continuous_tcp_path test/test_continuous_tcp_path.cpp src/control/ContinuousTcpPath.cpp)
+  target_include_directories(test_continuous_tcp_path PRIVATE include)
+  target_compile_features(test_continuous_tcp_path PRIVATE cxx_std_17)
+  target_link_libraries(test_continuous_tcp_path Eigen3::Eigen)
   ament_add_gtest(test_motion_action test/test_motion_action.cpp)
   target_link_libraries(test_motion_action ${controller_target} Threads::Threads)
+  ament_add_gtest(test_measured_motion test/test_measured_motion.cpp)
+  target_include_directories(test_measured_motion PRIVATE include)
+  target_compile_features(test_measured_motion PRIVATE cxx_std_17)
+  target_link_libraries(test_measured_motion Eigen3::Eigen)
   ament_add_gtest(test_runtime_motion_profile test/test_runtime_motion_profile.cpp)
   target_link_libraries(test_runtime_motion_profile ${controller_target} Threads::Threads)
   ament_add_gtest(test_motion_profile_server test/test_motion_profile_server.cpp)

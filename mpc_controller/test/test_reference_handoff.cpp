@@ -207,6 +207,31 @@ TEST_F(ReferenceHandoff, StandardPathRejectsEmptyInvalidAndUntransformablePoses)
     EXPECT_EQ(committedTarget(), pose);
 }
 
+TEST_F(ReferenceHandoff, ContinuousPathTopicIsExplicitAndObeysSessionAndOwnership) {
+    ASSERT_TRUE(reference->requestReset(pose, 10));
+    ASSERT_TRUE(spinUntilReset());
+    reference->setAcceptingTargets(true);
+    nav_msgs::msg::Path path;
+    path.header.frame_id = "base";
+    for (int i = 1; i <= 6; ++i) {
+        geometry_msgs::msg::PoseStamped p;
+        p.pose.position.x = 0.1; p.pose.position.y = 0.2;
+        p.pose.position.z = 0.3 + i * 0.01; p.pose.orientation.w = 1;
+        path.poses.push_back(p);
+    }
+    send("target_path/continuous", path);
+    const auto accepted = wrapped->getTargetTrajectories().stateTrajectory.back();
+    EXPECT_NEAR(accepted[2], 0.36, 1e-12);
+    ASSERT_TRUE(reference->claimMotion());
+    path.poses.back().pose.position.z = 0.38;
+    send("target_path/continuous", path);
+    EXPECT_EQ(wrapped->getTargetTrajectories().stateTrajectory.back(), accepted);
+    reference->releaseMotion();
+    reference->setAcceptingTargets(false);
+    send("target_path/continuous", path);
+    EXPECT_EQ(wrapped->getTargetTrajectories().stateTrajectory.back(), accepted);
+}
+
 TEST_F(ReferenceHandoff, PoseStreamUsedByRvizIsImmediateAndSessionGated) {
     ASSERT_TRUE(reference->requestReset(pose, 10));
     ASSERT_TRUE(spinUntilReset());
@@ -278,6 +303,8 @@ TEST_F(ReferenceHandoff, ProfileHoldReplacesTrajectoryAndBlocksEveryInputAcrossP
     path.header.frame_id = "base";
     path.poses.push_back(target);
     send("target_path", path);
+    EXPECT_EQ(committedTarget(), measured);
+    send("target_path/continuous", path);
     EXPECT_EQ(committedTarget(), measured);
 
     measured(2) = 0.33;  // Retrying an unacknowledged change refreshes its measured hold.

@@ -81,9 +81,10 @@ private:
   void acceptPose(const geometry_msgs::msg::PoseStamped &pose,
                   bool interpolate);
   void acceptRelative(const geometry_msgs::msg::TwistStamped &delta);
-  void acceptPath(const nav_msgs::msg::Path &path);
+  void acceptPath(const nav_msgs::msg::Path &path, bool continuous = false);
   void plan(const std::vector<ocs2::vector_t> &poses, double duration,
-            const ocs2::vector_t* start = nullptr, double speed_scale = 1.0);
+            const ocs2::vector_t* start = nullptr, double speed_scale = 1.0,
+            bool continuous = false);
   ocs2::vector_t sample(double time) const;
   void publish() const;
   void commitImmediate();
@@ -109,12 +110,15 @@ private:
   double duration_{2.0}, interval_{0.04}, max_linear_{0.3}, max_angular_{1.0};
   double max_linear_acc_{1.0}, max_angular_acc_{2.0}, max_linear_jerk_{2.0},
       max_angular_jerk_{4.0};
+  double continuous_max_deviation_{0.0};
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr reference_path_pub_; // Mock-only diagnostics.
   rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr pose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr stamped_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr twist_sub_;
   rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr
       relative_sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr continuous_path_sub_;
 };
 } // namespace zephyr::mpc
