@@ -35,6 +35,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <std_msgs/msg/int32.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <realtime_tools/realtime_buffer.hpp>
@@ -64,6 +65,7 @@ namespace zephyr::mpc {
         bool updateObservation(const rclcpp::Time& time);
         const std::array<double, 7>& measuredTcpPose() const { return measured_tcp_pose_; }
         const MotionSpeeds& measuredMotionSpeeds() const { return measured_motion_speeds_; }
+        const vector_t& measuredState() const { return measured_observation_.state; }
         void resetMeasuredMotion() { measured_motion_.reset(); measured_motion_speeds_ = {}; }
         /** False is a latched execution fault; outputs are already held. */
         bool evaluatePolicy(const rclcpp::Time& time);
@@ -150,6 +152,7 @@ namespace zephyr::mpc {
         std::shared_ptr<MotionRuntime> motion_runtime_;
 
         rclcpp::Publisher<ocs2_msgs::msg::MpcObservation>::SharedPtr mpc_observation_publisher_;
+        rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr solve_time_publisher_; // Mock diagnostics only.
         rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr base_command_publisher_;
         std::shared_ptr<realtime_tools::RealtimePublisher<geometry_msgs::msg::Twist>>
             realtime_base_command_publisher_;

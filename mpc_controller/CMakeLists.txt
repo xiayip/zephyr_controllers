@@ -36,6 +36,7 @@ add_library(${controller_target} SHARED
   src/control/TcpKinematics.cpp
   src/control/TcpReferenceManager.cpp
   src/control/ContinuousTcpPath.cpp
+  src/control/WholeBodyReference.cpp
   src/control/MotionActionServer.cpp
   src/control/RuntimeMotionProfile.cpp
   src/control/MotionProfileServer.cpp
@@ -107,6 +108,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_continuous_tcp_path Eigen3::Eigen)
   ament_add_gtest(test_motion_action test/test_motion_action.cpp)
   target_link_libraries(test_motion_action ${controller_target} Threads::Threads)
+  ament_add_gtest(test_whole_body_reference test/test_whole_body_reference.cpp)
+  target_link_libraries(test_whole_body_reference ${controller_target} Threads::Threads)
   ament_add_gtest(test_measured_motion test/test_measured_motion.cpp)
   target_include_directories(test_measured_motion PRIVATE include)
   target_compile_features(test_measured_motion PRIVATE cxx_std_17)

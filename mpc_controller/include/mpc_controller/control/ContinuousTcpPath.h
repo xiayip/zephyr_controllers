@@ -14,6 +14,7 @@ struct TcpPathLimits {
 struct SampledTcpPath {
   std::vector<double> times;  // Relative to the start, including every waypoint.
   std::vector<Eigen::VectorXd> poses;  // xyz, quaternion xyzw.
+  std::vector<double> waypoint_times; // Populated for explicit progress_steps (no waypoint removal).
 };
 
 /** Non-RT natural cubic pose path with one rest-to-rest quintic time law.
@@ -25,5 +26,6 @@ struct SampledTcpPath {
  */
 SampledTcpPath makeContinuousTcpPath(const std::vector<Eigen::VectorXd>& poses,
                                     const TcpPathLimits& limits,
-                                    double minimum_duration = 0.0);
+                                    double minimum_duration = 0.0,
+                                    const std::vector<double>& progress_steps = {});
 }  // namespace zephyr::mpc

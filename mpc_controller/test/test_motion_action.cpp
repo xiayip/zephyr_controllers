@@ -18,13 +18,16 @@ protected:
     node = std::make_shared<rclcpp_lifecycle::LifecycleNode>(
         "controller", "/motion_test", rclcpp::NodeOptions().use_global_arguments(false));
     wrapped = std::make_shared<ocs2::ReferenceManager>();
-    reference = std::make_shared<TcpReferenceManager>(wrapped, "base", "tcp", 6);
+    reference = std::make_shared<TcpReferenceManager>(wrapped, "base", "tcp", 9);
+    reference->configureWholeBody(true,{"joint1","joint2","joint3","joint4","joint5","joint6"},
+        ocs2::vector_t::Constant(6,-3), ocs2::vector_t::Constant(6,3));
     reference->subscribe(node);
     runtime = std::make_shared<MotionRuntime>();
     runtime->activate();
     sample.valid = true; sample.state = MotionStatus::IDLE; sample.reference_time = 10;
     sample.speeds.valid = true; // Fixture explicitly supplies fresh measured standstill.
     sample.pose = {0.1, 0.2, 0.3, 0, 0, 0, 1};
+    sample.whole_body_size = 9;
     executor.add_node(node->get_node_base_interface());
     ocs2::vector_t p = Eigen::Map<const Eigen::Matrix<double, 7, 1>>(sample.pose.data());
     ASSERT_TRUE(reference->requestReset(p, 10));
@@ -117,6 +120,34 @@ TEST_F(MotionActionTest, ArrivalRequiresActualFeedbackAndSettlingAfterTrajectory
   ASSERT_TRUE(wait(result));
   EXPECT_EQ(result.get().code, rclcpp_action::ResultCode::SUCCEEDED);
   EXPECT_TRUE(result.get().result->success);
+}
+
+TEST_F(MotionActionTest, TcpArrivalCannotCompleteBeforeRequestedBaseYawAndPosition) {
+  auto g=goal();
+  g.base_position_weight=5; g.base_yaw_weight=5;
+  g.whole_body_references.resize(1);
+  auto& base=g.whole_body_references[0].base_pose;
+  base.header.frame_id="base"; base.pose.position.x=.1;
+  base.pose.orientation.z=std::sin(.1); base.pose.orientation.w=std::cos(.1);
+  auto h=send(g); ASSERT_TRUE(h); auto result=client->async_get_result(h);
+  sample.reference_time=100; sample.pose[2]=.31;
+  pump(250ms); EXPECT_NE(result.wait_for(0ms),std::future_status::ready);
+  sample.whole_body_state[0]=.1;
+  pump(250ms); EXPECT_NE(result.wait_for(0ms),std::future_status::ready);
+  sample.whole_body_state[2]=.2;
+  ASSERT_TRUE(wait(result)); EXPECT_TRUE(result.get().result->success);
+  EXPECT_NEAR(result.get().result->base_yaw_error,0,1e-10);
+}
+
+TEST_F(MotionActionTest, PostureIsSoftAndMalformedWholeBodyGoalIsRejected) {
+  auto g=goal(); g.posture_weight=.1; g.whole_body_references.resize(1);
+  auto& posture=g.whole_body_references[0].posture;
+  posture.name={"joint1"}; posture.position={4};
+  EXPECT_FALSE(send(g));
+  posture.position={.2};
+  auto h=send(g); ASSERT_TRUE(h); auto result=client->async_get_result(h);
+  sample.reference_time=100; sample.pose[2]=.31;
+  ASSERT_TRUE(wait(result)); EXPECT_TRUE(result.get().result->success);
 }
 
 TEST_F(MotionActionTest, MotionRejectsConcurrentGoalsAndAllLegacyTargetInputs) {

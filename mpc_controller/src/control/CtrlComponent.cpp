@@ -278,6 +278,8 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
 
         mpc_observation_publisher_ = node_->create_publisher<ocs2_msgs::msg::MpcObservation>(
             robot_name_ + "_mpc_observation", 1);
+        if (mock_debug_enabled_)
+            solve_time_publisher_ = node_->create_publisher<std_msgs::msg::Float64>("~/solve_time_ms", 10);
 
         {
             zephyr::mpc_visualization::mpc_visualizer_config viz_cfg;
@@ -321,6 +323,8 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             mobile_base_enabled_ ? base_odom_frame : interface_->getManipulatorModelInfo().baseFrame,
             interface_->getManipulatorModelInfo().eeFrame,
             interface_->getManipulatorModelInfo().inputDim);
+        pose_reference_manager_->configureWholeBody(mobile_base_enabled_, joint_names_,
+            model.lowerPositionLimit.tail(joint_names_.size()), model.upperPositionLimit.tail(joint_names_.size()));
         pose_reference_manager_->subscribe(node_);
         runtime_profile_ = std::make_shared<RuntimeMotionProfile>();
         pose_reference_manager_->setRuntimeProfile(runtime_profile_);
@@ -328,6 +332,10 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         auto problem = interface_->getOptimalControlProblem();
         decorateProblem(problem, runtime_profile_, mobile_base_enabled_,
                         base_command_profile_ == "ranger", info.stateDim, info.inputDim);
+        problem.stateCostPtr->add("wholeBodyReference",
+            std::make_unique<WholeBodyStateCost>(pose_reference_manager_->wholeBodyReference()));
+        problem.finalCostPtr->add("wholeBodyReference",
+            std::make_unique<WholeBodyStateCost>(pose_reference_manager_->wholeBodyReference()));
         prepareThreadIsolation();
         mpc_ = std::make_unique<GaussNewtonDDP_MPC>(
             interface_->mpcSettings(),
@@ -383,7 +391,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                  "movel_duration", "movel_sample_interval", "movel_max_linear_velocity",
                  "movel_max_linear_acceleration", "movel_max_linear_jerk",
                  "movel_max_angular_velocity", "movel_max_angular_acceleration", "movel_max_angular_jerk",
-                 "movel_continuous_max_deviation"})
+                 "movel_continuous_max_deviation", "whole_body_max_joint_velocity"})
         {
             if (node_->has_parameter(name))
             {
@@ -940,6 +948,11 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                             std::chrono::steady_clock::now() - t0)
                             .count();
         const auto period_us = mpc_period_us_.load(std::memory_order_relaxed);
+        if (solve_time_publisher_) {
+            std_msgs::msg::Float64 timing;
+            timing.data = static_cast<double>(us) * 1e-3;
+            solve_time_publisher_->publish(timing);
+        }
         if (period_us > 0 && us > period_us)
         {
             RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,

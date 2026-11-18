@@ -131,6 +131,8 @@ rclcpp_action::GoalResponse MotionActionServer::goal(
     if (!std::all_of(std::begin(v), std::end(v), [](double x) { return std::isfinite(x); }))
       return reject("nonfinite relative motion");
   } else return reject("unknown motion mode");
+  std::string error;
+  if (!reference_->validateWholeBodyGoal(*g, error)) return reject(error.c_str());
   if (!reference_->claimMotion()) return reject("reference ownership unavailable");
   reserved_ = true;
   return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
@@ -144,10 +146,12 @@ void MotionActionServer::accepted(std::shared_ptr<Handle> handle) {
   reason_ = MotionStatus::NONE;
   message_ = "Executing";
   position_error_ = orientation_error_ = std::numeric_limits<double>::infinity();
+  base_errors_ = {0, 0};
   const auto sample = runtime_->samples.read();
   const auto pose = Eigen::Map<const Eigen::Matrix<double, 7, 1>>(sample.pose.data()).eval();
   if (!runtime_->active || sample.state != MotionStatus::IDLE || !fresh(sample) ||
-      !reference_->startMotion(*handle_->get_goal(), pose, target_, end_time_, message_)) {
+      !reference_->startMotion(*handle_->get_goal(), pose, target_, end_time_, message_,
+          Eigen::Map<const Eigen::VectorXd>(sample.whole_body_state.data(), sample.whole_body_size))) {
     reason_ = MotionStatus::INVALID_GOAL;
     if (message_ == "Executing") message_ = "Controller stopped before goal acceptance";
     finish(false, sample);  // No motion reference was committed.
@@ -176,10 +180,12 @@ void MotionActionServer::finish(bool success, const MotionSample& sample) {
   auto result = std::make_shared<Action::Result>();
   result->success = success;
   result->reason = reason_;
-  result->message = success ? "Measured TCP settled at target" : message_;
+  result->message = success ? "Measured TCP and requested base pose settled at target" : message_;
   result->actual = actual(sample);
   result->position_error = position_error_;
   result->orientation_error = orientation_error_;
+  result->base_position_error = base_errors_[0];
+  result->base_yaw_error = base_errors_[1];
   reference_->releaseMotion();
   if (stopping_) runtime_->stop_release.store(stop_token_);
   if (handle_->is_canceling()) handle_->canceled(result);
@@ -221,6 +227,8 @@ void MotionActionServer::tick() {
     if ((now - started_ns_) * 1e-9 >= timeout_seconds_) stop(MotionStatus::TIMED_OUT, "Motion deadline exceeded");
 
     if (fresh(sample)) {
+      base_errors_ = reference_->wholeBodyErrors(
+          Eigen::Map<const Eigen::VectorXd>(sample.whole_body_state.data(), sample.whole_body_size));
       const auto& p = target_.pose;
       position_error_ = (Eigen::Vector3d(sample.pose[0], sample.pose[1], sample.pose[2]) -
                          Eigen::Vector3d(p.position.x, p.position.y, p.position.z)).norm();
@@ -229,7 +237,9 @@ void MotionActionServer::tick() {
     }
     if (!stopping_) {
       const bool at_target = sample.reference_time >= end_time_ &&
-          position_error_ <= g.position_tolerance && orientation_error_ <= g.orientation_tolerance;
+          position_error_ <= g.position_tolerance && orientation_error_ <= g.orientation_tolerance &&
+          (g.base_position_weight == 0 || base_errors_[0] <= g.base_position_tolerance) &&
+          (g.base_yaw_weight == 0 || base_errors_[1] <= g.base_yaw_tolerance);
       const bool arrived = at_target && stopped(sample);
       if (!arrived) settled_ns_ = 0;
       else if (!settled_ns_) settled_ns_ = sample.received_ns;
@@ -274,6 +284,8 @@ void MotionActionServer::tick() {
     feedback->position_error = position_error_;
     feedback->orientation_error = orientation_error_;
     feedback->elapsed = (now - started_ns_) * 1e-9;
+    feedback->base_position_error = base_errors_[0];
+    feedback->base_yaw_error = base_errors_[1];
     handle_->publish_feedback(feedback);
   }
   status_pub_->publish(status);

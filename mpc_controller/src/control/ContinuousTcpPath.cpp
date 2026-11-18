@@ -32,9 +32,15 @@ double segmentDistance(const Eigen::Vector3d& p, const Eigen::Vector3d& a,
 }  // namespace
 
 SampledTcpPath makeContinuousTcpPath(const std::vector<Eigen::VectorXd>& poses,
-                                    const TcpPathLimits& l, double minimum_duration) {
+                                    const TcpPathLimits& l, double minimum_duration,
+                                    const std::vector<double>& progress_steps) {
   if (poses.size() < 2 || poses.size() > 1001)
     throw std::invalid_argument("Continuous path needs start + 1..1000 poses");
+  if (!progress_steps.empty()) {
+    if (progress_steps.size() + 1 != poses.size()) throw std::invalid_argument("Invalid whole-body progress dimensions");
+    for (double s : progress_steps)
+      if (!std::isfinite(s) || s <= 0) throw std::invalid_argument("Invalid whole-body progress step");
+  }
   const double positive[] = {l.linear_velocity, l.angular_velocity, l.linear_acceleration,
       l.angular_acceleration, l.linear_jerk, l.angular_jerk, l.sample_interval};
   for (double v : positive)
@@ -65,8 +71,9 @@ SampledTcpPath makeContinuousTcpPath(const std::vector<Eigen::VectorXd>& poses,
       const Pose6 delta = p - points.back();
       if (delta.tail<3>().norm() >= chart_limit)
         throw std::invalid_argument("Continuous orientation crosses rotation-vector branch");
-      const double step = std::max(delta.head<3>().norm() / l.linear_velocity,
+      double step = std::max(delta.head<3>().norm() / l.linear_velocity,
                                    delta.tail<3>().norm() / l.angular_velocity);
+      if (!progress_steps.empty()) step = std::max(step, progress_steps[points.size()-1]);
       if (!std::isfinite(step)) throw std::invalid_argument("Continuous path overflow");
       if (step < 1e-9) continue;  // Duplicate pose, not a dwell instruction.
       knots.push_back(knots.back() + step);
@@ -76,7 +83,7 @@ SampledTcpPath makeContinuousTcpPath(const std::vector<Eigen::VectorXd>& poses,
   if (points.size() == 1) {
     Eigen::VectorXd hold = poses.front();
     hold.tail<4>().normalize();
-    return {{0.0, std::max(l.sample_interval, minimum_duration)}, {hold, hold}};
+    return {{0.0, std::max(l.sample_interval, minimum_duration)}, {hold, hold}, {}};
   }
   if (!std::isfinite(knots.back())) throw std::invalid_argument("Continuous path overflow");
   const double length = knots.back();
@@ -153,6 +160,12 @@ SampledTcpPath makeContinuousTcpPath(const std::vector<Eigen::VectorXd>& poses,
     return std::abs(a - b) < 1e-10;
   }), times.end());
   SampledTcpPath result;
+  if (!progress_steps.empty())
+    for (double s : knots) result.waypoint_times.push_back(duration * inverseSmooth(s));
+  if (!result.waypoint_times.empty()) {
+    result.waypoint_times.front() = 0;
+    result.waypoint_times.back() = duration;
+  }
   result.times = std::move(times);
   result.poses.reserve(result.times.size());
   for (double t : result.times) {

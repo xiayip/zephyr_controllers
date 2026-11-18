@@ -40,6 +40,7 @@ private:
   geometry_msgs::msg::PoseStamped target_;
   bool reserved_{false}, stopping_{false};
   double end_time_{0}, timeout_seconds_{0}, position_error_{0}, orientation_error_{0};
+  std::array<double, 2> base_errors_{};
   int64_t started_ns_{0}, settled_ns_{0}, stopped_ns_{0};
   uint64_t stop_token_{0}, activation_epoch_{0};
   uint16_t reason_{MotionStatus::NONE};

@@ -175,6 +175,11 @@ namespace zephyr::mpc
         }
         MotionSample sample;
         sample.pose = ctrl_comp_->measuredTcpPose();
+        const auto& measured_state = ctrl_comp_->measuredState();
+        if (measured_state.size() <= static_cast<int>(sample.whole_body_state.size())) {
+            sample.whole_body_size = measured_state.size();
+            std::copy_n(measured_state.data(), sample.whole_body_size, sample.whole_body_state.begin());
+        }
         sample.speeds = ctrl_comp_->measuredMotionSpeeds();
         sample.stamp_ns = time.nanoseconds();
         sample.reference_time = time.seconds();

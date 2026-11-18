@@ -24,6 +24,8 @@ inline double motionTimeoutSeconds(double requested, double reference_duration, 
 // One bounded snapshot from the control loop. No ROS publishing or Action work in RT.
 struct MotionSample {
   std::array<double, 7> pose{0, 0, 0, 0, 0, 0, 1};
+  std::array<double, 32> whole_body_state{}; // Bounded RT snapshot; model order.
+  size_t whole_body_size{0};
   MotionSpeeds speeds;
   int64_t stamp_ns{0}, received_ns{0};
   double reference_time{0};

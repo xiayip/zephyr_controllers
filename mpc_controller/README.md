@@ -14,6 +14,7 @@
 | `src/control/CtrlComponent.cpp` | 模型加载、实测观测、求解结果执行、保护与工作线程协调 |
 | `src/control/TcpReferenceManager.cpp` | TCP 目标输入、坐标转换与 OCS2 参考轨迹生成 |
 | `src/control/ContinuousTcpPath.cpp` | 显式连续路径的几何插值、时间参数化与偏离检查，不依赖 ROS 或硬件 |
+| `src/control/WholeBodyReference.cpp` | 可选底盘／关节姿态参考、同时间轴插值和状态代价；不包含任务流程 |
 | `src/control/TcpTrajectoryRecorder.cpp` | 实测/预测 TCP 的缓冲与 CSV 写出 |
 | `include/mpc_controller/control/BaseKinematics.h` | 旧底盘后端的横向速度约束；不安排底盘/机械臂动作顺序 |
 | `src/visualization/mpc_visualizer.cpp` | TCP 位姿、两色轨迹、分身及其时间对齐 |
@@ -730,7 +731,7 @@ ros2 action send_goal /mpc_controller/execute_motion \
 ros2 topic echo /mpc_controller/motion_status
 ```
 
-底盘固定通过前述 `~/set_motion_profile` 在动作开始前配置。关节姿态代价、MoveIt 场景检查、
+底盘固定通过前述 `~/set_motion_profile` 在动作开始前配置。MoveIt 场景检查、
 动态 `.info` 切换和连续视觉目标任务会话留待后续实现。
 `ArmTapBT` 在任务层组合接近/按压/退回；控制器中没有按钮专用阶段和业务判断。
 
@@ -768,3 +769,60 @@ ros2 topic echo /mpc_controller/motion_status
 2.22～2.46 mm，最大 6.04 mm，内部途经点没有强制停顿。14 个测试程序、117 项当前用例通过。
 未改控制增益/底盘限速；碰撞检查沿用当前关闭配置。此结果不代表真机动力学精度、
 避障能力或底盘最终朝向已经满足按电梯任务要求。
+
+### 可选全身参考（剪影，M2 原型）
+
+仍使用 `~/execute_motion` / `ExecuteCartesianMotion`。空的 `whole_body_references`
+和默认零权重保持 TCP-only 行为；没有新增控制器、业务 FSM 或 OCS2 fork。
+**Action 新增了字段，DDS 消息定义有变化：机器人、RViz/BT 和发布端必须同步构建
+`zephyr_msgs` 及依赖它的客户端，旧二进制不保证线协议兼容。**
+
+当前支持 `POSE` 的一个参考，或 `CONTINUOUS_PATH` 中与 `waypoints` 一一对应的参考。
+此扩展暂不接受 `PATH` / `RELATIVE`；这两种原有 TCP-only 模式仍可正常使用。
+
+每个 `zephyr_msgs/WholeBodyReference` 包含：
+
+- `base_pose`：`geometry_msgs/PoseStamped`，位置为平面 x/y，姿态仅 yaw；z/roll/pitch 必须为零。
+  frame 必须显式等于 MPC 固定参考系（移动模型通常 `odom`），不接受 `base_link` 等移动系。
+- `posture`：`sensor_msgs/JointState` 的 name/position，支持机械臂关节子集；所有点名称和顺序一致。
+  拒绝重复名、未知关节、非有限值、越模型限位目标以及 velocity/effort。
+  这是关节名义姿态偏好，不是独立下发的关节命令。
+
+Action 中 `base_position_weight`、`base_yaw_weight`、`posture_weight` 为全程固定的非负权重
+（0 关闭，当前输入范围 0～1000）；内部新增运行及终端状态代价
+`0.5 * Σ weight * error²`，yaw 误差取最短角差，有限行程关节不做 2π 环绕。
+固定底座模型支持 posture，但拒绝底盘参考。没有配置的维度保持自由，不自动锁住整机。
+
+底盘位置／yaw 启用后，成功判定还要求最终实测误差分别小于
+`base_position_tolerance`（默认 0.02 m）／`base_yaw_tolerance`（默认 0.03 rad）。
+Action feedback/result 返回 `base_position_error`、`base_yaw_error`，禁用项为零。
+posture 默认只作为软偏好，不要求逐关节精确到位；TCP 误差、实测速度、持续时间、取消和超时判据不变。
+权重是加权折中，不是严格优先级，也不是碰撞或可达性保证。当前实现的是底盘**点参考加到位容差**，
+不是“区域内部零代价”的区域约束；不一致的 TCP/底盘/姿态输入可能无法满足完成条件。
+
+参考从同一实测 TCP／整机状态快照开始。TCP 与全身参考共用全局五次时间进度，
+底盘／关节使用保形 C1 插值，单调经过的中间点不强制停止；反向或极值处允许减速。
+`whole_body_max_joint_velocity` 是名义关节参考速度上限（初始化参数，默认 0.2 rad/s；Z2 mock 0.8）。
+底盘参考速度使用 `base_max_linear_speed` / `base_max_angular_speed`，乘以 `speed_scale`；
+旧配置若将输出限速设为 0，新底盘参考分别采用保守的 0.1 m/s / 0.2 rad/s；不改变旧输出语义。
+必要时整条 TCP 与全身参考一起延长，保持关键帧同时到达。它不保证全身加速度／jerk 有界，
+也不表示实际运动严格按参考时刻到达。全身扩展的总参考时长上限为 1 小时。
+
+完整参考在 executor 构造，TCP 和全身快照在同一求解边界交换，整个 solve 内不可变。
+停止、重置、profile hold 或新 TCP-only 目标会清除旧的全身代价；成功后保持最后参考。
+全身轨迹不是在线流式接口，不能在活动 Action 中用新目标或 profile service 偷换任务。
+运行时阶段门槛、按压授权、参考在线更新和自动剪影生成由后续任务层实现。
+
+mock-only 调试输出：`/tcp_reference_path` 和 `/base_reference_path` 为带时间戳、transient-local
+的 `nav_msgs/Path`；后者包括名义底盘姿态（零权重维度不代表实际被约束）。旧参考被清除时发布空路径。
+`~/solve_time_ms` 为 `std_msgs/Float64`，由求解线程发布每次 solve 加可选预测导出的耗时，
+不在 ros2_control 更新循环发布；真机默认不创建这些调试话题。
+
+完整 Z2 mock 运行及 CSV 示例见 `z2_bringup/README.md` 的全身参考测试段。
+
+2026-11-18 两次干净启动各完成 5 项验证（10/10 成功）：同一 TCP 下改变底盘 yaw，
+以及底盘 60 cm、机械臂 J2/J3 同时伸展的往返。后者 TCP 同时间参考误差 RMS
+1.04～1.16 mm，最终底盘误差 1.17～3.49 mm；原停稳门槛未放宽。
+这是关闭碰撞检查的 GenericSystem 结果，不代表真机精度。
+5 s horizon 下，部分 **TCP-only** 长路径仍会因残余运动停稳超时；新增参考能力
+没有宣称解决该基线问题。需单独继续诊断，不以修改到位判据替代修复。

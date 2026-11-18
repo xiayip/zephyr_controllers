@@ -16,6 +16,7 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <mpc_controller/control/ControlSafety.h>
+#include <mpc_controller/control/WholeBodyReference.h>
 #include <nav_msgs/msg/path.hpp>
 #include <ocs2_core/Types.h>
 #include <ocs2_mpc/SystemObservation.h>
@@ -37,6 +38,13 @@ public:
   void subscribe(const rclcpp_lifecycle::LifecycleNode::SharedPtr &node);
   /** Set once during controller initialization, before solver threads start. */
   void setRuntimeProfile(std::shared_ptr<RuntimeMotionProfile> profile);
+  void configureWholeBody(bool mobile, std::vector<std::string> joints,
+                          ocs2::vector_t lower, ocs2::vector_t upper);
+  const std::shared_ptr<WholeBodyReference>& wholeBodyReference() const { return whole_body_; }
+  bool validateWholeBodyGoal(const zephyr_msgs::action::ExecuteCartesianMotion::Goal& goal,
+                            std::string& error) const;
+  // Executor-only final base errors, disabled coordinates report zero.
+  std::array<double, 2> wholeBodyErrors(const ocs2::vector_t& state) const;
   void preSolverRun(ocs2::scalar_t init_time, ocs2::scalar_t final_time,
                     const ocs2::vector_t& initial_state) override;
   void setAcceptingTargets(bool accept);
@@ -55,7 +63,7 @@ public:
   bool startMotion(const zephyr_msgs::action::ExecuteCartesianMotion::Goal& goal,
                    const ocs2::vector_t& measured_pose,
                    geometry_msgs::msg::PoseStamped& target, double& end_time,
-                   std::string& error);
+                   std::string& error, const ocs2::vector_t& measured_state = ocs2::vector_t());
   bool consumeFailure() {
     return failed_.exchange(false, std::memory_order_acq_rel);
   }
@@ -84,11 +92,23 @@ private:
   void acceptPath(const nav_msgs::msg::Path &path, bool continuous = false);
   void plan(const std::vector<ocs2::vector_t> &poses, double duration,
             const ocs2::vector_t* start = nullptr, double speed_scale = 1.0,
-            bool continuous = false);
+            bool continuous = false, const ocs2::vector_array_t& body_states = {},
+            const ocs2::vector_t& body_weights = ocs2::vector_t());
+  void commit(ocs2::TargetTrajectories target,
+              std::shared_ptr<const WholeBodyTrajectory> body = nullptr);
+  void prepareWholeBody(const zephyr_msgs::action::ExecuteCartesianMotion::Goal& goal,
+                       const ocs2::vector_t& measured_state, ocs2::vector_array_t& states,
+                       ocs2::vector_t& weights) const;
   ocs2::vector_t sample(double time) const;
   void publish() const;
   void commitImmediate();
   mutable std::mutex mutex_;
+  std::mutex commit_mutex_; // Short non-RT commit only; never taken by control update.
+  std::shared_ptr<WholeBodyReference> whole_body_{std::make_shared<WholeBodyReference>()};
+  std::shared_ptr<const WholeBodyTrajectory> pending_body_;
+  bool mobile_{false};
+  std::vector<std::string> joints_;
+  ocs2::vector_t lower_, upper_, body_velocity_limits_;
   TargetSession target_session_;
   bool motion_owned_{false};  // Protected by mutex_, including topic commits.
   bool profile_change_pending_{false}; // Independent of the lifecycle/session gate.
@@ -113,6 +133,7 @@ private:
   double continuous_max_deviation_{0.0};
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr reference_path_pub_; // Mock-only diagnostics.
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr base_reference_path_pub_;
   rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr pose_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr stamped_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr twist_sub_;

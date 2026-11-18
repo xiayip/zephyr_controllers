@@ -64,13 +64,28 @@ TcpReferenceManager::TcpReferenceManager(
 void TcpReferenceManager::setRuntimeProfile(std::shared_ptr<RuntimeMotionProfile> profile) {
   runtime_profile_ = std::move(profile);
 }
+void TcpReferenceManager::configureWholeBody(bool mobile, std::vector<std::string> joints,
+                                           vector_t lower, vector_t upper) {
+  if (joints.empty() ||
+      lower.size() != static_cast<int>(joints.size()) || upper.size() != lower.size() ||
+      !lower.allFinite() || !upper.allFinite() || (lower.array() > upper.array()).any())
+    throw std::invalid_argument("Invalid whole-body model limits");
+  mobile_ = mobile; joints_ = std::move(joints); lower_ = std::move(lower); upper_ = std::move(upper);
+}
+void TcpReferenceManager::commit(TargetTrajectories target, std::shared_ptr<const WholeBodyTrajectory> body) {
+  std::lock_guard<std::mutex> lock(commit_mutex_);
+  referenceManagerPtr_->setTargetTrajectories(std::move(target));
+  pending_body_ = std::move(body);
+}
 void TcpReferenceManager::preSolverRun(scalar_t init_time, scalar_t final_time,
                                      const vector_t& initial_state) {
   // Capture profile FIRST. A new profile is submitted only after its measured
   // hold reference was queued; the reverse ordering could pair a new revision
   // with the preceding motion's reference for one solve.
   if (runtime_profile_) runtime_profile_->captureBeforeReferenceUpdate();
+  std::lock_guard<std::mutex> lock(commit_mutex_);
   referenceManagerPtr_->preSolverRun(init_time, final_time, initial_state);
+  whole_body_->solver = pending_body_;
 }
 void TcpReferenceManager::subscribe(
     const rclcpp_lifecycle::LifecycleNode::SharedPtr &node) {
@@ -92,13 +107,27 @@ void TcpReferenceManager::subscribe(
   max_linear_jerk_ = parameter("movel_max_linear_jerk", 2.0);
   max_angular_jerk_ = parameter("movel_max_angular_jerk", 4.0);
   continuous_max_deviation_ = parameter("movel_continuous_max_deviation", 0.0, true);
+  body_velocity_limits_ = vector_t::Constant(joints_.size() + (mobile_ ? 3 : 0),
+      parameter("whole_body_max_joint_velocity", 0.2));
+  if (mobile_) {
+    // Component-wise bound inscribed in the translational speed disk.
+    const double linear = parameter("base_max_linear_speed", 0.1, true);
+    const double angular = parameter("base_max_angular_speed", 0.2, true);
+    // Existing profiles may use 0 for uncapped output. Do not change their
+    // TCP-only behavior; use conservative limits for the new reference instead.
+    body_velocity_limits_.head<2>().setConstant((linear > 0 ? linear : 0.1) / std::sqrt(2.0));
+    body_velocity_limits_[2] = angular > 0 ? angular : 0.2;
+  }
   tf_ = std::make_shared<tf2_ros::Buffer>(node->get_clock());
   listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_);
   target_pub_ = node->create_publisher<geometry_msgs::msg::PoseStamped>(
       "tcp_current_target", rclcpp::QoS(1).transient_local());
-  if (node->has_parameter("mock_debug_enabled") && node->get_parameter("mock_debug_enabled").as_bool())
+  if (node->has_parameter("mock_debug_enabled") && node->get_parameter("mock_debug_enabled").as_bool()) {
     reference_path_pub_ = node->create_publisher<nav_msgs::msg::Path>(
         "tcp_reference_path", rclcpp::QoS(1).transient_local());
+    base_reference_path_pub_ = node->create_publisher<nav_msgs::msg::Path>(
+        "base_reference_path", rclcpp::QoS(1).transient_local());
+  }
   // All target integration, allocation and publishing runs on the executor.
   // The control loop supplies only an atomic clock and bounded reset requests.
   reference_timer_ =
@@ -281,8 +310,22 @@ bool TcpReferenceManager::transformPath(const nav_msgs::msg::Path &path,
 }
 void TcpReferenceManager::plan(const std::vector<vector_t> &goals,
                                double requested_duration, const vector_t* measured_start,
-                               double speed_scale, bool continuous) {
+                               double speed_scale, bool continuous,
+                               const vector_array_t& body_states, const vector_t& body_weights) {
   vector_t start = measured_start ? *measured_start : sample(time_);
+  const auto finish = [&](scalar_array_t times, vector_array_t poses, scalar_array_t knots) {
+    std::shared_ptr<WholeBodyTrajectory> body;
+    if (!body_states.empty()) {
+      body = makeWholeBodyTrajectory(knots, body_states, body_weights, mobile_ ? 2 : -1,
+                                     body_velocity_limits_ * speed_scale);
+      const double scale = (body->times.back()-time_) / (times.back()-time_);
+      for (auto& t : times) t = time_ + (t-time_) * scale;
+    }
+    if (!std::isfinite(times.back()) || (body && times.back()-time_ > 3600))
+      throw std::invalid_argument("Motion exceeds one-hour reference budget");
+    commit(TargetTrajectories(times, poses, vector_array_t(times.size(), vector_t::Zero(input_dim_))), body);
+    times_ = std::move(times); poses_ = std::move(poses); target_ = poses_.back();
+  };
   if (continuous) {
     TcpPathLimits limits{max_linear_ * speed_scale, max_angular_ * speed_scale,
         max_linear_acc_ * speed_scale, max_angular_acc_ * speed_scale,
@@ -290,7 +333,18 @@ void TcpReferenceManager::plan(const std::vector<vector_t> &goals,
         interval_, continuous_max_deviation_};
     std::vector<vector_t> points{start};
     points.insert(points.end(), goals.begin(), goals.end());
-    auto path = makeContinuousTcpPath(points, limits, requested_duration);
+    std::vector<double> steps;
+    if (!body_states.empty()) {
+      for (size_t i = 1; i < body_states.size(); ++i) {
+        auto delta = (body_states[i] - body_states[i-1]).eval();
+        if (mobile_) delta[2] = std::atan2(std::sin(delta[2]), std::cos(delta[2]));
+        double step = interval_;
+        for (int j = 0; j < delta.size(); ++j) if (body_weights[j] > 0)
+          step = std::max(step, std::abs(delta[j]) / (body_velocity_limits_[j]*speed_scale));
+        steps.push_back(step);
+      }
+    }
+    auto path = makeContinuousTcpPath(points, limits, requested_duration, steps);
     for (size_t i = 0; i < path.times.size(); ++i) {
       path.times[i] += time_;
       if (!std::isfinite(path.times[i]) || (i && path.times[i] <= path.times[i - 1]))
@@ -298,14 +352,12 @@ void TcpReferenceManager::plan(const std::vector<vector_t> &goals,
     }
     // Build fully on the executor; OCS2 swaps the buffered trajectory only in
     // preSolverRun. No partial path is exposed and no work moves into RT update.
-    referenceManagerPtr_->setTargetTrajectories(TargetTrajectories(
-        path.times, path.poses, vector_array_t(path.times.size(), vector_t::Zero(input_dim_))));
-    times_ = std::move(path.times);
-    poses_ = std::move(path.poses);
-    target_ = poses_.back();
+    for (auto& t : path.waypoint_times) t += time_;
+    finish(std::move(path.times), std::move(path.poses), std::move(path.waypoint_times));
     return;
   }
   scalar_array_t times{time_};
+  scalar_array_t knots{time_};
   vector_array_t poses{start};
   double elapsed = 0.0;
   for (const auto &goal : goals) {
@@ -328,13 +380,10 @@ void TcpReferenceManager::plan(const std::vector<vector_t> &goals,
       poses.push_back(interpolate(start, goal, smooth(t)));
     }
     elapsed += duration;
+    knots.push_back(time_ + elapsed);
     start = goal;
   }
-  referenceManagerPtr_->setTargetTrajectories(TargetTrajectories(
-      times, poses, vector_array_t(times.size(), vector_t::Zero(input_dim_))));
-  times_ = std::move(times);
-  poses_ = std::move(poses);
-  target_ = goals.back();
+  finish(std::move(times), std::move(poses), std::move(knots));
 }
 
 bool TcpReferenceManager::claimMotion() {
@@ -377,10 +426,102 @@ void TcpReferenceManager::endProfileChange() {
   profile_change_pending_ = false;
   ++input_generation_;
 }
+bool TcpReferenceManager::validateWholeBodyGoal(
+    const zephyr_msgs::action::ExecuteCartesianMotion::Goal& g, std::string& error) const {
+  using Goal = zephyr_msgs::action::ExecuteCartesianMotion::Goal;
+  try {
+    for (double w : {g.base_position_weight, g.base_yaw_weight, g.posture_weight})
+      if (!std::isfinite(w) || w < 0 || w > 1000)
+        throw std::invalid_argument("Whole-body weights must be finite within [0,1000]");
+    const bool base = g.base_position_weight > 0 || g.base_yaw_weight > 0;
+    const bool posture = g.posture_weight > 0;
+    if (g.whole_body_references.empty()) {
+      if (base || posture) throw std::invalid_argument("Whole-body weights require references");
+      return true;
+    }
+    if (joints_.empty()) throw std::invalid_argument("Whole-body model not configured");
+    if (joints_.size() + (mobile_ ? 3 : 0) > 32)
+      throw std::invalid_argument("Whole-body reference supports up to 32 scalar states");
+    if (!base && !posture) throw std::invalid_argument("Whole-body references require a positive weight");
+    if (base && !mobile_) throw std::invalid_argument("Base reference requires a mobile model");
+    if (g.mode != Goal::POSE && g.mode != Goal::CONTINUOUS_PATH)
+      throw std::invalid_argument("Whole-body references support POSE or CONTINUOUS_PATH only");
+    if (g.whole_body_references.size() != (g.mode == Goal::POSE ? 1 : g.waypoints.size()))
+      throw std::invalid_argument("Whole-body reference count must match TCP targets");
+    if ((g.base_position_weight > 0 && (!std::isfinite(g.base_position_tolerance) || g.base_position_tolerance <= 0)) ||
+        (g.base_yaw_weight > 0 && (!std::isfinite(g.base_yaw_tolerance) ||
+                                 g.base_yaw_tolerance <= 0 || g.base_yaw_tolerance > M_PI)))
+      throw std::invalid_argument("Invalid base arrival tolerance");
+    const auto& names = g.whole_body_references.front().posture.name;
+    for (const auto& r : g.whole_body_references) {
+      if (base) {
+        if (r.base_pose.header.frame_id != base_frame_)
+          throw std::invalid_argument("Base reference must use fixed MPC reference frame " + base_frame_);
+        const auto p = poseVector(r.base_pose.pose);
+        if (std::abs(p[2]) > 1e-6 || std::abs(p[3]) > 1e-6 || std::abs(p[4]) > 1e-6)
+          throw std::invalid_argument("Base reference must be planar: z=roll=pitch=0");
+      } else if (!r.base_pose.header.frame_id.empty())
+        throw std::invalid_argument("Base reference supplied without an active base weight");
+      const auto& q = r.posture;
+      if (!q.velocity.empty() || !q.effort.empty() || !q.header.frame_id.empty())
+        throw std::invalid_argument("Posture supports named joint positions only");
+      if (!posture) {
+        if (!q.name.empty() || !q.position.empty()) throw std::invalid_argument("Posture supplied without posture weight");
+        continue;
+      }
+      if (names.empty() || q.name != names || q.name.size() != q.position.size())
+        throw std::invalid_argument("Posture must use the same nonempty joint names at every waypoint");
+      for (size_t i = 0; i < names.size(); ++i) {
+        const auto it = std::find(joints_.begin(), joints_.end(), names[i]);
+        if (it == joints_.end() || std::find(names.begin(), names.begin()+i, names[i]) != names.begin()+i)
+          throw std::invalid_argument("Unknown or duplicate posture joint " + names[i]);
+        const size_t index = it-joints_.begin();
+        if (!std::isfinite(q.position[i]) || q.position[i] < lower_[index] || q.position[i] > upper_[index])
+          throw std::invalid_argument("Posture outside model joint limits: " + names[i]);
+      }
+    }
+    return true;
+  } catch (const std::exception& e) { error = e.what(); return false; }
+}
+void TcpReferenceManager::prepareWholeBody(
+    const zephyr_msgs::action::ExecuteCartesianMotion::Goal& g, const vector_t& measured,
+    vector_array_t& states, vector_t& weights) const {
+  std::string error;
+  if (!validateWholeBodyGoal(g, error)) throw std::invalid_argument(error);
+  if (g.whole_body_references.empty()) return;
+  const size_t offset = mobile_ ? 3 : 0, dim = joints_.size()+offset;
+  if (measured.size() != static_cast<int>(dim) || !measured.allFinite())
+    throw std::invalid_argument("Whole-body measured state unavailable");
+  states = {measured}; weights = vector_t::Zero(dim);
+  if (mobile_) weights.head<3>() << g.base_position_weight, g.base_position_weight, g.base_yaw_weight;
+  for (const auto& r : g.whole_body_references) {
+    vector_t state = measured;
+    if (g.base_position_weight > 0 || g.base_yaw_weight > 0) {
+      const auto p = poseVector(r.base_pose.pose);
+      if (g.base_position_weight > 0) state.head<2>() = p.head<2>();
+      if (g.base_yaw_weight > 0) state[2] = 2*std::atan2(p[5], p[6]);
+    }
+    for (size_t i = 0; i < r.posture.name.size(); ++i) {
+      const size_t j = std::find(joints_.begin(), joints_.end(), r.posture.name[i])-joints_.begin()+offset;
+      state[j] = r.posture.position[i]; weights[j] = g.posture_weight;
+    }
+    states.push_back(std::move(state));
+  }
+}
+std::array<double, 2> TcpReferenceManager::wholeBodyErrors(const vector_t& state) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!pending_body_ || !mobile_) return {0, 0};
+  if (state.size() != pending_body_->weights.size() || !state.allFinite())
+    return {INFINITY, INFINITY};
+  const auto& target = pending_body_->states.back();
+  const double yaw = state[2]-target[2];
+  return {pending_body_->weights[0] > 0 ? (state.head<2>()-target.head<2>()).norm() : 0,
+          pending_body_->weights[2] > 0 ? std::abs(std::atan2(std::sin(yaw), std::cos(yaw))) : 0};
+}
 bool TcpReferenceManager::startMotion(
     const zephyr_msgs::action::ExecuteCartesianMotion::Goal& request,
     const vector_t& measured_pose, geometry_msgs::msg::PoseStamped& target,
-    double& end_time, std::string& error) {
+    double& end_time, std::string& error, const vector_t& measured_state) {
   using Goal = zephyr_msgs::action::ExecuteCartesianMotion::Goal;
   std::lock_guard<std::mutex> lock(mutex_);
   try {
@@ -415,8 +556,12 @@ bool TcpReferenceManager::startMotion(
       }
     }
     if (goals.empty()) throw std::invalid_argument("Empty motion");
+    vector_array_t body_states;
+    vector_t body_weights;
+    prepareWholeBody(request, measured_state, body_states, body_weights);
     time_ = observation_time_.load(std::memory_order_acquire);
-    plan(goals, 0.0, &measured_pose, request.speed_scale, request.mode == Goal::CONTINUOUS_PATH);
+    plan(goals, 0.0, &measured_pose, request.speed_scale, request.mode == Goal::CONTINUOUS_PATH,
+         body_states, body_weights);
     end_time = times_.back();
     target.header.frame_id = base_frame_;
     target.header.stamp = node_->now();
@@ -441,8 +586,7 @@ vector_t TcpReferenceManager::sample(double time) const {
 void TcpReferenceManager::commitImmediate() {
   times_.clear();
   poses_.clear();
-  referenceManagerPtr_->setTargetTrajectories(
-      TargetTrajectories({time_}, {target_}, {vector_t::Zero(input_dim_)}));
+  commit(TargetTrajectories({time_}, {target_}, {vector_t::Zero(input_dim_)}));
 }
 void TcpReferenceManager::setCurrentObservation(
     const SystemObservation &observation) {
@@ -530,6 +674,18 @@ void TcpReferenceManager::publish() const {
       path.poses.push_back(std::move(sample));
     }
     reference_path_pub_->publish(path);
+    nav_msgs::msg::Path base_path;
+    base_path.header = p.header;
+    if (pending_body_ && mobile_) for (double time : times_) {
+      const auto state = pending_body_->sample(time);
+      geometry_msgs::msg::PoseStamped base;
+      base.header.frame_id = base_frame_;
+      base.header.stamp = rclcpp::Time(static_cast<int64_t>(time*1e9));
+      base.pose.position.x = state[0]; base.pose.position.y = state[1];
+      base.pose.orientation.z = std::sin(state[2]/2); base.pose.orientation.w = std::cos(state[2]/2);
+      base_path.poses.push_back(base);
+    }
+    base_reference_path_pub_->publish(base_path); // Empty explicitly clears retired reference.
   }
 }
 
