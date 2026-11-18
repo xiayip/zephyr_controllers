@@ -28,6 +28,7 @@ class MotionProfileServerTest : public testing::Test {
     runtime = std::make_shared<MotionRuntime>();
     runtime->activate();
     sample.valid = true;
+    sample.speeds.valid = true;
     sample.state = MotionStatus::IDLE;
     sample.reference_time = 10;
     sample.profile_revision = 1;
@@ -147,6 +148,39 @@ TEST_F(MotionProfileServerTest, AcceptanceWaitsForMatchingPolicyBeforeReleasingT
   EXPECT_DOUBLE_EQ(latest_status.active.input_cost_scale, 3.0);
   EXPECT_TRUE(reference->claimMotion());
   reference->releaseMotion();
+}
+
+TEST_F(MotionProfileServerTest, ModelChangeRejectsUnknownOrMovingBaseWithoutTakingReference) {
+  sample.speeds.valid = false;
+  EXPECT_FALSE(request(RuntimeProfileConfig::CRAB)->accepted);
+  sample.speeds.valid = true;
+  for (const auto axis : {MotionSpeeds::BaseLinear, MotionSpeeds::BaseAngular}) {
+    for (const double value : {0.1, std::numeric_limits<double>::quiet_NaN()}) {
+      sample.speeds.values[axis] = value;
+      EXPECT_FALSE(request(RuntimeProfileConfig::CRAB)->accepted);
+      EXPECT_EQ(profile->requestedRevision(), 1U);
+      EXPECT_TRUE(reference->claimMotion());
+      reference->releaseMotion();
+    }
+    sample.speeds.values[axis] = 0;
+  }
+  EXPECT_TRUE(request(RuntimeProfileConfig::CRAB)->accepted);
+}
+
+TEST_F(MotionProfileServerTest, MatchingNewPolicyStillWaitsIfBaseMovedDuringHandover) {
+  const auto response = request(RuntimeProfileConfig::SPIN);
+  ASSERT_TRUE(response->accepted);
+  matchingPolicy(response->revision);
+  sample.speeds.values[MotionSpeeds::BaseLinear] = .1;
+  pump(100ms);
+  EXPECT_FALSE(runtime->profile_output_allowed);
+  EXPECT_FALSE(latest_status.applied);
+  EXPECT_TRUE(latest_status.transition_pending);
+  EXPECT_FALSE(reference->claimMotion());
+  sample.speeds.values[MotionSpeeds::BaseLinear] = 0;
+  pump(100ms);
+  EXPECT_TRUE(latest_status.applied);
+  EXPECT_TRUE(runtime->profile_output_allowed);
 }
 
 TEST_F(MotionProfileServerTest, OnlyActiveFreshIdleControllerAcceptsNewProfile) {

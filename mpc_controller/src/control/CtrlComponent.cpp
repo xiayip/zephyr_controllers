@@ -5,6 +5,7 @@
 //
 
 #include "mpc_controller/control/CtrlComponent.h"
+#include "mpc_controller/control/ArmVelocityStep.h"
 
 #include <mpc_controller/runtime/ThreadScheduling.h>
 #include <ocs2_core/thread_support/ThreadPool.h>
@@ -108,6 +109,9 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         // Production defaults must not allocate prediction meshes or record CSV.
         // Only hardware-checked mock launch profiles opt into these diagnostics.
         mock_debug_enabled_ = auto_declare("mock_debug_enabled", false);
+        const bool control_diagnostics_enabled = auto_declare("control_diagnostics_enabled", false);
+        if (control_diagnostics_enabled && !mock_debug_enabled_)
+            throw std::runtime_error("Control diagnostics are mock-only");
         prediction_visualization_enabled_ = auto_declare("prediction_visualization_enabled", false);
         // Declare dir before enabled so both can be applied together from yaml/callback.
         traj_record_dir_ = auto_declare("traj_record_dir", std::string("/tmp/traj_record"));
@@ -163,11 +167,18 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         base_linear_stop_threshold_ = auto_declare("base_linear_stop_threshold", 0.015);
         base_angular_start_threshold_ = auto_declare("base_angular_start_threshold", 0.04);
         base_angular_stop_threshold_ = auto_declare("base_angular_stop_threshold", 0.02);
-        base_command_profile_ = auto_declare("base_command_profile", std::string("omni"));
+        const auto base_command_profile = auto_declare("base_command_profile", std::string("omni"));
         base_max_linear_speed_ = auto_declare("base_max_linear_speed", 0.0);
         base_max_angular_speed_ = auto_declare("base_max_angular_speed", 0.0);
-        if ((base_command_profile_ != "omni" && base_command_profile_ != "ranger") ||
-            !std::isfinite(base_max_linear_speed_) || base_max_linear_speed_ < 0.0 ||
+        BaseKinematics base_kinematics;
+        base_kinematics.backend = BaseKinematics::parseBackend(base_command_profile);
+        base_kinematics.mobile = mobile_base_enabled_;
+        base_kinematics.wheel_base = auto_declare("base_wheel_base", 0.494);
+        base_kinematics.max_steering_angle = auto_declare("base_max_steering_angle", 0.698);
+        base_kinematics.command_deadzone = auto_declare("base_command_deadzone", 0.001);
+        base_kinematics.ackermann_penalty = auto_declare("base_ackermann_penalty", 1000.0);
+        base_kinematics.validate();
+        if (!std::isfinite(base_max_linear_speed_) || base_max_linear_speed_ < 0.0 ||
             !std::isfinite(base_max_angular_speed_) || base_max_angular_speed_ < 0.0)
         {
             throw std::runtime_error("Invalid base command profile or speed limits");
@@ -280,6 +291,19 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             robot_name_ + "_mpc_observation", 1);
         if (mock_debug_enabled_)
             solve_time_publisher_ = node_->create_publisher<std_msgs::msg::Float64>("~/solve_time_ms", 10);
+        if (control_diagnostics_enabled)
+        {
+            auto publisher = node_->create_publisher<std_msgs::msg::Float64MultiArray>(
+                "~/control_sample", rclcpp::SensorDataQoS());
+            control_diagnostics_publisher_ = std::make_shared<
+                realtime_tools::RealtimePublisher<std_msgs::msg::Float64MultiArray>>(publisher);
+            auto& message = control_diagnostics_publisher_->msg_;
+            const auto n = joint_names_.size() + base_state_offset_;
+            message.data.resize(10 + 4 * n);
+            message.layout.dim.resize(1);
+            message.layout.dim[0].label = "time,policy_start,sample_time,base_mode,speeds_valid,speeds[5];measured[n];nominal[n];input[n];command[n](base_velocity,arm_position)";
+            message.layout.dim[0].size = message.layout.dim[0].stride = message.data.size();
+        }
 
         {
             zephyr::mpc_visualization::mpc_visualizer_config viz_cfg;
@@ -326,12 +350,11 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         pose_reference_manager_->configureWholeBody(mobile_base_enabled_, joint_names_,
             model.lowerPositionLimit.tail(joint_names_.size()), model.upperPositionLimit.tail(joint_names_.size()));
         pose_reference_manager_->subscribe(node_);
-        runtime_profile_ = std::make_shared<RuntimeMotionProfile>();
+        runtime_profile_ = std::make_shared<RuntimeMotionProfile>(RuntimeProfileConfig{}, base_kinematics);
         pose_reference_manager_->setRuntimeProfile(runtime_profile_);
         // Extend a copy of the upstream problem through public APIs only.
         auto problem = interface_->getOptimalControlProblem();
-        decorateProblem(problem, runtime_profile_, mobile_base_enabled_,
-                        base_command_profile_ == "ranger", info.stateDim, info.inputDim);
+        decorateProblem(problem, runtime_profile_, mobile_base_enabled_, info.stateDim, info.inputDim);
         problem.stateCostPtr->add("wholeBodyReference",
             std::make_unique<WholeBodyStateCost>(pose_reference_manager_->wholeBodyReference()));
         problem.finalCostPtr->add("wholeBodyReference",
@@ -384,9 +407,10 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                  "base_odom_topic", "base_cmd_topic", "base_linear_start_threshold",
                  "base_linear_stop_threshold", "base_angular_start_threshold",
                  "base_angular_stop_threshold", "base_command_profile", "base_max_linear_speed",
+                 "base_wheel_base", "base_max_steering_angle", "base_command_deadzone", "base_ackermann_penalty",
                  "base_max_angular_speed", "planning_urdf_path",
                  "future_time_offset", "task_config_package", "info_file_name", "ocs2_library_folder", "base_frame",
-                 "tcp_ee_frame", "mock_debug_enabled", "prediction_visualization_enabled", "prediction_publish_hz",
+                 "tcp_ee_frame", "mock_debug_enabled", "control_diagnostics_enabled", "prediction_visualization_enabled", "prediction_publish_hz",
                  "prediction_ghost_interval", "prediction_ghost_count", "prediction_max_age",
                  "movel_duration", "movel_sample_interval", "movel_max_linear_velocity",
                  "movel_max_linear_acceleration", "movel_max_linear_jerk",
@@ -552,7 +576,9 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
 
     void CtrlComponent::applyBaseCommandDeadband(geometry_msgs::msg::Twist& command)
     {
-        // Both axes use the same start/stop hysteresis, with independent state.
+        // Preserve curvature while translating in explicit Ackermann/differential
+        // modes. Unlike Ackermann, differential can still spin after translation
+        // stops. COORDINATED retains its backward-compatible independent gates.
         const auto allow_motion = [](double speed, double start, double stop, bool& active) {
             const bool suppress = active ? speed <= stop : speed < start;
             active = !suppress;
@@ -563,7 +589,14 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         {
             command.linear.x = command.linear.y = 0.0;
         }
-        if (!allow_motion(std::abs(command.angular.z),
+        const auto mode = runtime_profile_->activeConfig().base_mode;
+        if (mode == RuntimeProfileConfig::ACKERMANN_FORWARD || mode == RuntimeProfileConfig::ACKERMANN_REVERSE ||
+            (mode == RuntimeProfileConfig::DIFFERENTIAL && base_translation_active_))
+        {
+            if (!base_translation_active_) command.angular.z = 0.0;
+            base_rotation_active_ = false;
+        }
+        else if (!allow_motion(std::abs(command.angular.z),
                           base_angular_start_threshold_, base_angular_stop_threshold_, base_rotation_active_))
         {
             command.angular.z = 0.0;
@@ -754,6 +787,15 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             holdLastSentPositions();
             return false;
         }
+        vector_t arm_command = future_state;
+        if (mobile_base_enabled_ && !stepArmVelocity(
+                measured_observation_.state, future_input, base_state_offset_,
+                1.0 / ctrl_interfaces_.frequency_, arm_command))
+        {
+            RCLCPP_ERROR(node_->get_logger(), "Invalid mobile arm velocity step; holding");
+            holdLastSentPositions();
+            return false;
+        }
         // Validate all commands before writing any base or arm output.
         if (mixed)
         {
@@ -778,6 +820,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             holdLastSentPositions();
             return true;
         }
+        Eigen::Vector3d sent_base_command = Eigen::Vector3d::Zero();
         if (mobile_base_enabled_ && base_command_publisher_)
         {
             geometry_msgs::msg::Twist command;
@@ -788,12 +831,22 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                 command.linear.y = future_input(1);
                 command.angular.z = future_input(2);
             }
-            // Remove numerical lateral residuals before applying the planar
-            // deadband; Ranger's prediction uses the same vy=0 constraint.
-            if (base_command_profile_ == "ranger") command.linear.y = 0.0;
+            const auto project = [&] {
+                const auto velocity = runtime_profile_->kinematics().project(
+                    runtime_profile_->activeConfig().base_mode,
+                    Eigen::Vector3d(command.linear.x, command.linear.y, command.angular.z));
+                command.linear.x = velocity.x();
+                command.linear.y = velocity.y();
+                command.angular.z = velocity.z();
+            };
+            project();
             applyBaseCommandDeadband(command);
             limitBaseCommand(command, base_max_linear_speed_, base_max_angular_speed_);
+            // Deadbands/speed caps must not turn Ackermann into an accidental
+            // spin or increase curvature beyond the steering envelope.
+            project();
             publishMobileBaseCommand(command);
+            sent_base_command << command.linear.x, command.linear.y, command.angular.z;
         }
         if (mixed)
         {
@@ -806,8 +859,27 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                             i + base_state_offset_ < static_cast<size_t>(future_state.size()); ++i)
         {
             ctrl_interfaces_.setJointMotionCommand(
-                i, future_state(static_cast<Eigen::Index>(i + base_state_offset_)),
+                i, arm_command(static_cast<Eigen::Index>(i + base_state_offset_)),
                 future_input(static_cast<Eigen::Index>(i + base_state_offset_)));
+        }
+        if (control_diagnostics_publisher_ && control_diagnostics_publisher_->trylock())
+        {
+            auto& data = control_diagnostics_publisher_->msg_.data;
+            const auto n = observation_.state.size();
+            data[0] = time.seconds();
+            data[1] = policy.timeTrajectory_.front();
+            data[2] = future_time;
+            data[3] = runtime_profile_->activeConfig().base_mode;
+            data[4] = measured_motion_speeds_.valid;
+            std::copy_n(measured_motion_speeds_.values.begin(), 5, data.begin() + 5);
+            std::copy_n(observation_.state.data(), n, data.begin() + 10);
+            std::copy_n(future_state.data(), n, data.begin() + 10 + n);
+            std::copy_n(future_input.data(), n, data.begin() + 10 + 2 * n);
+            if (mobile_base_enabled_)
+                std::copy_n(sent_base_command.data(), 3, data.begin() + 10 + 3 * n);
+            std::copy(ctrl_interfaces_.last_sent_joint_positions_.begin(),
+                ctrl_interfaces_.last_sent_joint_positions_.end(), data.begin() + 10 + 3 * n + base_state_offset_);
+            control_diagnostics_publisher_->unlockAndPublish();
         }
         return true;
     }

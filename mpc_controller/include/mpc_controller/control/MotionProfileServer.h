@@ -12,7 +12,8 @@
 namespace zephyr::mpc {
 /** Executor-side coordinator. No service, mutex or DDS work runs in update().
  * Request acceptance is separate from activation of a matching MPC policy.
- * This component neither arbitrates chassis commands nor confirms a base stop.
+ * Changing a mobile base model requires fresh measured low-speed feedback.
+ * This is not a safety-rated stop or a hardware steering/mode acknowledgement.
  */
 class MotionProfileServer {
  public:
@@ -34,6 +35,7 @@ class MotionProfileServer {
   bool profile_submitted_{true};
   bool transition_pending_{false}, owns_reference_gate_{false};
   bool handover_failed_{false};
+  bool requires_base_stop_{false};
   std::string detail_;
   rclcpp::Service<SetProfile>::SharedPtr service_;
   rclcpp::Publisher<ProfileStatus>::SharedPtr publisher_;

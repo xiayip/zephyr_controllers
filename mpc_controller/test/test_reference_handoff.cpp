@@ -347,17 +347,27 @@ TEST_F(ReferenceHandoff, ProfileReleaseNeverReplaysCachedTwistAndAcceptsFreshTar
     reference->setAcceptingTargets(true);
     geometry_msgs::msg::Twist twist;
     twist.linear.x = 0.1;
-    send("tcp_target/twist", twist);
-    observation.time = 10.05;
-    reference->setCurrentObservation(observation);
-    spinFor(20ms);
+    // This is a stream with a 200 ms watchdog. Keep it fresh until an actual
+    // integrated target is observed; a fixed 20 ms sleep races DDS discovery,
+    // callback delivery and the 10 ms reference timer under parallel CTest.
+    auto publisher = node->create_publisher<geometry_msgs::msg::Twist>("tcp_target/twist", 1);
+    publisher->on_activate();
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (committedTarget()(0) <= pose(0) && std::chrono::steady_clock::now() < deadline) {
+        publisher->publish(twist);
+        spinFor(5ms);
+        observation.time += .01;
+        reference->setCurrentObservation(observation);
+        spinFor(15ms);
+    }
+    publisher.reset();
     ASSERT_GT(committedTarget()(0), pose(0));  // The cached stream was active before the handoff.
 
     auto measured = pose;
     measured(2) = 0.34;
     ASSERT_TRUE(reference->beginProfileChange(measured));
     reference->endProfileChange();
-    observation.time = 10.10;
+    observation.time += .05;
     reference->setCurrentObservation(observation);
     spinFor(20ms);  // Less than the 200 ms twist watchdog: cancellation, not expiry, must hold it.
     EXPECT_EQ(committedTarget(), measured);

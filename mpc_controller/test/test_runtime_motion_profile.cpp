@@ -10,6 +10,7 @@
 #include <ocs2_core/cost/QuadraticStateInputCost.h>
 #include <ocs2_core/dynamics/LinearSystemDynamics.h>
 #include <ocs2_core/initialization/DefaultInitializer.h>
+#include <ocs2_core/soft_constraint/StateInputSoftConstraint.h>
 #include <ocs2_ddp/GaussNewtonDDP_MPC.h>
 #include <ocs2_mpc/MPC_MRT_Interface.h>
 #include <ocs2_mpc/MRT_BASE.h>
@@ -82,7 +83,7 @@ TEST(RuntimeMotionProfile, ValidatesBoundsWithoutChangingRequestedOrSolverState)
     EXPECT_FALSE(runtime.submit(bad, reason));
     bad.input_cost_scale = 1.0;
   }
-  bad.base_mode = 7;
+  bad.base_mode = 255;
   EXPECT_FALSE(runtime.submit(bad, reason));
   bad.base_mode = RuntimeProfileConfig::LOCKED;
   bad.revision = 0;
@@ -106,7 +107,7 @@ TEST(RuntimeMotionProfile, DefaultCostsAndAllDerivativesMatchAndClonesShareFroze
   const auto original = makeProblem();
   auto problem = original;
   const auto runtime = std::make_shared<RuntimeMotionProfile>();
-  decorateProblem(problem, runtime, true, true, 4, 4);
+  decorateProblem(problem, runtime, true, 4, 4);
   auto solver_copy = problem;
   const auto x = vector_t::Constant(4, 0.4).eval();
   const auto u = vector_t::Constant(4, -0.2).eval();
@@ -156,12 +157,13 @@ TEST(RuntimeMotionProfile, RequestBetweenReferenceSwapAndModuleCallbackWaitsForN
   EXPECT_EQ(runtime->solverConfig().revision, 3U);
 }
 
-TEST(RuntimeMotionProfile, LockHasFullRankAndDoesNotDuplicateRangerLateralConstraint) {
+TEST(RuntimeMotionProfile, LockHasFullRankAndRangerUsesOnlyOneLateralRow) {
   for (const bool ranger : {false, true}) {
     auto problem = makeProblem();
-    if (ranger) problem.equalityConstraintPtr->add("baseNoLateralVelocity", makeNoLateralVelocityConstraint(4, 4));
-    const auto runtime = std::make_shared<RuntimeMotionProfile>();
-    decorateProblem(problem, runtime, true, ranger, 4, 4);
+    BaseKinematics kinematics;
+    kinematics.backend = ranger ? BaseKinematics::Backend::Ranger : BaseKinematics::Backend::Omni;
+    const auto runtime = std::make_shared<RuntimeMotionProfile>(RuntimeProfileConfig{}, kinematics);
+    decorateProblem(problem, runtime, true, 4, 4);
     auto clone = problem;
     auto& constraint = clone.equalityConstraintPtr->get("runtimeBaseMotion");
     EXPECT_EQ(constraint.getNumConstraints(0), ranger ? 1U : 0U);
@@ -178,22 +180,115 @@ TEST(RuntimeMotionProfile, LockHasFullRankAndDoesNotDuplicateRangerLateralConstr
     EXPECT_TRUE(approximation.dfdx.isZero());
     EXPECT_TRUE(approximation.f.isApprox(input.head<3>()));
     EXPECT_TRUE(approximation.dfdu.rightCols(1).isZero());
-    size_t index = 0;
-    EXPECT_FALSE(clone.equalityConstraintPtr->getTermIndex("baseNoLateralVelocity", index));
+    EXPECT_EQ(clone.equalityConstraintPtr->getNumConstraints(0), 3U);
     ASSERT_TRUE(runtime->submit({3, RuntimeProfileConfig::COORDINATED, 1.0, 1.0}, reason));
     synchronize(runtime);
     EXPECT_EQ(constraint.getNumConstraints(0), ranger ? 1U : 0U);
+    EXPECT_EQ(clone.equalityConstraintPtr->getNumConstraints(0), ranger ? 1U : 0U);
   }
 }
 
 TEST(RuntimeMotionProfile, FixedBaseDoesNotConstrainArmInputsAndInvalidMobileDimensionsReject) {
   auto problem = makeProblem(2);
   const auto runtime = std::make_shared<RuntimeMotionProfile>(RuntimeProfileConfig{1, RuntimeProfileConfig::LOCKED, 1, 1});
-  decorateProblem(problem, runtime, false, true, 2, 2);
+  decorateProblem(problem, runtime, false, 2, 2);
   EXPECT_TRUE(problem.equalityConstraintPtr->empty());
   auto invalid = makeProblem(2);
-  EXPECT_THROW(decorateProblem(invalid, runtime, true, true, 2, 2), std::invalid_argument);
-  EXPECT_THROW(decorateProblem(invalid, nullptr, false, false, 2, 2), std::invalid_argument);
+  EXPECT_THROW(decorateProblem(invalid, runtime, true, 2, 2), std::invalid_argument);
+  EXPECT_THROW(decorateProblem(invalid, nullptr, false, 2, 2), std::invalid_argument);
+}
+
+TEST(RuntimeMotionProfile, RangerLateralConstraintLeavesBaseAndSixArmInputsFree) {
+  BaseKinematics kinematics;
+  kinematics.backend = BaseKinematics::Backend::Ranger;
+  const auto runtime = std::make_shared<RuntimeMotionProfile>(RuntimeProfileConfig{}, kinematics);
+  auto problem = makeProblem(9);
+  decorateProblem(problem, runtime, true, 9, 9);
+  auto clone = problem;
+  auto& constraint = clone.equalityConstraintPtr->get("runtimeBaseMotion");
+  const auto state = vector_t::Constant(9, 2.0).eval();
+  const PreComputation pre;
+  for (double time : {0., 1., 100.}) {
+    for (double sign : {-1., 1.}) {
+      auto input = vector_t::Constant(9, sign * .2).eval();
+      input[1] = 0;
+      EXPECT_TRUE(constraint.getValue(time, state, input, pre).isZero());
+      input[1] = sign * .1;
+      const auto a = constraint.getLinearApproximation(time, state, input, pre);
+      ASSERT_EQ(a.f.size(), 1);
+      EXPECT_DOUBLE_EQ(a.f[0], input[1]);
+      EXPECT_TRUE(a.dfdx.isZero());
+      for (int i = 0; i < 9; ++i) EXPECT_DOUBLE_EQ(a.dfdu(0, i), i == 1 ? 1. : 0.);
+    }
+  }
+}
+
+TEST(RuntimeMotionProfile, AllModeEqualitiesAreFullRankAndLeaveArmFree) {
+  const auto runtime = std::make_shared<RuntimeMotionProfile>();
+  auto problem = makeProblem();
+  decorateProblem(problem, runtime, true, 4, 4);
+  auto clone = problem;
+  auto& constraint = clone.equalityConstraintPtr->get("runtimeBaseMotion");
+  const auto x = vector_t::Zero(4).eval();
+  const auto u = (vector_t(4) << 0.1, 0.2, 0.3, 0.4).finished();
+  const PreComputation pre;
+  std::string reason;
+  for (uint8_t mode = 0; mode <= RuntimeProfileConfig::OMNI; ++mode) {
+    ASSERT_TRUE(runtime->submit({uint64_t(mode + 2), mode, 1, 1}, reason));
+    synchronize(runtime);
+    const auto a = constraint.getLinearApproximation(0, x, u, pre);
+    EXPECT_EQ(a.dfdu.fullPivLu().rank(), a.f.size());
+    EXPECT_TRUE(a.dfdx.isZero());
+    EXPECT_TRUE(a.dfdu.rightCols(1).isZero());
+    EXPECT_TRUE(a.f.isApprox(a.dfdu * u));
+    EXPECT_TRUE((a.dfdu * (vector_t(4) << runtime->kinematics().project(mode, u.head<3>()), 0.4).finished()).isZero(1e-12));
+  }
+}
+
+TEST(RuntimeMotionProfile, AckermannEnvelopeDerivativesAndSoftPenalty) {
+  const auto runtime = std::make_shared<RuntimeMotionProfile>();
+  auto problem = makeProblem();
+  decorateProblem(problem, runtime, true, 4, 4);
+  auto& cost = dynamic_cast<StateInputSoftConstraint&>(problem.softConstraintPtr->get("ackermannEnvelope"));
+  auto& cone = cost.get();
+  const auto x = vector_t::Zero(4).eval();
+  const auto u = (vector_t(4) << 0.1, 0.2, 3.0, 0.4).finished();
+  const PreComputation pre;
+  const TargetTrajectories target;
+  std::string reason;
+  EXPECT_FALSE(cost.isActive(0));
+  for (const auto mode : {RuntimeProfileConfig::ACKERMANN_FORWARD, RuntimeProfileConfig::ACKERMANN_REVERSE}) {
+    ASSERT_TRUE(runtime->submit({uint64_t(mode), mode, 1, 1}, reason));
+    synchronize(runtime);
+    ASSERT_TRUE(cost.isActive(0));
+    const auto a = cone.getLinearApproximation(0, x, u, pre);
+    EXPECT_TRUE(a.f.isApprox(a.dfdu * u));
+    EXPECT_TRUE(a.dfdx.isZero());
+    EXPECT_TRUE(a.dfdu.col(1).isZero());
+    EXPECT_TRUE(a.dfdu.col(3).isZero());
+    const auto quadratic = cost.getQuadraticApproximation(0, x, u, target, pre);
+    EXPECT_GT(quadratic.f, 0);
+    for (int i = 0; i < 4; ++i) {
+      auto plus = u, minus = u;
+      plus[i] += 1e-6; minus[i] -= 1e-6;
+      EXPECT_NEAR(quadratic.dfdu[i], (cost.getValue(0, x, plus, target, pre) -
+          cost.getValue(0, x, minus, target, pre)) / 2e-6, 1e-5);
+    }
+    auto feasible = u;
+    feasible.head<3>() = runtime->kinematics().project(mode, u.head<3>());
+    EXPECT_NEAR(cost.getValue(0, x, feasible, target, pre), 0, 1e-12);
+  }
+}
+
+TEST(RuntimeMotionProfile, UnsupportedBackendModeLeavesRevisionUntouched) {
+  BaseKinematics k;
+  k.backend = BaseKinematics::Backend::Ranger;
+  RuntimeMotionProfile runtime({}, k);
+  std::string reason;
+  EXPECT_FALSE(runtime.submit({2, RuntimeProfileConfig::OMNI, 1, 1}, reason));
+  EXPECT_FALSE(runtime.submit({2, RuntimeProfileConfig::DIFFERENTIAL, 1, 1}, reason));
+  EXPECT_EQ(runtime.requestedRevision(), 1U);
+  EXPECT_TRUE(runtime.submit({2, RuntimeProfileConfig::CRAB, 1, 1}, reason));
 }
 
 TEST(RuntimeMotionProfile, MrtPairsLatestBufferedPolicyAndNeverLabelsOldPolicyWithNewRequest) {
@@ -259,8 +354,10 @@ TEST(RuntimeMotionProfile, ConcurrentMrtBufferOverwritePreservesPolicyRevisionPa
 
 TEST(RuntimeMotionProfile, RealMpcUsesNewConstraintAndCostWithoutReconstructingController) {
   auto problem = makeProblem();
-  const auto runtime = std::make_shared<RuntimeMotionProfile>();
-  decorateProblem(problem, runtime, true, true, 4, 4);
+  BaseKinematics kinematics;
+  kinematics.backend = BaseKinematics::Backend::Ranger;
+  const auto runtime = std::make_shared<RuntimeMotionProfile>(RuntimeProfileConfig{}, kinematics);
+  decorateProblem(problem, runtime, true, 4, 4);
   rollout::Settings rollout_settings;
   rollout_settings.timeStep = 0.01;
   TimeTriggeredRollout rollout(*problem.dynamicsPtr, rollout_settings);

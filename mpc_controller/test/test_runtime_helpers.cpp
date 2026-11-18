@@ -109,7 +109,8 @@ TEST(RuntimeHelpers, TimingSamplesAreBoundedAndDisabledScopeDoesNothing) {
 
 TEST(RuntimeHelpers, ProductionRejectsDiagnosticsBeforeLoadingAnyRobotModel) {
   rclcpp::init(0, nullptr);
-  for (const auto* parameter : {"prediction_visualization_enabled", "traj_record_enabled"}) {
+  for (const auto* parameter : {"prediction_visualization_enabled", "traj_record_enabled",
+                                "control_diagnostics_enabled"}) {
     rclcpp::NodeOptions options;
     options.use_global_arguments(false).parameter_overrides({rclcpp::Parameter(parameter, true)});
     auto node = std::make_shared<rclcpp_lifecycle::LifecycleNode>("diagnostics_gate_test", options);

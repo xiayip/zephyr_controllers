@@ -2,12 +2,15 @@
 #include "mpc_controller/control/RuntimeMotionProfile.h"
 
 #include <cmath>
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
 #include <ocs2_core/constraint/StateInputConstraint.h>
 #include <ocs2_core/cost/StateCost.h>
 #include <ocs2_core/cost/StateInputCost.h>
+#include <ocs2_core/soft_constraint/StateInputSoftConstraint.h>
+#include <ocs2_core/penalties/penalties/SquaredHingePenalty.h>
 
 namespace zephyr::mpc {
 namespace {
@@ -69,21 +72,24 @@ class ScaledInputCost final : public ocs2::StateInputCost {
 
 class RuntimeBaseConstraint final : public ocs2::StateInputConstraint {
  public:
-  RuntimeBaseConstraint(std::shared_ptr<RuntimeMotionProfile> runtime, bool ranger,
+  RuntimeBaseConstraint(std::shared_ptr<RuntimeMotionProfile> runtime,
                         size_t state_dim, size_t input_dim)
       : StateInputConstraint(ocs2::ConstraintOrder::Linear), runtime_(std::move(runtime)),
-        ranger_(ranger), state_dim_(state_dim), input_dim_(input_dim) {}
+        state_dim_(state_dim), input_dim_(input_dim) {}
   RuntimeBaseConstraint* clone() const override { return new RuntimeBaseConstraint(*this); }
   bool isActive(ocs2::scalar_t time) const override { return getNumConstraints(time) != 0; }
   size_t getNumConstraints(ocs2::scalar_t) const override {
-    return runtime_->solverConfig().base_mode == RuntimeProfileConfig::LOCKED ? 3 : (ranger_ ? 1 : 0);
+    const auto axes = runtime_->kinematics().zeroAxes(runtime_->solverConfig().base_mode);
+    return std::count(axes.begin(), axes.end(), true);
   }
   ocs2::vector_t getValue(ocs2::scalar_t time, const ocs2::vector_t&,
                           const ocs2::vector_t& input, const ocs2::PreComputation&) const override {
     const auto count = getNumConstraints(time);
-    if (count == 3) return input.head<3>();
-    if (count == 1) return ocs2::vector_t::Constant(1, input(1));
-    return ocs2::vector_t(0);
+    ocs2::vector_t value(count);
+    const auto axes = runtime_->kinematics().zeroAxes(runtime_->solverConfig().base_mode);
+    size_t row = 0;
+    for (size_t axis = 0; axis < 3; ++axis) if (axes[axis]) value[row++] = input[axis];
+    return value;
   }
   ocs2::VectorFunctionLinearApproximation getLinearApproximation(
       ocs2::scalar_t time, const ocs2::vector_t& state, const ocs2::vector_t& input,
@@ -91,15 +97,50 @@ class RuntimeBaseConstraint final : public ocs2::StateInputConstraint {
     const auto count = getNumConstraints(time);
     auto approximation = ocs2::VectorFunctionLinearApproximation::Zero(count, state_dim_, input_dim_);
     approximation.f = getValue(time, state, input, pre);
-    if (count == 3) approximation.dfdu.leftCols<3>().setIdentity();
-    else if (count == 1) approximation.dfdu(0, 1) = 1.0;
+    const auto axes = runtime_->kinematics().zeroAxes(runtime_->solverConfig().base_mode);
+    size_t row = 0;
+    for (size_t axis = 0; axis < 3; ++axis) if (axes[axis]) approximation.dfdu(row++, axis) = 1.0;
     return approximation;
   }
  private:
   std::shared_ptr<RuntimeMotionProfile> runtime_;
-  bool ranger_;
   size_t state_dim_;
   size_t input_dim_;
+};
+
+// Separate directions keep the cone linear and well-conditioned at rest:
+// k * signed(vx) +/- wz >= 0. No nonconvex vy*wz=0 or division by vx.
+class AckermannEnvelope final : public ocs2::StateInputConstraint {
+ public:
+  AckermannEnvelope(std::shared_ptr<RuntimeMotionProfile> runtime, size_t nx, size_t nu)
+      : StateInputConstraint(ocs2::ConstraintOrder::Linear), runtime_(std::move(runtime)), nx_(nx), nu_(nu) {}
+  AckermannEnvelope* clone() const override { return new AckermannEnvelope(*this); }
+  bool isActive(ocs2::scalar_t) const override {
+    const auto mode = runtime_->solverConfig().base_mode;
+    return mode == RuntimeProfileConfig::ACKERMANN_FORWARD || mode == RuntimeProfileConfig::ACKERMANN_REVERSE;
+  }
+  size_t getNumConstraints(ocs2::scalar_t) const override { return 2; }
+  ocs2::vector_t getValue(ocs2::scalar_t, const ocs2::vector_t&,
+                        const ocs2::vector_t& input, const ocs2::PreComputation&) const override {
+    return (ocs2::vector_t(2) << slope() * input[0] - input[2], slope() * input[0] + input[2]).finished();
+  }
+  ocs2::VectorFunctionLinearApproximation getLinearApproximation(
+      ocs2::scalar_t time, const ocs2::vector_t& state, const ocs2::vector_t& input,
+      const ocs2::PreComputation& pre) const override {
+    auto result = ocs2::VectorFunctionLinearApproximation::Zero(2, nx_, nu_);
+    result.f = getValue(time, state, input, pre);
+    result.dfdu(0, 0) = result.dfdu(1, 0) = slope();
+    result.dfdu(0, 2) = -1;
+    result.dfdu(1, 2) = 1;
+    return result;
+  }
+ private:
+  double slope() const {
+    return runtime_->kinematics().maxCurvature() *
+        (runtime_->solverConfig().base_mode == RuntimeProfileConfig::ACKERMANN_REVERSE ? -1.0 : 1.0);
+  }
+  std::shared_ptr<RuntimeMotionProfile> runtime_;
+  size_t nx_, nu_;
 };
 
 }  // namespace
@@ -107,8 +148,8 @@ class RuntimeBaseConstraint final : public ocs2::StateInputConstraint {
 bool validateRuntimeProfileConfig(const RuntimeProfileConfig& config, std::string& reason) {
   reason.clear();
   if (config.revision == 0) reason = "profile revision must be positive";
-  else if (config.base_mode != RuntimeProfileConfig::COORDINATED && config.base_mode != RuntimeProfileConfig::LOCKED)
-    reason = "base_mode must be COORDINATED or LOCKED";
+  else if (config.base_mode > RuntimeProfileConfig::OMNI)
+    reason = "unknown base_mode; see MotionProfile constants";
   else if (!std::isfinite(config.tcp_cost_scale) || config.tcp_cost_scale < 0.1 || config.tcp_cost_scale > 10.0)
     reason = "tcp_cost_scale must be finite and within [0.1, 10]";
   else if (!std::isfinite(config.input_cost_scale) || config.input_cost_scale < 0.1 || config.input_cost_scale > 10.0)
@@ -116,16 +157,22 @@ bool validateRuntimeProfileConfig(const RuntimeProfileConfig& config, std::strin
   return reason.empty();
 }
 
-RuntimeMotionProfile::RuntimeMotionProfile(RuntimeProfileConfig initial)
-    : pending_config_(initial), requested_revision_(initial.revision), solver_config_(initial),
+RuntimeMotionProfile::RuntimeMotionProfile(RuntimeProfileConfig initial, BaseKinematics kinematics)
+    : kinematics_(kinematics), pending_config_(initial), requested_revision_(initial.revision), solver_config_(initial),
       buffered_config_(initial), active_config_(initial) {
   std::string reason;
+  kinematics_.validate();
   if (!validateRuntimeProfileConfig(initial, reason)) throw std::invalid_argument(reason);
+  if (!kinematics_.supports(initial.base_mode)) throw std::invalid_argument("Unsupported initial base mode");
   buffered_config_.revision = active_config_.revision = 0;
 }
 
 bool RuntimeMotionProfile::submit(const RuntimeProfileConfig& config, std::string& reason) {
   if (!validateRuntimeProfileConfig(config, reason)) return false;
+  if (!kinematics_.supports(config.base_mode)) {
+    reason = "base_mode unsupported by configured chassis backend";
+    return false;
+  }
   std::lock_guard<std::mutex> lock(pending_mutex_);
   if (config.revision <= pending_config_.revision) {
     reason = "profile revision must increase";
@@ -163,7 +210,7 @@ void RuntimeMotionProfile::modifyActiveSolution(const ocs2::CommandData&, ocs2::
 
 void decorateProblem(ocs2::OptimalControlProblem& problem,
                      const std::shared_ptr<RuntimeMotionProfile>& runtime,
-                     bool mobile, bool ranger, size_t state_dim, size_t input_dim) {
+                     bool mobile, size_t state_dim, size_t input_dim) {
   if (!runtime) throw std::invalid_argument("runtime profile is required");
   if (mobile && (state_dim < 3 || input_dim < 3))
     throw std::invalid_argument("Mobile profile requires planar base state and input dimensions");
@@ -178,10 +225,15 @@ void decorateProblem(ocs2::OptimalControlProblem& problem,
   problem.finalSoftConstraintPtr->add("finalEndEffector", std::make_unique<ScaledStateCost>(std::move(final_tcp), runtime));
   problem.costPtr->add("inputCost", std::make_unique<ScaledInputCost>(std::move(input), runtime));
   if (mobile) {
-    // Replace our former Ranger-only equality; never duplicate its vy row.
-    problem.equalityConstraintPtr->erase("baseNoLateralVelocity");
+    // A single mode-aware constraint owns all base zero-velocity rows.
     problem.equalityConstraintPtr->add("runtimeBaseMotion",
-        std::make_unique<RuntimeBaseConstraint>(runtime, ranger, state_dim, input_dim));
+        std::make_unique<RuntimeBaseConstraint>(runtime, state_dim, input_dim));
+    // DDP supports this inequality as a soft cost, not a hard feasibility proof.
+    // The identical cone is also enforced by the final command projection.
+    problem.softConstraintPtr->add("ackermannEnvelope", std::make_unique<ocs2::StateInputSoftConstraint>(
+        std::make_unique<AckermannEnvelope>(runtime, state_dim, input_dim),
+        std::make_unique<ocs2::SquaredHingePenalty>(
+            ocs2::SquaredHingePenalty::Config(runtime->kinematics().ackermann_penalty, 0.0))));
   }
 }
 

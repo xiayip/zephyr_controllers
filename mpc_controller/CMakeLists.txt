@@ -33,6 +33,7 @@ set(controller_target ${PROJECT_NAME}_core)
 add_library(${controller_target} SHARED
   src/mpc_controller.cpp
   src/control/CtrlComponent.cpp
+  src/control/BaseKinematics.cpp
   src/control/TcpKinematics.cpp
   src/control/TcpReferenceManager.cpp
   src/control/ContinuousTcpPath.cpp
@@ -114,6 +115,10 @@ if(BUILD_TESTING)
   target_include_directories(test_measured_motion PRIVATE include)
   target_compile_features(test_measured_motion PRIVATE cxx_std_17)
   target_link_libraries(test_measured_motion Eigen3::Eigen)
+  ament_add_gtest(test_arm_velocity_step test/test_arm_velocity_step.cpp)
+  target_include_directories(test_arm_velocity_step PRIVATE include)
+  target_compile_features(test_arm_velocity_step PRIVATE cxx_std_17)
+  target_link_libraries(test_arm_velocity_step Eigen3::Eigen)
   ament_add_gtest(test_runtime_motion_profile test/test_runtime_motion_profile.cpp)
   target_link_libraries(test_runtime_motion_profile ${controller_target} Threads::Threads)
   ament_add_gtest(test_motion_profile_server test/test_motion_profile_server.cpp)

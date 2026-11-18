@@ -10,12 +10,19 @@
 #include <ocs2_mpc/MrtObserver.h>
 #include <ocs2_oc/oc_problem/OptimalControlProblem.h>
 #include <ocs2_oc/synchronized_module/SolverSynchronizedModule.h>
+#include "mpc_controller/control/BaseKinematics.h"
 
 namespace zephyr::mpc {
 
 struct RuntimeProfileConfig {
   static constexpr uint8_t COORDINATED = 0;
   static constexpr uint8_t LOCKED = 1;
+  static constexpr uint8_t CRAB = 2;
+  static constexpr uint8_t SPIN = 3;
+  static constexpr uint8_t ACKERMANN_FORWARD = 4;
+  static constexpr uint8_t ACKERMANN_REVERSE = 5;
+  static constexpr uint8_t DIFFERENTIAL = 6;
+  static constexpr uint8_t OMNI = 7;
   uint64_t revision{1};
   uint8_t base_mode{COORDINATED};
   double tcp_cost_scale{1.0};
@@ -31,7 +38,8 @@ bool validateRuntimeProfileConfig(const RuntimeProfileConfig& config, std::strin
  */
 class RuntimeMotionProfile final : public ocs2::SolverSynchronizedModule, public ocs2::MrtObserver {
  public:
-  explicit RuntimeMotionProfile(RuntimeProfileConfig initial = {});
+  explicit RuntimeMotionProfile(RuntimeProfileConfig initial = {}, BaseKinematics kinematics = {});
+  const BaseKinematics& kinematics() const { return kinematics_; }
 
   // Non-RT writers only. Rejects invalid/non-increasing revisions atomically.
   bool submit(const RuntimeProfileConfig& config, std::string& reason);
@@ -56,6 +64,7 @@ class RuntimeMotionProfile final : public ocs2::SolverSynchronizedModule, public
   void modifyActiveSolution(const ocs2::CommandData&, ocs2::PrimalSolution&) override;
 
  private:
+  const BaseKinematics kinematics_;
   mutable std::mutex pending_mutex_;
   RuntimeProfileConfig pending_config_;
   std::atomic<uint64_t> requested_revision_;
@@ -70,6 +79,6 @@ class RuntimeMotionProfile final : public ocs2::SolverSynchronizedModule, public
 // Named TCP/input costs retain their original implementation and default values.
 void decorateProblem(ocs2::OptimalControlProblem& problem,
                      const std::shared_ptr<RuntimeMotionProfile>& runtime,
-                     bool mobile, bool ranger, size_t state_dim, size_t input_dim);
+                     bool mobile, size_t state_dim, size_t input_dim);
 
 }  // namespace zephyr::mpc

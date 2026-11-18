@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <mpc_controller/control/MotionProfileServer.h>
+#include <cmath>
 
 namespace zephyr::mpc {
 namespace {
@@ -14,6 +15,13 @@ zephyr_msgs::msg::MotionProfile message(const RuntimeProfileConfig& config) {
 bool fresh(const MotionSample& sample, int64_t now) {
   return sample.valid && sample.received_ns > 0 && now >= sample.received_ns &&
          now - sample.received_ns <= kFeedbackAgeNs;
+}
+bool baseStopped(const MotionSample& sample) {
+  const auto& speed = sample.speeds;
+  const auto linear = speed.values[MotionSpeeds::BaseLinear];
+  const auto angular = speed.values[MotionSpeeds::BaseAngular];
+  return speed.valid && std::isfinite(linear) && std::isfinite(angular) &&
+      linear >= 0 && linear < 0.01 && angular >= 0 && angular < 0.02;
 }
 }  // namespace
 
@@ -43,6 +51,10 @@ void MotionProfileServer::request(const SetProfile::Request& req, SetProfile::Re
   next.tcp_cost_scale = req.profile.tcp_cost_scale;
   next.input_cost_scale = req.profile.input_cost_scale;
   if (!validateRuntimeProfileConfig(next, res.message)) return;
+  if (!profile_->kinematics().supports(next.base_mode)) {
+    res.message = "base_mode unsupported by configured chassis backend";
+    return;
+  }
   const auto sample = runtime_->samples.read();
   if (!runtime_->active || runtime_->stopRequested() ||
       sample.activation_epoch != runtime_->activation_epoch.load() || !fresh(sample, motionSteadyNs())) {
@@ -55,6 +67,11 @@ void MotionProfileServer::request(const SetProfile::Request& req, SetProfile::Re
     res.message = "controller must be idle; finish or cancel its motion first";
     return;
   }
+  const bool changing_model = profile_->kinematics().mobile && next.base_mode != sample.profile_base_mode;
+  if (changing_model && !baseStopped(sample)) {
+    res.message = "base mode changes require measured standstill (<0.01 m/s, <0.02 rad/s); finish/cancel first";
+    return;
+  }
   ocs2::vector_t pose(7);
   for (size_t i = 0; i < 7; ++i) pose[i] = sample.pose[i];
   // Reserve all target inputs and queue a measured hold BEFORE submitting the
@@ -64,6 +81,7 @@ void MotionProfileServer::request(const SetProfile::Request& req, SetProfile::Re
     return;
   }
   owns_reference_gate_ = true;
+  requires_base_stop_ = changing_model;
   runtime_->profile_output_allowed = false;
   transition_pending_ = true;
   profile_submitted_ = profile_->submit(next, res.message);
@@ -87,12 +105,14 @@ void MotionProfileServer::tick() {
       fresh(sample, motionSteadyNs()) && sample.reason == MotionStatus::NONE &&
       (sample.state == MotionStatus::IDLE || sample.state == MotionStatus::INITIALIZING);
   const bool ready = healthy && profile_submitted_ && !handover_failed_ &&
-      sample.profile_revision == requested_config_.revision;
+      sample.profile_revision == requested_config_.revision &&
+      (!requires_base_stop_ || baseStopped(sample));
   runtime_->profile_output_allowed = ready;
   if (ready) {
     if (owns_reference_gate_) reference_->endProfileChange();
     owns_reference_gate_ = false;
     transition_pending_ = false;
+    requires_base_stop_ = false;
     detail_ = "MPC profile applied";
   }
   ProfileStatus status;
@@ -111,6 +131,7 @@ void MotionProfileServer::tick() {
       !fresh(sample, motionSteadyNs()) || sample.activation_epoch != runtime_->activation_epoch.load() ?
           "feedback unavailable or stale" :
       sample.reason != MotionStatus::NONE ? "controller fault; inspect motion_status" :
+      requires_base_stop_ && !baseStopped(sample) ? "waiting for measured base standstill" :
       !ready && !handover_failed_ ? "waiting for matching MPC policy" : detail_;
   publisher_->publish(status);
 }

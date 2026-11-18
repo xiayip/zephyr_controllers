@@ -36,6 +36,7 @@
 #include <rclcpp_lifecycle/lifecycle_node.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <realtime_tools/realtime_buffer.hpp>
@@ -153,6 +154,8 @@ namespace zephyr::mpc {
 
         rclcpp::Publisher<ocs2_msgs::msg::MpcObservation>::SharedPtr mpc_observation_publisher_;
         rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr solve_time_publisher_; // Mock diagnostics only.
+        std::shared_ptr<realtime_tools::RealtimePublisher<std_msgs::msg::Float64MultiArray>>
+            control_diagnostics_publisher_; // Explicit mock-only opt-in, preallocated samples.
         rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr base_command_publisher_;
         std::shared_ptr<realtime_tools::RealtimePublisher<geometry_msgs::msg::Twist>>
             realtime_base_command_publisher_;
@@ -181,7 +184,6 @@ namespace zephyr::mpc {
         double base_angular_stop_threshold_{0.02};
         bool base_translation_active_{false};
         bool base_rotation_active_{false};
-        std::string base_command_profile_{"omni"};
         double base_max_linear_speed_{0.0};
         double base_max_angular_speed_{0.0};
 
