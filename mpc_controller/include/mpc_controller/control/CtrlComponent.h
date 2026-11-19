@@ -26,6 +26,8 @@
 #include <mpc_controller/control/MotionRuntime.h>
 #include <mpc_controller/control/RuntimeMotionProfile.h>
 #include <mpc_controller/control/TcpTrajectoryRecorder.h>
+#include <mpc_controller/control/Gripper.h>
+#include <mpc_controller/control/UrdfMimic.h>
 #include <ocs2_core/Types.h>
 #include <ocs2_mobile_manipulator/MobileManipulatorInterface.h>
 #include <ocs2_mpc/MPC_BASE.h>
@@ -59,13 +61,15 @@ namespace zephyr::mpc {
     public:
         explicit CtrlComponent(const std::shared_ptr<rclcpp_lifecycle::LifecycleNode>& node,
                                CtrlInterfaces& ctrl_interfaces,
-                               std::shared_ptr<MotionRuntime> motion_runtime = nullptr);
+                               std::shared_ptr<MotionRuntime> motion_runtime = nullptr,
+                               GripperConfig gripper = {});
         ~CtrlComponent();
 
         /** Commit only complete, finite feedback. False means hold outputs this cycle. */
         bool updateObservation(const rclcpp::Time& time);
         const std::array<double, 7>& measuredTcpPose() const { return measured_tcp_pose_; }
         const MotionSpeeds& measuredMotionSpeeds() const { return measured_motion_speeds_; }
+        double measuredGripperSpeed() const { return measured_motion_.gripperSpeed(); }
         const vector_t& measuredState() const { return measured_observation_.state; }
         void resetMeasuredMotion() { measured_motion_.reset(); measured_motion_speeds_ = {}; }
         /** False is a latched execution fault; outputs are already held. */
@@ -124,6 +128,9 @@ namespace zephyr::mpc {
 
         // OCS2 interface (public access)
         std::shared_ptr<MobileManipulatorInterface> interface_;
+        // Separate display/FK model only; never injected into the upstream solver.
+        std::optional<PinocchioInterface> gripper_geometry_;
+        std::vector<MimicRelation> gripper_mimic_;
 
         // MPC components
         std::unique_ptr<MPC_BASE> mpc_;
@@ -150,6 +157,8 @@ namespace zephyr::mpc {
 
         std::shared_ptr<rclcpp_lifecycle::LifecycleNode> node_;
         CtrlInterfaces& ctrl_interfaces_;
+        GripperConfig gripper_;
+        int gripper_index_{-1};
         std::shared_ptr<MotionRuntime> motion_runtime_;
 
         rclcpp::Publisher<ocs2_msgs::msg::MpcObservation>::SharedPtr mpc_observation_publisher_;

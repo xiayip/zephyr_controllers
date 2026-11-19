@@ -18,6 +18,7 @@
   <depend>rcl_interfaces</depend>
   <depend>eigen</depend>
   <depend>pinocchio</depend>
+  <depend>urdf</depend>
   <depend>boost</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>

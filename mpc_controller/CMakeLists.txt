@@ -20,7 +20,7 @@ find_package(Boost CONFIG REQUIRED)
 set(controller_dependencies
   pluginlib controller_interface hardware_interface ament_index_cpp
   rclcpp rclcpp_lifecycle rclcpp_action rcl_interfaces zephyr_msgs
-  geometry_msgs nav_msgs sensor_msgs std_msgs std_srvs visualization_msgs realtime_tools
+  geometry_msgs nav_msgs sensor_msgs std_msgs std_srvs visualization_msgs realtime_tools urdf
   tf2 tf2_ros tf2_geometry_msgs moveit_msgs
   ocs2_core ocs2_oc ocs2_mpc ocs2_ddp ocs2_msgs ocs2_mobile_manipulator
   ocs2_pinocchio_interface ocs2_self_collision ocs2_self_collision_visualization
@@ -38,6 +38,7 @@ add_library(${controller_target} SHARED
   src/control/TcpReferenceManager.cpp
   src/control/ContinuousTcpPath.cpp
   src/control/WholeBodyReference.cpp
+  src/control/UrdfMimic.cpp
   src/control/MotionActionServer.cpp
   src/control/RuntimeMotionProfile.cpp
   src/control/MotionProfileServer.cpp
@@ -91,6 +92,8 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(Eigen3 REQUIRED)
   find_package(Threads REQUIRED)
+  ament_add_gtest(test_gripper test/test_gripper.cpp)
+  target_link_libraries(test_gripper ${controller_target})
   ament_add_gtest(test_control_safety test/test_control_safety.cpp)
   target_include_directories(test_control_safety PRIVATE include)
   target_compile_features(test_control_safety PRIVATE cxx_std_17)

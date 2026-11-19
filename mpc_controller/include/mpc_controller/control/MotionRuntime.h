@@ -27,6 +27,7 @@ struct MotionSample {
   std::array<double, 32> whole_body_state{}; // Bounded RT snapshot; model order.
   size_t whole_body_size{0};
   MotionSpeeds speeds;
+  double gripper_speed{0}; // normalized closure/s, separate from arm rad/s
   int64_t stamp_ns{0}, received_ns{0};
   double reference_time{0};
   uint64_t stop_ack{0};

@@ -165,3 +165,40 @@ TEST_F(WholeBodyHandoff, FixedArmAcceptsPostureButRejectsBase) {
   EXPECT_EQ(ref->wholeBodyReference()->solver->weights.size(),2);
   EXPECT_NEAR(ref->wholeBodyReference()->solver->states.back()[0],.1,1e-10);
 }
+
+TEST_F(WholeBodyHandoff, GripperReferenceHoldResetLimitsAndArrival) {
+  ref.reset();
+  ref = std::make_unique<TcpReferenceManager>(wrapped,"odom","tcp",2);
+  vector_t lower(2),upper(2); lower<<-3,0; upper<<3,1;
+  ref->configureWholeBody(false,{"j1","grip"},lower,upper);
+  GripperConfig c; c.joint="grip"; c.command_prefix="gripper";
+  ref->configureGripper(c); ref->subscribe(node);
+  ASSERT_TRUE(ref->requestReset(pose,10,.4));
+  for(int i=0;i<100 && !ref->resetReady();++i) { executor.spin_some(); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+  ref->preSolverRun(10,15,vector_t::Zero(2));
+  ASSERT_TRUE(ref->wholeBodyReference()->solver);
+  EXPECT_DOUBLE_EQ(ref->wholeBodyReference()->solver->states.back()[1],.4);
+  auto g=goal(); g.base_yaw_weight=0;
+  auto& r=g.whole_body_references.front(); r.base_pose.header.frame_id.clear();
+  r.posture.name={"grip"}; r.posture.position={.8};
+  std::string error; EXPECT_TRUE(ref->validateWholeBodyGoal(g,error));
+  r.posture.position[0]=1.01; EXPECT_FALSE(ref->validateWholeBodyGoal(g,error)); r.posture.position[0]=.8;
+  ref->setAcceptingTargets(true); ASSERT_TRUE(ref->claimMotion());
+  vector_t measured(2); measured<<0,.4;
+  geometry_msgs::msg::PoseStamped target; double end;
+  ASSERT_TRUE(ref->startMotion(g,pose,target,end,error,measured))<<error;
+  ref->preSolverRun(10,15,measured);
+  auto body=ref->wholeBodyReference()->solver;
+  EXPECT_DOUBLE_EQ(body->states.back()[1],.8);
+  EXPECT_DOUBLE_EQ(body->weights[1],c.weight);
+  EXPECT_FALSE(ref->gripperAtTarget(measured,0));
+  measured[1]=.8; EXPECT_FALSE(ref->gripperAtTarget(measured,.1));
+  EXPECT_TRUE(ref->gripperAtTarget(measured,0));
+  ref->releaseMotion();
+  // Subsequent TCP-only motion keeps the final closure, not the original .4.
+  g.whole_body_references.clear(); g.posture_weight=0;
+  ASSERT_TRUE(ref->claimMotion());
+  ASSERT_TRUE(ref->startMotion(g,pose,target,end,error,measured))<<error;
+  ref->preSolverRun(10,15,measured);
+  EXPECT_DOUBLE_EQ(ref->wholeBodyReference()->solver->states.back()[1],.8);
+}

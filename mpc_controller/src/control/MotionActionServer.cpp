@@ -88,6 +88,7 @@ bool MotionActionServer::fresh(const MotionSample& sample) const {
 }
 bool MotionActionServer::stopped(const MotionSample& sample) const {
   if (!sample.speeds.valid) return false;
+  if (!std::isfinite(sample.gripper_speed) || sample.gripper_speed < 0 || sample.gripper_speed > 0.02) return false;
   for (size_t i = 0; i < settle_limits_.size(); ++i)
     if (!std::isfinite(sample.speeds.values[i]) || sample.speeds.values[i] < 0 ||
         sample.speeds.values[i] > settle_limits_[i]) return false;
@@ -180,7 +181,7 @@ void MotionActionServer::finish(bool success, const MotionSample& sample) {
   auto result = std::make_shared<Action::Result>();
   result->success = success;
   result->reason = reason_;
-  result->message = success ? "Measured TCP and requested base pose settled at target" : message_;
+  result->message = success ? "Measured TCP, requested base pose and optional gripper settled at target" : message_;
   result->actual = actual(sample);
   result->position_error = position_error_;
   result->orientation_error = orientation_error_;
@@ -240,16 +241,19 @@ void MotionActionServer::tick() {
           position_error_ <= g.position_tolerance && orientation_error_ <= g.orientation_tolerance &&
           (g.base_position_weight == 0 || base_errors_[0] <= g.base_position_tolerance) &&
           (g.base_yaw_weight == 0 || base_errors_[1] <= g.base_yaw_tolerance);
-      const bool arrived = at_target && stopped(sample);
+      const bool gripper_arrived = reference_->gripperAtTarget(
+          Eigen::Map<const Eigen::VectorXd>(sample.whole_body_state.data(), sample.whole_body_size), sample.gripper_speed);
+      const bool arrived = at_target && stopped(sample) && gripper_arrived;
       if (!arrived) settled_ns_ = 0;
       else if (!settled_ns_) settled_ns_ = sample.received_ns;
       status.state = at_target ? MotionStatus::SETTLING : MotionStatus::EXECUTING;
       status.message = arrived ? "Waiting for stable measured arrival and low whole-body speed" : "Executing";
       if (at_target && !arrived) {
         std::ostringstream detail;
-        detail << "At target; waiting for valid low measured speeds [TCP m/s, TCP rad/s, joint rad/s, base m/s, base rad/s]:";
+        detail << "TCP/base at target; waiting for gripper/low measured speeds [TCP m/s, TCP rad/s, joint rad/s, base m/s, base rad/s]:";
         for (double speed : sample.speeds.values) detail << ' ' << speed;
-        detail << " valid=" << sample.speeds.valid;
+        detail << " valid=" << sample.speeds.valid << " gripper_arrived=" << gripper_arrived
+               << " gripper_speed=" << sample.gripper_speed;
         status.message = detail.str();
       }
       if (settled_ns_ && (sample.received_ns - settled_ns_) * 1e-9 >= g.settle_time) finish(true, sample);

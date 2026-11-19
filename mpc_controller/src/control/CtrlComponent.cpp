@@ -6,6 +6,8 @@
 
 #include "mpc_controller/control/CtrlComponent.h"
 #include "mpc_controller/control/ArmVelocityStep.h"
+#include <fstream>
+#include <sstream>
 
 #include <mpc_controller/runtime/ThreadScheduling.h>
 #include <ocs2_core/thread_support/ThreadPool.h>
@@ -86,8 +88,8 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
 
     CtrlComponent::CtrlComponent(const std::shared_ptr<rclcpp_lifecycle::LifecycleNode>& node,
                                  CtrlInterfaces& ctrl_interfaces,
-                                 std::shared_ptr<MotionRuntime> motion_runtime)
-        : node_(node), ctrl_interfaces_(ctrl_interfaces), motion_runtime_(std::move(motion_runtime))
+                                 std::shared_ptr<MotionRuntime> motion_runtime, GripperConfig gripper)
+        : node_(node), ctrl_interfaces_(ctrl_interfaces), gripper_(std::move(gripper)), motion_runtime_(std::move(motion_runtime))
     {
         // Match ControllerInterface::auto_declare, including predeclared overrides.
         const auto auto_declare = [this](const std::string& name, const auto& value) {
@@ -265,7 +267,8 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         // base prefix. Fail configuration rather than silently permuting DoFs.
         const auto& model = interface_->getPinocchioInterface().getModel();
         const auto& info = interface_->getManipulatorModelInfo();
-        if (model.nq != static_cast<int>(joint_names_.size() + base_state_offset_) ||
+        const size_t controlled_count = joint_names_.size() + (gripper_.enabled() ? 1 : 0);
+        if (model.nq != static_cast<int>(controlled_count + base_state_offset_) ||
             model.nv != model.nq || info.stateDim != static_cast<size_t>(model.nq) ||
             info.inputDim != static_cast<size_t>(model.nv))
             throw std::runtime_error("MPC requires scalar arm joints and matching state/input model dimensions");
@@ -281,7 +284,39 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             arm_torque_indices_.push_back(joint.idx_v());
         }
         arm_torques_ = vector_t::Zero(joint_names_.size());
-        measured_motion_.configure(joint_names_.size(), mobile_base_enabled_);
+        if (gripper_.enabled()) {
+            const auto id = model.getJointId(gripper_.joint);
+            gripper_index_ = joint_names_.size() + base_state_offset_;
+            if (id == 0 || id >= model.joints.size() || model.joints[id].nq() != 1 ||
+                model.joints[id].idx_q() != gripper_index_ || model.joints[id].idx_v() != gripper_index_ ||
+                model.lowerPositionLimit[gripper_index_] != 0 || model.upperPositionLimit[gripper_index_] != 1)
+                throw std::runtime_error("Gripper must be the final independent normalized [0,1] model coordinate");
+            if (interface_->isSelfCollisionEnabled() || interface_->isEnvironmentCollisionEnabled())
+                throw std::runtime_error("Gripper collision avoidance is not yet validated; disable selfCollision/environmentCollision for this mock milestone");
+            if (!mock_debug_enabled_)
+                throw std::runtime_error("Optimized gripper is mock-only until actuator tracking and collision geometry are validated");
+            std::vector<std::string> fixed;
+            loadData::loadStdVector<std::string>(task_file, "model_information.removeJoints", fixed, false);
+            std::ifstream file(urdf_file);
+            std::stringstream xml; xml << file.rdbuf();
+            gripper_mimic_ = readMimicRelations(xml.str());
+            // This milestone supports one gripper, not arbitrary mimic actuators.
+            for (const auto& relation : gripper_mimic_)
+                if (relation.source != gripper_.joint ||
+                    std::find(fixed.begin(), fixed.end(), relation.joint) != fixed.end())
+                    throw std::runtime_error("Gripper mimic must follow its independent closure and not be removed");
+            gripper_geometry_ = makeMimicGeometry(xml.str(), mobile_base_enabled_, fixed);
+            const auto& geometry = gripper_geometry_->getModel();
+            const auto tcp = geometry.getFrameId(info.eeFrame);
+            if (tcp >= geometry.frames.size()) throw std::runtime_error("Missing TCP geometry frame");
+            // Upstream TCP costs use fixed mimic fingers. Never silently use a
+            // fingertip TCP whose position would depend on the omitted coupling.
+            for (auto j = geometry.frames[tcp].parentJoint; j != 0; j = geometry.parents[j])
+                for (const auto& relation : gripper_mimic_)
+                    if (geometry.names[j] == relation.joint)
+                        throw std::runtime_error("Optimized gripper currently requires a TCP independent of mimic fingers");
+        }
+        measured_motion_.configure(joint_names_.size(), mobile_base_enabled_, gripper_.enabled());
         if (interface_->isSelfCollisionEnabled() && collision_check_timeout_ < 2.0 * visualization_period_sec_)
             throw std::runtime_error("collision_check_timeout must cover at least two collision worker periods (prediction_publish_hz)");
         if (interface_->isSelfCollisionEnabled() && !std::isfinite(interface_->getSelfCollisionMinimumDistance()))
@@ -298,7 +333,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             control_diagnostics_publisher_ = std::make_shared<
                 realtime_tools::RealtimePublisher<std_msgs::msg::Float64MultiArray>>(publisher);
             auto& message = control_diagnostics_publisher_->msg_;
-            const auto n = joint_names_.size() + base_state_offset_;
+            const auto n = controlled_count + base_state_offset_;
             message.data.resize(10 + 4 * n);
             message.layout.dim.resize(1);
             message.layout.dim[0].label = "time,policy_start,sample_time,base_mode,speeds_valid,speeds[5];measured[n];nominal[n];input[n];command[n](base_velocity,arm_position)";
@@ -325,8 +360,10 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                 viz_cfg.pinocchio_geometry = std::move(*geo);
                 viz_cfg.self_collision_activation_distance = interface_->getSelfCollisionActivationDistance();
             }
+            if (gripper_geometry_)
+                viz_cfg.configuration_expansion = mimicExpansion(model, gripper_geometry_->getModel(), gripper_mimic_);
             visualizer_ = std::make_unique<zephyr::mpc_visualization::mpc_visualizer>(
-                node_, interface_->getPinocchioInterface(), std::move(viz_cfg));
+                node_, gripper_geometry_ ? *gripper_geometry_ : interface_->getPinocchioInterface(), std::move(viz_cfg));
         }
         visualizer_->initialize();
         visualizer_->setPosePublishPeriod(dds_publish_period_sec_);
@@ -347,8 +384,11 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             mobile_base_enabled_ ? base_odom_frame : interface_->getManipulatorModelInfo().baseFrame,
             interface_->getManipulatorModelInfo().eeFrame,
             interface_->getManipulatorModelInfo().inputDim);
-        pose_reference_manager_->configureWholeBody(mobile_base_enabled_, joint_names_,
-            model.lowerPositionLimit.tail(joint_names_.size()), model.upperPositionLimit.tail(joint_names_.size()));
+        auto controlled_joints = joint_names_;
+        if (gripper_.enabled()) controlled_joints.push_back(gripper_.joint);
+        pose_reference_manager_->configureWholeBody(mobile_base_enabled_, controlled_joints,
+            model.lowerPositionLimit.tail(controlled_count), model.upperPositionLimit.tail(controlled_count));
+        pose_reference_manager_->configureGripper(gripper_);
         pose_reference_manager_->subscribe(node_);
         runtime_profile_ = std::make_shared<RuntimeMotionProfile>(RuntimeProfileConfig{}, base_kinematics);
         pose_reference_manager_->setRuntimeProfile(runtime_profile_);
@@ -415,7 +455,9 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                  "movel_duration", "movel_sample_interval", "movel_max_linear_velocity",
                  "movel_max_linear_acceleration", "movel_max_linear_jerk",
                  "movel_max_angular_velocity", "movel_max_angular_acceleration", "movel_max_angular_jerk",
-                 "movel_continuous_max_deviation", "whole_body_max_joint_velocity"})
+                 "movel_continuous_max_deviation", "whole_body_max_joint_velocity",
+                 "gripper.joint", "gripper.command_prefix", "gripper.max_rate",
+                 "gripper.speed_limit", "gripper.effort_limit", "gripper.weight", "gripper.tolerance"})
         {
             if (node_->has_parameter(name))
             {
@@ -658,6 +700,12 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             }
             observation_candidate_[static_cast<Eigen::Index>(i + base_state_offset_)] = *value;
         }
+        if (gripper_.enabled()) {
+            const auto value = ctrl_interfaces_.gripper_position_state ?
+                ctrl_interfaces_.gripper_position_state->get().get_optional() : std::nullopt;
+            if (!value || !GripperConfig::validPosition(*value)) return false;
+            observation_candidate_[gripper_index_] = *value;
+        }
         if (!observation_candidate_.allFinite())
         {
             return false;
@@ -813,6 +861,15 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                 return false;
             }
         }
+        double gripper_command = 0;
+        if (gripper_.enabled()) {
+            try {
+                gripper_command = gripper_.step(measured_observation_.state[gripper_index_],
+                    arm_command[gripper_index_], 1.0 / ctrl_interfaces_.frequency_);
+            } catch (const std::exception&) {
+                holdLastSentPositions(); return false;
+            }
+        }
         // Recheck immediately before writes: a profile request may have arrived
         // since updatePolicy() and torque validation.
         if (!profileOutputReady())
@@ -821,6 +878,9 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
             return true;
         }
         Eigen::Vector3d sent_base_command = Eigen::Vector3d::Zero();
+        if (gripper_.enabled() && !ctrl_interfaces_.writeGripper(gripper_command)) {
+            holdLastSentPositions(); return false;
+        }
         if (mobile_base_enabled_ && base_command_publisher_)
         {
             geometry_msgs::msg::Twist command;
@@ -879,6 +939,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
                 std::copy_n(sent_base_command.data(), 3, data.begin() + 10 + 3 * n);
             std::copy(ctrl_interfaces_.last_sent_joint_positions_.begin(),
                 ctrl_interfaces_.last_sent_joint_positions_.end(), data.begin() + 10 + 3 * n + base_state_offset_);
+            if (gripper_.enabled()) data[10 + 3 * n + gripper_index_] = ctrl_interfaces_.last_gripper_position;
             control_diagnostics_publisher_->unlockAndPublish();
         }
         return true;
@@ -888,7 +949,8 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
     {
         // Use real joints, even if the held reference differs after disturbance.
         reset_tcp_pose_ = visualizer_->computeEndEffectorPose(measured_observation_.state);
-        return pose_reference_manager_->requestReset(reset_tcp_pose_, measured_observation_.time);
+        return pose_reference_manager_->requestReset(reset_tcp_pose_, measured_observation_.time,
+            gripper_.enabled() ? measured_observation_.state[gripper_index_] : 0.0);
     }
 
     void CtrlComponent::resetMpc()
@@ -967,6 +1029,7 @@ static void limitBaseCommand(geometry_msgs::msg::Twist& command,
         {
             held = interface.get().set_value(0.0) && held;
         }
+        if (gripper_.enabled()) held = ctrl_interfaces_.writeGripper(ctrl_interfaces_.last_gripper_position) && held;
         return held;
     }
 

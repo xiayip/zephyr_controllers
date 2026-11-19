@@ -1,6 +1,6 @@
 # mpc_controller
 
-支持固定底座单机械臂，或单机械臂加移动底盘的 MPC 控制器，直接依赖原版 OCS2。
+支持固定底座单机械臂，或单机械臂加移动底盘的 MPC 控制器，直接使用 OCS2 求解器。
 不再需要安装或构建 `arms_ros2_control` 的任何包。包名、控制器类名和插件名均为小写。
 
 ## 组成与依赖
@@ -15,6 +15,7 @@
 | `src/control/TcpReferenceManager.cpp` | TCP 目标输入、坐标转换与 OCS2 参考轨迹生成 |
 | `src/control/ContinuousTcpPath.cpp` | 显式连续路径的几何插值、时间参数化与偏离检查，不依赖 ROS 或硬件 |
 | `src/control/WholeBodyReference.cpp` | 可选底盘／关节姿态参考、同时间轴插值和状态代价；不包含任务流程 |
+| `src/control/UrdfMimic.cpp`、`include/.../control/Gripper.h` | URDF 从动关节线性映射、可选独立开度坐标；当前仅 mock 验证 |
 | `src/control/TcpTrajectoryRecorder.cpp` | 实测/预测 TCP 的缓冲与 CSV 写出 |
 | `include/mpc_controller/control/BaseKinematics.h` | 旧底盘后端的横向速度约束；不安排底盘/机械臂动作顺序 |
 | `src/visualization/mpc_visualizer.cpp` | TCP 位姿、两色轨迹、分身及其时间对齐 |
@@ -27,7 +28,8 @@
 TCP 接入 MPC 的主要链路为：
 `tcp_target/stamped → TcpReferenceManager → OCS2 参考轨迹 → 求解器 → CtrlComponent → 关节与底盘命令`。
 
-MPC 求解器与优化模型使用未修改的 `ocs2_mobile_manipulator`、`ocs2_ddp`、`ocs2_mpc`。
+MPC/DDP 及 `ocs2_mobile_manipulator` 均使用未修改的上游实现。
+夹爪驱动关节留在优化模型中，URDF mimic 从动关系在本包的显示／FK 层展开。
 关节接口、调度/计时及单 TCP 误差 HUD 是本包内的少量辅助代码；不复制 MPC 算法。
 普通目标话题及 FK/IK 复用标准 ROS 类型；有限运动 Action 和运行配置接口依赖 `zephyr_msgs`。
 画圆等形状生成放在上层示例，不属于控制器的执行接口。
@@ -101,7 +103,7 @@ colcon test-result --verbose
 
 以下单臂入口位于配套 `zephyr_arm_ros2` 工作区改动中，目前暂留本地，
 **不随本次控制器 `dev_mpc` 推送发布**。仅拉取本控制器仓库不会获得该 launch/task 配置；
-本包本身只提供控制器及 RViz 插件，不需要另建自定义消息。
+本包本身只提供控制器及 RViz 插件；Action 接口使用配套 `zephyr_msgs`。
 
 固定底座单臂 mock（默认打开 RViz）：
 
@@ -119,8 +121,8 @@ ros2 launch zephyr_arm_bringup mpc_mock.launch.py show_rviz:=false
 - `manipulatorModelType=0`，只有六个机械臂状态；控制器只认领六轴 `position`。
 - 同时激活 `joint_state_broadcaster` 和 `zephyr_arm_gripper_controller`。
 - 包含法兰、Gemini 305、OmniPicker 的几何，TCP 为 `omni_picker_tcp`。
-- MPC 中夹爪固定闭合，mock 初始夹爪归一化位置为 `1.0`；本轮不要开合夹爪，
-  否则显示与规划几何会不一致。夹爪实时几何更新尚未接入。
+- 此单臂配置中的夹爪仍固定闭合，mock 初始夹爪归一化位置为 `1.0`，不要独立开合后
+  沿用固定夹爪的规划几何。下文 Z2 的可选优化夹爪配置已接入实时 mimic 几何。
 - 当前本地单臂 mock 的 `selfCollision.activate=false`：暂时关闭 MPC 自碰撞代价和
   运行时自碰撞检查，隔离验证控制链。原有 52 对配置保留，没有修改 SRDF 排除规则。
   碰撞模型简化并验证后再启用；不含桌面、Z2 车厢或动态环境，不能用作安全证明。
@@ -171,7 +173,7 @@ Z2 的底盘＋机械臂 mock 也验证了 stop 后底盘零速保持、无 resu
 
 ## 后续更新上游
 
-升级 OCS2 后重新构建本包并运行回归测试；API 适配留在本包，不修改上游源码。
+升级 OCS2 后重新构建本包并运行回归测试；适配只放在本包，不修改 `ocs2_ros2` 上游目录。
 `arms_ros2_control` 仅作为代码来源参考，更新它不会影响当前控制器。
 迁入的辅助代码需按 UPSTREAM.md 的来源表人工对比，不会自动跟随上游更新。
 
@@ -578,8 +580,10 @@ Ranger 配置拒绝大于 `0.698 rad` 的转向上限及小于 `0.001` 的命令
 2. 五个实测总变差速度：TCP 线/角速度、最大关节速度、底盘线/角速度；
 3. 四组各 n 个数：`measured_state, nominal_state, nominal_input, command`。
 
-移动模型 n=9，顺序是 `[x,y,yaw,joint1..6]`；input 是底盘体坐标速度与关节速度，
-command 的前三个数是投影/死区后的底盘**请求速度**、后六个数是关节位置参考。
+普通移动模型 n=9，顺序是 `[x,y,yaw,joint1..6]`；启用归一化夹爪时 n=10，
+最后一项为闭合度。input 是底盘体坐标速度、关节速度和可选闭合度速度（1/s），
+command 的前三个数是投影/死区后的底盘**请求速度**、随后六个数是关节位置参考，
+可选最后一项是限速后的夹爪闭合度命令。不要把最后一项当作 rad 或 N·m。
 请求速度不是底盘应答，仍要和 `/cmd_vel`、里程计及关节实测对照。
 该诊断不参与控制、到位判据或故障处理；策略无效/保持分支不发布新控制采样。
 
@@ -881,7 +885,8 @@ posture 默认只作为软偏好，不要求逐关节精确到位；TCP 误差�
 也不表示实际运动严格按参考时刻到达。全身扩展的总参考时长上限为 1 小时。
 
 完整参考在 executor 构造，TCP 和全身快照在同一求解边界交换，整个 solve 内不可变。
-停止、重置、profile hold 或新 TCP-only 目标会清除旧的全身代价；成功后保持最后参考。
+停止、重置、profile hold 或新 TCP-only 目标会清除旧的全身代价；启用可选夹爪时重建闭合度保持代价，
+避免新增自由度没有目标而漂移。成功后保持最后参考。
 全身轨迹不是在线流式接口，不能在活动 Action 中用新目标或 profile service 偷换任务。
 运行时阶段门槛、按压授权、参考在线更新和自动剪影生成由后续任务层实现。
 
@@ -898,3 +903,92 @@ mock-only 调试输出：`/tcp_reference_path` 和 `/base_reference_path` 为带
 这是关闭碰撞检查的 GenericSystem 结果，不代表真机精度。
 5 s horizon 下，部分 **TCP-only** 长路径仍会因残余运动停稳超时；新增参考能力
 没有宣称解决该基线问题。需单独继续诊断，不以修改到位判据替代修复。
+
+## 可选夹爪进入 MPC 预测（2026-11-19，mock）
+
+在同一个最优控制问题中追加 **一个独立闭合度坐标** `g∈[0,1]`：0 完全打开，1 完全关闭。
+它不是 rad，也不是夹持力。Z2 状态为 `[x,y,yaw,joint1..6,g]`，输入末项为 `g_dot`（1/s）。
+夹爪和底盘／机械臂使用同一参考时间轴、5 s 预测窗口及求解周期；没有新增控制器或任务 FSM。
+路径中间点无需等夹爪停稳；反向开合的极值自然允许减速。末端成功判据额外要求闭合度误差
+不超过 `gripper.tolerance`，实测闭合度速度不超过 0.02/s，并满足原有 settle 时间。
+
+运行链是 `MPC → normalized_gripper_controller 的 position/velocity/effort reference → hardware`。
+MPC 写归一化位置及固定速度／力度上限，**不会将带符号的 `g_dot` 写入设备 velocity 上限**。
+下游控制器本来就支持 chaining；本次补充了引用边界检查和退出 chain 时保留最后命令，
+防止释放控制权后重放 MPC 接管之前的旧话题目标。chain 期间独立 Action 被拒绝、话题忽略。
+取消重新以实测闭合度保持；重新激活从实测闭合度初始化。TCP-only 指令保留最近闭合度目标。
+
+启用示例（初始化参数；空 `gripper.joint` 表示禁用）：
+
+```yaml
+gripper:
+  joint: omni_picker_finger_joint
+  command_prefix: zephyr_arm_gripper_controller
+  max_rate: 0.5       # 闭合度/s；参考时间参数化和输出步长限制
+  speed_limit: 0.5    # 设备归一化速度上限 (0,1]
+  effort_limit: 0.4   # 设备归一化力度上限 [0,1]，不是 N·m
+  weight: 10.0       # 闭合度跟踪软代价，与 arm posture_weight 分开
+  tolerance: 0.01    # 末端闭合度到位门槛
+```
+
+task.info 必须配套增加一个状态／输入、代价及速度限位（Z2 mock 为 ±0.5/s），
+从 `removeJoints` 移除夹爪驱动及 mimic 关节，保持独立夹爪是最后一个坐标。
+URDF 驱动关节限位必须为 `[0,1]`；从动指关节由 URDF 的 multiplier/offset 驱动。
+嵌套 mimic 按 `q从动 = multiplier × q源 + offset` 合并到独立根关节，不需要求解 IK，
+也不依赖 Pinocchio 的原生 mimic 支持。例如当前 OmniPicker 在 `g=0.5` 时，
+narrow1 / narrow_loop / wide1 / wide_loop 分别为 `-0.343 / -0.5145 / 0.343 / 0.5145 rad`。
+这些系数从 URDF 读取，不硬编码在控制器中。
+
+上游 OCS2 工厂保留独立驱动坐标、固定从动指；本包另外用普通关节模型做显示／FK，
+将 `q_geometry = A q_independent + b` 展开后复用**已有** Pinocchio 正运动学。
+增加的几何坐标不是优化自由度，也不发送额外电机指令。真实机器人显示仍由原 URDF/TF 驱动。
+`compute_fk` 请求带六轴＋夹爪开度时自动展开手指；只给六轴时保留原固定夹爪 FK。
+`compute_ik` 仍是六轴机械臂 IK，不自动搜索夹爪开度。
+为避免上游 TCP 代价与显示模型不一致，本阶段只接受不依赖 mimic 指关节的 TCP（如
+`omni_picker_tcp`），拒绝将运动指尖设为控制 TCP。碰撞／开合影响的动力学仍未接入。
+
+沿用 `ExecuteCartesianMotion.whole_body_references[i].posture`，无新 Action 字段或线协议变化：
+
+```yaml
+posture_weight: 0.1  # 非零表示使用姿态字段；夹爪实际代价取 gripper.weight
+whole_body_references:
+  - posture:
+      name: [joint1, joint2, joint3, joint4, joint5, joint6, omni_picker_finger_joint]
+      position: [1.5707, 1.6, 1.0, 0.0, -0.5, 0.0, 0.4]
+```
+
+以上是单个参考的字段示意，不是完整可执行目标。连续路径应给每个 TCP waypoint 配一个
+whole-body reference，且各参考使用相同的 posture.name 列表。可只指定夹爪一个名字，
+或与六轴姿态一起指定。完整 2 m、两途经姿态＋夹爪测试见 Z2 README 的 `--gripper` 示例。
+
+### 依赖与编译
+
+不需要新第三方库、OCS2 fork、补丁或模型注入接口。继续使用既有 OCS2/Pinocchio
+依赖与 URDF 解析库；Pinocchio 是原 MPC/FK 链已有的依赖，不是为 mimic 新引入的。
+此前试验性的 OCS2 改动已经撤回，源码目录必须保持上游原样，见 [UPSTREAM.md](UPSTREAM.md)。
+
+```bash
+cd /workspaces/zephyr-dev/zephyr_ws
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+colcon build --packages-select mpc_controller normalized_gripper_controller z2_bringup \
+  --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+source install/setup.bash
+```
+
+若此前安装过试验性模型注入版本，先从干净的上游源码重新构建一次
+`ocs2_mobile_manipulator`（`-DBUILD_TESTING=OFF`），再构建控制器；不要混用旧头文件／库。
+这只是清除上一版安装产物，不是新引入源码构建要求，也不需要 `ocs2_robotic_assets`。
+
+本轮仅 Z2 mock 默认启用该配置，真实任务文件／控制器参数未改。控制器会拒绝在
+`mock_debug_enabled=false` 或启用自／环境碰撞检查时使用该未验收特性。
+**当前只是具有开合预测与可变显示几何，不会自动选择开度穿越障碍**：后续需在本包的碰撞代价中
+应用上述展开和链式求导 `J_independent = J_geometry A`；碰撞模型简化、碰撞梯度验证、
+真机开度响应标定、接触／夹持成功判据仍需单独开发，不能将理想 mock 的到位当作真实抓住物体。
+
+撤回上游改动后的复测：2 m / 两个途经姿态 / 闭合度 0.2→0.8→0.4，17.46 s 成功
+（不含 JTC 准备）；TCP 时间对齐 RMS 1.21 mm，峰值 4.05 mm；末端 TCP 误差
+0.93 mm、底盘 1.88 mm、闭合度误差 0.000083。另通过取消保持、直接指令拒绝、
+MPC↔JTC 交接与 TCP-only 保持测试。开度 0 / 0.5 / 1 的手指和 TCP FK
+与独立的 URDF 数学展开一致（变换矩阵元素误差 < 2e-15）。
+这些是关闭碰撞的 GenericSystem 结果，非真机精度或接触验收。

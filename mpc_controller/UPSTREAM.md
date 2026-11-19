@@ -22,16 +22,33 @@ is `final`, owns its component privately, and has no extension point for the
 mobile-base observation/command offsets or replacement visualizer.
 All adapted C++ symbols live in `zephyr` namespaces to avoid collisions with
 upstream libraries. Only the Zephyr integration and visualization are built
-here. MPC/DDP solvers, model construction and costs/constraints remain linked OCS2
-implementations. Minimal joint handles, scheduling/timing and single-TCP error graphics
+here. MPC/DDP solvers remain linked OCS2 implementations; Zephyr supplies its
+whole-body reference costs and optional URDF mimic expansion for display/FK. Minimal joint handles, scheduling/timing and single-TCP error graphics
 are maintained locally under Apache-2.0; there is no build/runtime dependency on
 `arms_controller_common`, `ocs2_controller_common`, `arms_ros2_control_msgs`, or
 `arms_rviz_control_plugin`. Native single-TCP references,
 IK/FK, marker interaction, pose UI and recording are implemented locally without arm-side
 name translation. FK/IK use `moveit_msgs` contracts (not MoveIt runtime);
 motion targets use standard geometry_msgs/nav_msgs topics, with shape generation in higher-level demos.
-There is no zephyr_msgs dependency. No source-file injection, include-directory shadowing, duplicate
-package names, or post-clone patch step is used.
+Finite-motion Actions and runtime configuration now depend on `zephyr_msgs`.
+No source-file injection, include-directory shadowing or duplicate package names are used.
+
+### Optional optimized gripper (2026-11-19)
+
+`UrdfMimic.cpp` and `Gripper.h` are Zephyr additions. **Do not modify the upstream
+`ocs2_ros2` checkout.** The earlier experimental model-injection extension was
+reverted in full. The controller uses the original MobileManipulatorInterface
+constructor and factory, retaining one independent normalized gripper coordinate.
+
+URDF relations are flattened algebraically, `q_follower = a*q_source+b`.
+Display/FK uses an ordinary joint model and explicit expansion `q_geometry=A*q+b`;
+it reuses the existing Pinocchio dependency without native mimic functionality.
+The additional geometry coordinates are not optimization variables. This model
+is never injected into OCS2. Collision costs remain disabled for this feature;
+future geometry gradients must apply the same expansion/chain rule in this package.
+There is no new library, source patch, header shadowing or binary ABI requirement
+for mimic support. If a previous model-injection build was installed, rebuild
+the unchanged upstream library once before rebuilding the controller.
 
 The `ocs2_wbc_controller` entry in arms_ros2_control is an uninitialized external
 submodule in this workspace. This migration preserves the working mobile

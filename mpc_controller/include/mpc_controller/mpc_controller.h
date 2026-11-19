@@ -21,6 +21,7 @@
 #include "mpc_controller/control/TcpKinematics.h"
 #include "mpc_controller/control/MotionActionServer.h"
 #include "mpc_controller/control/MotionProfileServer.h"
+#include "mpc_controller/control/Gripper.h"
 namespace zephyr::mpc
 {
 /** Runs only OCS2. Solver work stays off the controller_manager update thread. */
@@ -75,6 +76,7 @@ private:
 
         // Hardware parameters
         std::string command_prefix_;
+        GripperConfig gripper_;
         std::vector<std::string> joint_names_;
         std::vector<std::string> command_interface_types_;
         std::vector<std::string> state_interface_types_;
@@ -111,5 +113,6 @@ private:
         rclcpp::Service<moveit_msgs::srv::GetPositionFK>::SharedPtr fk_service_;
         rclcpp::Service<moveit_msgs::srv::GetPositionIK>::SharedPtr ik_service_;
         std::shared_ptr<TcpKinematics> kinematics_;
+        std::shared_ptr<TcpKinematics> gripper_fk_;
     };
 }

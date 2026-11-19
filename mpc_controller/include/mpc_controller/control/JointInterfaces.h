@@ -5,6 +5,7 @@
 #include <hardware_interface/loaned_command_interface.hpp>
 #include <hardware_interface/loaned_state_interface.hpp>
 #include <tuple>
+#include <optional>
 #include <vector>
 
 namespace zephyr::mpc {
@@ -27,6 +28,19 @@ struct JointInterfaces {
   ControlMode control_mode_{ControlMode::POSITION};
   std::vector<double> pd_gains_;
   std::vector<double> last_sent_joint_positions_;
+  // Kept separate: normalized speed/effort caps are not arm qdot/torque.
+  std::optional<std::reference_wrapper<hardware_interface::LoanedStateInterface>> gripper_position_state;
+  std::optional<std::reference_wrapper<hardware_interface::LoanedCommandInterface>>
+      gripper_position, gripper_speed, gripper_effort;
+  double last_gripper_position{0}, gripper_speed_limit{0.5}, gripper_effort_limit{0.4};
+  bool writeGripper(double position) {
+    if (!gripper_position || !gripper_speed || !gripper_effort) return false;
+    const bool ok = gripper_position->get().set_value(position) &&
+        gripper_speed->get().set_value(gripper_speed_limit) &&
+        gripper_effort->get().set_value(gripper_effort_limit);
+    if (ok) last_gripper_position = position;
+    return ok;
+  }
 
   void detectAndSetControlMode() {
     control_mode_ = !joint_position_command_interface_.empty() &&
@@ -51,6 +65,8 @@ struct JointInterfaces {
       std::ignore = joint_velocity_command_interface_[index].get().set_value(velocity);
   }
   void clear() {
+    gripper_position_state.reset(); gripper_position.reset();
+    gripper_speed.reset(); gripper_effort.reset();
     joint_position_command_interface_.clear();
     joint_velocity_command_interface_.clear();
     joint_force_command_interface_.clear();

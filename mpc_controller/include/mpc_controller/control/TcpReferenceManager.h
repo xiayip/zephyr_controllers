@@ -17,6 +17,7 @@
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <mpc_controller/control/ControlSafety.h>
 #include <mpc_controller/control/WholeBodyReference.h>
+#include <mpc_controller/control/Gripper.h>
 #include <nav_msgs/msg/path.hpp>
 #include <ocs2_core/Types.h>
 #include <ocs2_mpc/SystemObservation.h>
@@ -40,6 +41,8 @@ public:
   void setRuntimeProfile(std::shared_ptr<RuntimeMotionProfile> profile);
   void configureWholeBody(bool mobile, std::vector<std::string> joints,
                           ocs2::vector_t lower, ocs2::vector_t upper);
+  void configureGripper(GripperConfig config);
+  bool gripperAtTarget(const ocs2::vector_t& state, double speed) const;
   const std::shared_ptr<WholeBodyReference>& wholeBodyReference() const { return whole_body_; }
   bool validateWholeBodyGoal(const zephyr_msgs::action::ExecuteCartesianMotion::Goal& goal,
                             std::string& error) const;
@@ -50,7 +53,7 @@ public:
   void setAcceptingTargets(bool accept);
   void setCurrentObservation(const ocs2::SystemObservation &observation);
   /** Nonblocking request; caller retries while the mailbox is busy. */
-  bool requestReset(const ocs2::vector_t &pose, double time);
+  bool requestReset(const ocs2::vector_t &pose, double time, double gripper_position = 0.0);
   bool resetReady() const;
   const std::string& referenceFrame() const { return base_frame_; }
   bool claimMotion();
@@ -74,6 +77,7 @@ private:
   struct ResetRequest {
     std::array<double, 7> pose{};
     double time{0};
+    double gripper_position{0};
     uint64_t sequence{0};
   };
   TryWriteMailbox<ResetRequest> reset_mailbox_;
@@ -107,6 +111,9 @@ private:
   std::shared_ptr<WholeBodyReference> whole_body_{std::make_shared<WholeBodyReference>()};
   std::shared_ptr<const WholeBodyTrajectory> pending_body_;
   bool mobile_{false};
+  GripperConfig gripper_;
+  int gripper_index_{-1};
+  double gripper_target_{0}; // Executor-owned, reset seeds from measured position.
   std::vector<std::string> joints_;
   ocs2::vector_t lower_, upper_, body_velocity_limits_;
   TargetSession target_session_;

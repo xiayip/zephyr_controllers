@@ -72,8 +72,27 @@ void TcpReferenceManager::configureWholeBody(bool mobile, std::vector<std::strin
     throw std::invalid_argument("Invalid whole-body model limits");
   mobile_ = mobile; joints_ = std::move(joints); lower_ = std::move(lower); upper_ = std::move(upper);
 }
+void TcpReferenceManager::configureGripper(GripperConfig config) {
+  config.validate();
+  gripper_ = std::move(config);
+  if (!gripper_.enabled()) return;
+  if (joints_.empty() || joints_.back() != gripper_.joint || lower_.tail<1>()[0] != 0 || upper_.tail<1>()[0] != 1)
+    throw std::invalid_argument("Gripper must be last normalized whole-body coordinate");
+  gripper_index_ = joints_.size() - 1 + (mobile_ ? 3 : 0);
+}
 void TcpReferenceManager::commit(TargetTrajectories target, std::shared_ptr<const WholeBodyTrajectory> body) {
   std::lock_guard<std::mutex> lock(commit_mutex_);
+  if (gripper_.enabled()) {
+    if (!body) {
+      // TCP-only commands retain closure, never leave the extra DoF cost-free.
+      vector_t state = vector_t::Zero(joints_.size() + (mobile_ ? 3 : 0));
+      vector_t weights = vector_t::Zero(state.size());
+      state[gripper_index_] = gripper_target_;
+      weights[gripper_index_] = gripper_.weight;
+      body = makeWholeBodyTrajectory({0, 1}, {state, state}, weights, -1, vector_t::Ones(state.size()));
+    }
+    gripper_target_ = body->states.back()[gripper_index_];
+  }
   referenceManagerPtr_->setTargetTrajectories(std::move(target));
   pending_body_ = std::move(body);
 }
@@ -109,6 +128,7 @@ void TcpReferenceManager::subscribe(
   continuous_max_deviation_ = parameter("movel_continuous_max_deviation", 0.0, true);
   body_velocity_limits_ = vector_t::Constant(joints_.size() + (mobile_ ? 3 : 0),
       parameter("whole_body_max_joint_velocity", 0.2));
+  if (gripper_.enabled()) body_velocity_limits_[gripper_index_] = gripper_.max_rate;
   if (mobile_) {
     // Component-wise bound inscribed in the translational speed disk.
     const double linear = parameter("base_max_linear_speed", 0.1, true);
@@ -488,14 +508,20 @@ void TcpReferenceManager::prepareWholeBody(
     vector_array_t& states, vector_t& weights) const {
   std::string error;
   if (!validateWholeBodyGoal(g, error)) throw std::invalid_argument(error);
-  if (g.whole_body_references.empty()) return;
+  if (g.whole_body_references.empty() && !gripper_.enabled()) return;
   const size_t offset = mobile_ ? 3 : 0, dim = joints_.size()+offset;
   if (measured.size() != static_cast<int>(dim) || !measured.allFinite())
     throw std::invalid_argument("Whole-body measured state unavailable");
   states = {measured}; weights = vector_t::Zero(dim);
+  if (gripper_.enabled()) weights[gripper_index_] = gripper_.weight;
   if (mobile_) weights.head<3>() << g.base_position_weight, g.base_position_weight, g.base_yaw_weight;
-  for (const auto& r : g.whole_body_references) {
+  const size_t count = g.mode == zephyr_msgs::action::ExecuteCartesianMotion::Goal::POSE ||
+      g.mode == zephyr_msgs::action::ExecuteCartesianMotion::Goal::RELATIVE ? 1 : g.waypoints.size();
+  for (size_t k = 0; k < count; ++k) {
+    const zephyr_msgs::msg::WholeBodyReference empty;
+    const auto& r = g.whole_body_references.empty() ? empty : g.whole_body_references[k];
     vector_t state = measured;
+    if (gripper_.enabled()) state[gripper_index_] = gripper_target_;
     if (g.base_position_weight > 0 || g.base_yaw_weight > 0) {
       const auto p = poseVector(r.base_pose.pose);
       if (g.base_position_weight > 0) state.head<2>() = p.head<2>();
@@ -503,10 +529,18 @@ void TcpReferenceManager::prepareWholeBody(
     }
     for (size_t i = 0; i < r.posture.name.size(); ++i) {
       const size_t j = std::find(joints_.begin(), joints_.end(), r.posture.name[i])-joints_.begin()+offset;
-      state[j] = r.posture.position[i]; weights[j] = g.posture_weight;
+      state[j] = r.posture.position[i];
+      weights[j] = static_cast<int>(j) == gripper_index_ ? gripper_.weight : g.posture_weight;
     }
     states.push_back(std::move(state));
   }
+}
+bool TcpReferenceManager::gripperAtTarget(const vector_t& state, double speed) const {
+  if (!gripper_.enabled()) return true;
+  std::lock_guard<std::mutex> lock(mutex_);
+  return state.size() > gripper_index_ && GripperConfig::validPosition(state[gripper_index_]) &&
+      std::isfinite(speed) && speed >= 0 && speed <= 0.02 &&
+      std::abs(state[gripper_index_] - gripper_target_) <= gripper_.tolerance;
 }
 std::array<double, 2> TcpReferenceManager::wholeBodyErrors(const vector_t& state) const {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -592,12 +626,14 @@ void TcpReferenceManager::setCurrentObservation(
     const SystemObservation &observation) {
   observation_time_.store(observation.time, std::memory_order_release);
 }
-bool TcpReferenceManager::requestReset(const vector_t &pose, double time) {
+bool TcpReferenceManager::requestReset(const vector_t &pose, double time, double gripper_position) {
   if (pose.size() != 7 || !pose.allFinite() || !std::isfinite(time))
     return false;
+  if (gripper_.enabled() && !GripperConfig::validPosition(gripper_position)) return false;
   ResetRequest request;
   std::copy_n(pose.data(), 7, request.pose.begin());
   request.time = time;
+  request.gripper_position = gripper_position;
   request.sequence = requested_reset_ + 1;
   if (!reset_mailbox_.tryWrite(request))
     return false;
@@ -614,6 +650,7 @@ void TcpReferenceManager::updateReference() {
   std::lock_guard<std::mutex> lock(mutex_);
   const auto reset = reset_mailbox_.read();
   if (reset.sequence != applied_reset_.load(std::memory_order_relaxed)) {
+    gripper_target_ = reset.gripper_position;
     target_ = Eigen::Map<const Eigen::Matrix<double, 7, 1>>(reset.pose.data());
     time_ = last_time_ = reset.time;
     twist_active_ = false;

@@ -20,4 +20,10 @@ target_link_libraries(${PROJECT_NAME} ${PARAMETERS_TARGET})
 pluginlib_export_plugin_description_file(
   controller_interface normalized_gripper_controller.xml)
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_chain test/test_chain.cpp)
+  target_link_libraries(test_chain ${PROJECT_NAME})
+endif()
+
 ament_auto_package(USE_SCOPED_HEADER_INSTALL_DIR)

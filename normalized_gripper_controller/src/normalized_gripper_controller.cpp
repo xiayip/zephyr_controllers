@@ -246,7 +246,18 @@ NormalizedGripperController::on_deactivate(const rclcpp_lifecycle::State &) {
 
 bool NormalizedGripperController::on_set_chained_mode(bool chained_mode) {
   if (chained_mode) {
+    chained_mode_.store(true);
     preempt_active_goal();
+  } else if (chained_mode_.load()) {
+    // Do not replay the last topic command from before MPC took ownership.
+    // Continue the final bounded chain reference until a NEW external command.
+    Commands hold;
+    hold.position = reference_handles_[kPositionReference]->get_optional().value_or(NAN);
+    hold.velocity = reference_handles_[kVelocityReference]->get_optional().value_or(NAN);
+    hold.effort = reference_handles_[kEffortReference]->get_optional().value_or(NAN);
+    for (double value : {hold.position, hold.velocity, hold.effort})
+      if (!std::isfinite(value) || value < 0 || value > 1) return false;
+    command_.writeFromNonRT(hold);
   }
   chained_mode_.store(chained_mode);
   return true;
@@ -279,6 +290,10 @@ NormalizedGripperController::update_and_write_commands(
   }
   final_command_ = {*position_reference, *velocity_reference,
                     *effort_reference};
+  // Chain clients must obey the same normalized bounds as topic/action users.
+  for (double value : {final_command_.position, final_command_.velocity, final_command_.effort})
+    if (!std::isfinite(value) || value < 0 || value > 1)
+      return controller_interface::return_type::ERROR;
   if (!std::isfinite(final_command_.position) ||
       !position_command_interface_->get().set_value(final_command_.position)) {
     return controller_interface::return_type::ERROR;

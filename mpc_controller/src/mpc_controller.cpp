@@ -101,7 +101,8 @@ namespace zephyr::mpc
                 conf.names.push_back(prefix + joint_name + "/" + interface_type);
             }
         }
-
+        if (gripper_.enabled()) for (const auto* type : {"position", "velocity", "effort"})
+            conf.names.push_back(gripper_.command_prefix + "/" + gripper_.joint + "/" + type);
         return conf;
     }
 
@@ -117,7 +118,7 @@ namespace zephyr::mpc
                 conf.names.push_back(joint_name + "/" + interface_type);
             }
         }
-
+        if (gripper_.enabled()) conf.names.push_back(gripper_.joint + "/position");
         return conf;
     }
 
@@ -181,6 +182,7 @@ namespace zephyr::mpc
             std::copy_n(measured_state.data(), sample.whole_body_size, sample.whole_body_state.begin());
         }
         sample.speeds = ctrl_comp_->measuredMotionSpeeds();
+        sample.gripper_speed = ctrl_comp_->measuredGripperSpeed();
         sample.stamp_ns = time.nanoseconds();
         sample.reference_time = time.seconds();
         sample.received_ns = motionSteadyNs();
@@ -214,6 +216,16 @@ namespace zephyr::mpc
             get_node()->get_parameter("update_rate", ctrl_interfaces_.frequency_);
             command_prefix_ = auto_declare<std::string>("command_prefix", command_prefix_);
             joint_names_ = auto_declare<std::vector<std::string>>("joints", joint_names_);
+            gripper_.joint = auto_declare<std::string>("gripper.joint", "");
+            gripper_.command_prefix = auto_declare<std::string>("gripper.command_prefix", "");
+            gripper_.max_rate = auto_declare<double>("gripper.max_rate", 0.5);
+            gripper_.speed_limit = auto_declare<double>("gripper.speed_limit", 0.5);
+            gripper_.effort_limit = auto_declare<double>("gripper.effort_limit", 0.4);
+            gripper_.weight = auto_declare<double>("gripper.weight", 10.0);
+            gripper_.tolerance = auto_declare<double>("gripper.tolerance", 0.01);
+            gripper_.validate();
+            if (gripper_.enabled() && std::find(joint_names_.begin(), joint_names_.end(), gripper_.joint) != joint_names_.end())
+                throw std::invalid_argument("Gripper must not appear in arm joints");
             command_interface_types_ = auto_declare<std::vector<std::string>>("command_interfaces", command_interface_types_);
             state_interface_types_ = auto_declare<std::vector<std::string>>("state_interfaces", state_interface_types_);
             ctrl_interfaces_.pd_gains_ = auto_declare<std::vector<double>>("pd_gains", ctrl_interfaces_.pd_gains_);
@@ -226,11 +238,18 @@ namespace zephyr::mpc
             ik_options.damping = auto_declare<double>("kinematics.damping", 0.01);
             ik_options.timeout = auto_declare<double>("kinematics.timeout", 0.1);
             ik_options.random_restart = auto_declare<bool>("kinematics.random_restart", false);
-            ctrl_comp_ = std::make_shared<CtrlComponent>(get_node(), ctrl_interfaces_, motion_runtime_);
+            ctrl_comp_ = std::make_shared<CtrlComponent>(get_node(), ctrl_interfaces_, motion_runtime_, gripper_);
             const auto& info = ctrl_comp_->interface_->getManipulatorModelInfo();
-            const auto model = makeTcpKinematicsModel(
-                ctrl_comp_->interface_->getPinocchioInterface().getModel(), joint_names_, info.baseFrame);
+            const auto& source = ctrl_comp_->interface_->getPinocchioInterface().getModel();
+            const auto model = makeTcpKinematicsModel(source, joint_names_, info.baseFrame);
             kinematics_ = std::make_shared<TcpKinematics>(model, joint_names_, info.eeFrame, info.baseFrame, ik_options);
+            if (gripper_.enabled()) {
+                auto all = joint_names_; all.push_back(gripper_.joint);
+                for (const auto& relation : ctrl_comp_->gripper_mimic_) all.push_back(relation.joint);
+                gripper_fk_ = std::make_shared<TcpKinematics>(makeTcpKinematicsModel(
+                    ctrl_comp_->gripper_geometry_->getModel(), all, info.baseFrame),
+                    all, info.eeFrame, info.baseFrame, ik_options);
+            }
             execution_ = std::make_unique<MpcExecution>(ctrl_comp_, ctrl_interfaces_.frequency_);
             RCLCPP_INFO(get_node()->get_logger(), "Direct OCS2 controller initialized; TCP=%s", info.eeFrame.c_str());
             return CallbackReturn::SUCCESS;
@@ -252,7 +271,26 @@ namespace zephyr::mpc
         fk_service_ = get_node()->create_service<moveit_msgs::srv::GetPositionFK>("~/compute_fk",
             [this](moveit_msgs::srv::GetPositionFK::Request::SharedPtr request,
                    moveit_msgs::srv::GetPositionFK::Response::SharedPtr response) {
-                try { kinematics_->fk(*request, *response); }
+                try {
+                    const auto& names = request->robot_state.joint_state.name;
+                    const bool has_gripper = gripper_fk_ && std::find(names.begin(), names.end(), gripper_.joint) != names.end();
+                    if (has_gripper) {
+                        auto expanded = *request;
+                        auto& joints = expanded.robot_state.joint_state;
+                        if (joints.name.size() != joint_names_.size()+1 || joints.position.size() != joints.name.size())
+                            throw std::invalid_argument("FK requires all arm joints and one normalized closure");
+                        const auto source = std::find(joints.name.begin(), joints.name.end(), gripper_.joint)-joints.name.begin();
+                        const double closure = joints.position[source];
+                        if (!GripperConfig::validPosition(closure)) throw std::invalid_argument("Invalid FK closure");
+                        for (const auto& relation : ctrl_comp_->gripper_mimic_) {
+                            joints.name.push_back(relation.joint);
+                            joints.position.push_back(relation.multiplier*closure+relation.offset);
+                        }
+                        gripper_fk_->fk(expanded, *response);
+                    } else {
+                        kinematics_->fk(*request, *response);
+                    }
+                }
                 catch (const std::exception& error) {
                     response->error_code.val = moveit_msgs::msg::MoveItErrorCodes::FAILURE;
                     response->error_code.message = error.what();
@@ -281,6 +319,13 @@ namespace zephyr::mpc
         // assign command interfaces
         for (auto& interface : command_interfaces_)
         {
+            if (gripper_.enabled() && interface.get_name().rfind(gripper_.command_prefix + "/" + gripper_.joint + "/", 0) == 0) {
+                const auto& name = interface.get_name();
+                if (name == gripper_.command_prefix + "/" + gripper_.joint + "/position") ctrl_interfaces_.gripper_position = interface;
+                else if (name == gripper_.command_prefix + "/" + gripper_.joint + "/velocity") ctrl_interfaces_.gripper_speed = interface;
+                else if (name == gripper_.command_prefix + "/" + gripper_.joint + "/effort") ctrl_interfaces_.gripper_effort = interface;
+                continue;
+            }
             std::string interface_name = interface.get_interface_name();
             if (const size_t pos = interface_name.find('/'); pos != std::string::npos)
             {
@@ -292,6 +337,10 @@ namespace zephyr::mpc
         // assign state interfaces
         for (auto& interface : state_interfaces_)
         {
+            if (gripper_.enabled() && interface.get_name() == gripper_.joint + "/position") {
+                ctrl_interfaces_.gripper_position_state = interface;
+                continue;
+            }
             state_interface_map_.at(interface.get_interface_name())->push_back(interface);
         }
 
@@ -336,6 +385,16 @@ namespace zephyr::mpc
             initial_positions.push_back(*value);
         }
         ctrl_interfaces_.last_sent_joint_positions_ = std::move(initial_positions);
+        if (gripper_.enabled()) {
+            const auto position = ctrl_interfaces_.gripper_position_state ?
+                ctrl_interfaces_.gripper_position_state->get().get_optional() : std::nullopt;
+            ctrl_interfaces_.gripper_speed_limit = gripper_.speed_limit;
+            ctrl_interfaces_.gripper_effort_limit = gripper_.effort_limit;
+            if (!position || !GripperConfig::validPosition(*position) || !ctrl_interfaces_.writeGripper(*position)) {
+                RCLCPP_ERROR(get_node()->get_logger(), "Cannot activate: invalid/incomplete gripper interfaces");
+                return CallbackReturn::ERROR;
+            }
+        }
         if (ctrl_interfaces_.control_mode_ == ControlMode::MIX && ctrl_interfaces_.pd_gains_.size() >= 2)
         {
             for (auto& interface : ctrl_interfaces_.joint_kp_command_interface_)

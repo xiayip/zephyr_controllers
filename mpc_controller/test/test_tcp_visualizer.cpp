@@ -97,3 +97,24 @@ TEST_F(TcpVisualizer, PublishesOnlyTcpPoseWithFrameAndThrottlePreserved) {
     ASSERT_EQ(received.size(), 2u);
     EXPECT_EQ(received.back().header.stamp.nanosec, 30000000u);
 }
+
+TEST_F(TcpVisualizer, ExpandsUrdfMimicForRealtimeAndRecordingFk) {
+    pinocchio::Model geometry;
+    const auto finger = geometry.addJoint(0, pinocchio::JointModelRZ(),
+        pinocchio::SE3::Identity(), "finger");
+    geometry.addFrame(pinocchio::Frame("finger_tip", finger, 0,
+        pinocchio::SE3(Eigen::Matrix3d::Identity(), Eigen::Vector3d(1, 0, 0)), pinocchio::OP_FRAME));
+    mpc_visualizer_config config;
+    config.tcp_ee_frame = "finger_tip";
+    config.configuration_expansion = zephyr::mpc::ConfigurationExpansion{
+        Eigen::MatrixXd::Constant(1, 1, 0.7), Eigen::VectorXd::Constant(1, -0.7)};
+    mpc_visualizer mapped(node, ocs2::PinocchioInterface(geometry), config);
+    const auto half = mapped.computeEndEffectorPose(ocs2::vector_t::Constant(1, 0.5));
+    EXPECT_NEAR(half(0), std::cos(-0.35), 1e-12);
+    EXPECT_NEAR(half(1), std::sin(-0.35), 1e-12);
+    const auto open = mapped.computeRecordedEndEffectorPose(ocs2::vector_t::Zero(1));
+    EXPECT_NEAR(open(0), std::cos(-0.7), 1e-12);
+    EXPECT_NEAR(open(1), std::sin(-0.7), 1e-12);
+    EXPECT_TRUE(mapped.computeEndEffectorPose(ocs2::vector_t::Constant(1, 0.5)).isApprox(half, 1e-12));
+    EXPECT_THROW(mapped.computeEndEffectorPose(ocs2::vector_t::Zero(2)), std::invalid_argument);
+}

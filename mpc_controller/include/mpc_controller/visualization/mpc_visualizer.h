@@ -13,6 +13,7 @@
 #include <vector>
 
 #include <ocs2_core/Types.h>
+#include <mpc_controller/control/UrdfMimic.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -83,6 +84,7 @@ struct mpc_visualizer_config {
     double control_period{0.02};
     std::string tcp_ee_frame;
     std::optional<PinocchioGeometryInterface> pinocchio_geometry;
+    std::optional<zephyr::mpc::ConfigurationExpansion> configuration_expansion;
     bool self_collision_enabled{false};
     scalar_t self_collision_activation_distance{0};
 };
@@ -118,7 +120,7 @@ public:
     void clearTrajectoryHistory();
 
 private:
-    void forwardKinematicsInto(pinocchio::Data& data, const vector_t& state) const;
+    void forwardKinematicsInto(pinocchio::Data& data, vector_t& q, const vector_t& state) const;
     vector_t extractFramePose7(const pinocchio::Data& data, pinocchio::FrameIndex frame_id) const;
     static void fillPoseStamped(geometry_msgs::msg::PoseStamped& msg, const rclcpp::Time& time,
                                 const std::string& frame_id, const vector_t& pose7);
@@ -151,6 +153,7 @@ private:
     /** Dedicated Data so RT and viz threads never share a pinocchio cache. */
     mutable pinocchio::Data rt_data_;
     mutable pinocchio::Data viz_data_;
+    mutable vector_t rt_configuration_, viz_configuration_;
     pinocchio::GeometryModel visual_geometry_model_;
     std::unique_ptr<pinocchio::GeometryData> visual_geometry_data_;
     pinocchio::FrameIndex tcp_ee_frame_id_{0};

@@ -31,6 +31,12 @@ using namespace ocs2;
     {
         if (config_.visualization_frame.empty()) config_.visualization_frame = config_.base_frame;
         const auto& model = pinocchio_interface_.getModel();
+        rt_configuration_.setZero(model.nq);
+        viz_configuration_.setZero(model.nq);
+        if (config_.configuration_expansion &&
+            (config_.configuration_expansion->matrix.rows() != model.nq ||
+             config_.configuration_expansion->offset.size() != model.nq))
+            throw std::invalid_argument("Invalid visualization mimic expansion");
         tcp_ee_frame_id_ = model.getFrameId(config_.tcp_ee_frame);
         tcp_ee_frame_valid_ = tcp_ee_frame_id_ < static_cast<pinocchio::FrameIndex>(model.nframes);
     }
@@ -147,7 +153,7 @@ using namespace ocs2;
         predicted_robot_states_.clear();
         if (!tcp_ee_frame_valid_ || prediction.states.front().size() != measured_state.size()) return;
 
-        forwardKinematicsInto(viz_data_, measured_state);
+        forwardKinematicsInto(viz_data_, viz_configuration_, measured_state);
         const vector_t current_pose = extractFramePose7(viz_data_, tcp_ee_frame_id_);
         tcp_arm_trajectory_history_.push_back(current_pose);
         tcp_arm_next_step_.push_back(current_pose);
@@ -162,14 +168,14 @@ using namespace ocs2;
             const double sample_time = render_time + remaining * static_cast<double>(i) / path_samples;
             if (prediction.sample(sample_time, state))
             {
-                forwardKinematicsInto(viz_data_, state);
+                forwardKinematicsInto(viz_data_, viz_configuration_, state);
                 tcp_arm_trajectory_history_.push_back(extractFramePose7(viz_data_, tcp_ee_frame_id_));
             }
         }
         const double next_time = std::min(render_time + config_.control_period, prediction.times.back());
         if (prediction.sample(next_time, state))
         {
-            forwardKinematicsInto(viz_data_, state);
+            forwardKinematicsInto(viz_data_, viz_configuration_, state);
             tcp_arm_next_step_.push_back(extractFramePose7(viz_data_, tcp_ee_frame_id_));
         }
 
@@ -259,7 +265,7 @@ using namespace ocs2;
 
         for (size_t ghost = 0; ghost < predicted_robot_states_.size(); ++ghost)
         {
-            forwardKinematicsInto(viz_data_, predicted_robot_states_[ghost]);
+            forwardKinematicsInto(viz_data_, viz_configuration_, predicted_robot_states_[ghost]);
             pinocchio::updateGeometryPlacements(
                 model, viz_data_, visual_geometry_model_, *visual_geometry_data_);
 
@@ -346,10 +352,18 @@ using namespace ocs2;
         return geometry_visualization_->getLastMinDistance();
     }
 
-    void mpc_visualizer::forwardKinematicsInto(pinocchio::Data& data, const vector_t& state) const
+    void mpc_visualizer::forwardKinematicsInto(pinocchio::Data& data, vector_t& q, const vector_t& state) const
     {
         const auto& model = pinocchio_interface_.getModel();
-        pinocchio::forwardKinematics(model, data, state);
+        if (config_.configuration_expansion) {
+            const auto& map = *config_.configuration_expansion;
+            if (state.size() != map.matrix.cols()) throw std::invalid_argument("Invalid mimic input dimension");
+            q.noalias() = map.matrix * state;
+            q += map.offset;
+        } else {
+            q = state;
+        }
+        pinocchio::forwardKinematics(model, data, q);
         pinocchio::updateFramePlacements(model, data);
     }
 
@@ -395,7 +409,7 @@ using namespace ocs2;
     {
         if (tcp_ee_frame_valid_)
         {
-            forwardKinematicsInto(rt_data_, state);
+            forwardKinematicsInto(rt_data_, rt_configuration_, state);
             return extractFramePose7(rt_data_, tcp_ee_frame_id_);
         }
 
@@ -429,7 +443,7 @@ using namespace ocs2;
             pose(6) = 1.0;
             return pose;
         }
-        forwardKinematicsInto(viz_data_, state);
+        forwardKinematicsInto(viz_data_, viz_configuration_, state);
         return extractFramePose7(viz_data_, tcp_ee_frame_id_);
     }
 
