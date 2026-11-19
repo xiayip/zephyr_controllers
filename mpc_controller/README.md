@@ -838,6 +838,12 @@ ros2 topic echo /mpc_controller/motion_status
 
 ### 可选全身参考（剪影，M2 原型）
 
+![Z2 全身 MPC mock：前进 2 m，连续经过两个中间剪影并到达终点](docs/images/mpc_wholebody_two_vias.png)
+
+*Z2 mock 示例：底盘前进 2 m，同时连续经过两个机械臂姿态。紫色 VIA 1、橙色 VIA 2
+和绿色 END / ready 是测试脚本发布的固定整机参考剪影；青色半透明模型是 MPC 的滚动预测，
+不是实测轨迹。此图不代表碰撞检查或真机验证。*
+
 仍使用 `~/execute_motion` / `ExecuteCartesianMotion`。空的 `whole_body_references`
 和默认零权重保持 TCP-only 行为；没有新增控制器、业务 FSM 或 OCS2 fork。
 **Action 新增了字段，DDS 消息定义有变化：机器人、RViz/BT 和发布端必须同步构建
